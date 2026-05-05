@@ -43,15 +43,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
         }
 
         // 2. Database check for Super Admins and Staff
-        $stmt = $db->prepare("SELECT u.*, r.role_name, t.shop_name 
+        $stmt = $db->prepare("SELECT u.*, r.role_name, t.shop_name, t.status AS tenant_status
                                FROM users u 
                                JOIN roles r ON u.role_id = r.role_id 
                                LEFT JOIN tenants t ON u.tenant_id = t.tenant_id
-                               WHERE u.email = ? AND u.status = 'ACTIVE'");
+                               WHERE u.email = ?");
         $stmt->execute([$user]);
         $row = $stmt->fetch();
 
-        if ($row && password_verify($pass, $row['password_hash'])) {
+        if ($row) {
+            if (password_verify($pass, $row['password_hash'])) {
+                $isOwnerOrManager = in_array(strtoupper($row['role_name']), ['OWNER', 'MANAGER', 'SUPER_ADMIN']);
+                $isTenantSuspended = isset($row['tenant_status']) && strtoupper($row['tenant_status']) === 'SUSPENDED';
+
+                // Check User Account Status
+                if (strtoupper($row['status']) !== 'ACTIVE') {
+                    // EXCEPTION: Allow Owners/Managers if their shop is suspended
+                    if (!($isOwnerOrManager && $isTenantSuspended)) {
+                        echo json_encode(['status' => 'error', 'message' => 'Account is deactivated. (Role: ' . $row['role_name'] . ', Shop Status: ' . $row['tenant_status'] . ')']);
+                        exit;
+                    }
+                }
+
+                // Check for Suspended Workshop Access Policy
+                if ($isTenantSuspended && !$isOwnerOrManager) {
+                    echo json_encode(['status' => 'error', 'message' => 'Workshop suspended. Please contact the owner.']);
+                    exit;
+                }
+
             // Check if it's a Super Admin (role_id 1 AND tenant_id is NULL)
             if ($row['role_id'] == 1 && ($row['tenant_id'] === null || $row['tenant_id'] == 0)) {
                 $_SESSION['user_id'] = $row['user_id'];
@@ -93,10 +112,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
                 'redirect' => (strtoupper($row['role_name']) === 'SUPER_ADMIN') ? 'dashboard.php' : 'tenant-dashboard.php'
             ]);
         } else {
-            echo json_encode(['status' => 'error', 'message' => 'Invalid credentials.']);
+            echo json_encode(['status' => 'error', 'message' => 'Invalid credentials (password mismatch).']);
         }
-    } catch (Exception $e) { echo json_encode(['status' => 'error', 'message' => 'System error.']); }
-    exit;
+    } else {
+        echo json_encode(['status' => 'error', 'message' => 'Invalid credentials (email not found).']);
+    }
+} catch (Exception $e) { echo json_encode(['status' => 'error', 'message' => 'System error.']); }
+exit;
 }
 
 // FETCH SHOP BRANDING & ACTUAL COLORS & SLUG
@@ -321,6 +343,18 @@ $accentGlow = $rgb ? "rgba({$rgb[0]}, {$rgb[1]}, {$rgb[2]}, 0.4)" : "rgba(99, 10
             })
             .catch(err => { showToast('Connection error.'); if(text) text.style.display = 'inline-block'; spinner.style.display = 'none'; btn.style.pointerEvents = 'all'; });
         });
+
+        // Handle URL errors
+        window.addEventListener('load', () => {
+            const params = new URLSearchParams(window.location.search);
+            const error = params.get('error');
+            if (error === 'suspended_workshop') {
+                showToast(currentLang === 'ph' ? 'Suspended ang Workshop. Owner/Manager lang ang pwedeng pumasok.' : 'Workshop Suspended. Only Owners/Managers can access.');
+            } else if (error === 'deactivated') {
+                showToast(currentLang === 'ph' ? 'Deactivated ang iyong account.' : 'Your account has been deactivated.');
+            }
+        });
+
 
         function showToast(msg) {
             const t = document.getElementById('toast'); t.innerText = msg; t.style.opacity = '1'; t.style.transform = 'translateX(-50%) translateY(10px)';

@@ -49,6 +49,25 @@ try {
   }
   $current_user_pic = $userData['profile_pic'] ?? '';
 
+  // Fetch Mechanic Shift if applicable
+  $my_shift = null;
+  $my_pending_shift_request = null;
+  if (strtoupper($role) === 'MECHANIC') {
+    $stmt_m = $db_check->prepare("SELECT shift_start, shift_end, shift_days FROM mechanics WHERE user_id = ? AND tenant_id = ?");
+    $stmt_m->execute([$_SESSION['user_id'], $tenant_id]);
+    $my_shift = $stmt_m->fetch(PDO::FETCH_ASSOC);
+
+    // Also fetch latest shift request status (only if not seen yet OR if it's still pending)
+    $stmt_sr = $db_check->prepare("SELECT * FROM shift_requests WHERE mechanic_id = (SELECT mechanic_id FROM mechanics WHERE user_id = ? AND tenant_id = ?) AND tenant_id = ? AND (status = 'PENDING' OR is_seen = 0) ORDER BY created_at DESC LIMIT 1");
+    $stmt_sr->execute([$_SESSION['user_id'], $tenant_id, $tenant_id]);
+    $my_pending_shift_request = $stmt_sr->fetch(PDO::FETCH_ASSOC);
+
+    // If it's processed (APPROVED/REJECTED) but not seen, mark it as seen NOW so next time it's gone
+    if ($my_pending_shift_request && $my_pending_shift_request['status'] !== 'PENDING' && $my_pending_shift_request['is_seen'] == 0) {
+      $db_check->prepare("UPDATE shift_requests SET is_seen = 1 WHERE request_id = ?")->execute([$my_pending_shift_request['request_id']]);
+    }
+  }
+
 } catch (Exception $e) {
 }
 
@@ -107,9 +126,29 @@ try {
       amount DECIMAL(15,2) NOT NULL,
       payment_method VARCHAR(50) DEFAULT 'CASH',
       reference_no VARCHAR(100),
-      status VARCHAR(20) DEFAULT 'COMPLETED',
-      payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      status VARCHAR(20) DEFAULT 'COMPLETED'
     )");
+
+    // Shift Requests Table
+    $db->exec("CREATE TABLE IF NOT EXISTS shift_requests (
+      request_id INT AUTO_INCREMENT PRIMARY KEY,
+      tenant_id INT NOT NULL,
+      mechanic_id INT NOT NULL,
+      requested_start TIME NOT NULL,
+      requested_end TIME NOT NULL,
+      reason TEXT,
+      status ENUM('PENDING', 'APPROVED', 'REJECTED') DEFAULT 'PENDING',
+      is_seen TINYINT(1) DEFAULT 0,
+      processed_by INT NULL,
+      processed_at TIMESTAMP NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (tenant_id), INDEX (mechanic_id)
+    )");
+
+    try {
+      $db->exec("ALTER TABLE shift_requests ADD COLUMN is_seen TINYINT(1) DEFAULT 0 AFTER status");
+    } catch (Exception $e) {
+    }
 
     // --- SUBSCRIPTION ENGINE HEALER (V2) ---
     $db->exec("CREATE TABLE IF NOT EXISTS subscription_plans (
@@ -200,6 +239,31 @@ try {
       $active_subscription = $stmt->fetch(PDO::FETCH_ASSOC);
     }
   } catch (Exception $e) {
+  }
+
+  $plan_tier = $active_subscription['plan_name'] ?? 'Free Tier';
+  $bay_limit = intval($active_subscription['max_service_bays'] ?? 2);
+
+  // Calculate Low Stock Count for Sidebar Badge
+  $low_stock_count = 0;
+  try {
+    $stmt = $db->prepare("SELECT COUNT(*) FROM inventory WHERE tenant_id = ? AND quantity <= stock_threshold");
+    $stmt->execute([$tenant_id]);
+    $low_stock_count = intval($stmt->fetchColumn());
+  } catch (Exception $e) {
+  }
+
+  // Shift Requests Data for Server-Side Rendering
+  $pending_shift_requests_count = 0;
+  $pending_shift_requests_list = [];
+  if (in_array($role, ['OWNER', 'MANAGER'])) {
+    try {
+      $stmt = $db->prepare("SELECT sr.*, COALESCE(m.full_name, 'Unknown Mechanic') as full_name FROM shift_requests sr LEFT JOIN mechanics m ON sr.mechanic_id = m.mechanic_id WHERE sr.tenant_id = ? AND sr.status = 'PENDING' ORDER BY sr.created_at DESC");
+      $stmt->execute([$tenant_id]);
+      $pending_shift_requests_list = $stmt->fetchAll(PDO::FETCH_ASSOC);
+      $pending_shift_requests_count = count($pending_shift_requests_list);
+    } catch (Exception $e) {
+    }
   }
 
   // Handle AJAX: Renew Subscription
@@ -435,16 +499,29 @@ try {
         $pUploadDir = 'uploads/profiles/';
         if (!is_dir($pUploadDir))
           mkdir($pUploadDir, 0777, true);
+
+        // Auto-patch if column missing
+        try {
+          $db->exec("ALTER TABLE users ADD COLUMN profile_pic VARCHAR(255) NULL AFTER name");
+        } catch (Exception $e) {
+        }
+
         $pExt = pathinfo($_FILES['profile_pic']['name'], PATHINFO_EXTENSION);
-        $pFileName = 'profile_' . time() . '_' . uniqid() . '.' . $pExt;
+        $pFileName = 'profile_' . $user_id . '_' . time() . '.' . $pExt;
         $pPath = $pUploadDir . $pFileName;
-        move_uploaded_file($_FILES['profile_pic']['tmp_name'], $pPath);
-        $db->prepare("UPDATE users SET profile_pic = ? WHERE user_id = ?")->execute([$pPath, $user_id]);
-        echo json_encode(['status' => 'success', 'message' => 'Profile picture updated!']);
+
+        if (move_uploaded_file($_FILES['profile_pic']['tmp_name'], $pPath)) {
+          $db->prepare("UPDATE users SET profile_pic = ? WHERE user_id = ?")->execute([$pPath, $user_id]);
+          @ob_clean();
+          echo json_encode(['status' => 'success', 'message' => 'Profile picture updated!']);
+        } else {
+          throw new Exception("Failed to move uploaded file.");
+        }
       } else {
         throw new Exception("No file uploaded or upload error.");
       }
     } catch (Exception $e) {
+      @ob_clean();
       echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
     }
     exit;
@@ -483,6 +560,12 @@ try {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX (tenant_id), INDEX (customer_id), INDEX (vehicle_id), INDEX (service_id)
       ) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;");
+
+        try {
+          $db->exec("ALTER TABLE appointments ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP");
+        } catch (Exception $e) {
+        }
+
       } catch (Exception $e) {
       }
 
@@ -532,9 +615,18 @@ try {
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           INDEX (tenant_id)
         ) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;");
-        try { $db->exec("ALTER TABLE services ADD COLUMN master_id INT DEFAULT NULL AFTER tenant_id"); } catch(Exception $e) {}
-        try { $db->exec("ALTER TABLE services ADD COLUMN category VARCHAR(50) NULL AFTER price"); } catch(Exception $e) {}
-        try { $db->exec("ALTER TABLE services ADD COLUMN estimated_time VARCHAR(50) NULL AFTER category"); } catch(Exception $e) {}
+        try {
+          $db->exec("ALTER TABLE services ADD COLUMN master_id INT DEFAULT NULL AFTER tenant_id");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE services ADD COLUMN category VARCHAR(50) NULL AFTER price");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE services ADD COLUMN estimated_time VARCHAR(50) NULL AFTER category");
+        } catch (Exception $e) {
+        }
       } catch (Exception $e) {
       }
 
@@ -576,6 +668,18 @@ try {
         }
         try {
           $db->exec("ALTER TABLE users ADD COLUMN role_id INT DEFAULT 3");
+        } catch (\Throwable $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE users ADD COLUMN name VARCHAR(100) AFTER email");
+        } catch (\Throwable $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE users ADD COLUMN profile_pic VARCHAR(255) NULL AFTER name");
+        } catch (\Throwable $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE users ADD COLUMN status ENUM('ACTIVE','INACTIVE') DEFAULT 'ACTIVE'");
         } catch (\Throwable $e) {
         }
         try {
@@ -636,7 +740,30 @@ try {
         } catch (Exception $e) {
         }
         try {
+          $db->exec("ALTER TABLE mechanics ADD COLUMN shift_start TIME DEFAULT '08:00:00'");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE mechanics ADD COLUMN shift_end TIME DEFAULT '17:00:00'");
+        } catch (Exception $e) {
+        }
+        try {
           $db->exec("ALTER TABLE mechanics ADD COLUMN full_name VARCHAR(100) NULL AFTER tenant_id");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("CREATE TABLE IF NOT EXISTS shift_requests (
+            request_id INT AUTO_INCREMENT PRIMARY KEY,
+            tenant_id INT NOT NULL,
+            mechanic_id INT NOT NULL,
+            requested_start TIME NOT NULL,
+            requested_end TIME NOT NULL,
+            reason TEXT,
+            status ENUM('PENDING', 'APPROVED', 'REJECTED') DEFAULT 'PENDING',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            processed_by INT NULL,
+            processed_at TIMESTAMP NULL
+          )");
         } catch (Exception $e) {
         }
 
@@ -750,7 +877,10 @@ try {
       // Payments Table Healer/Creation
       try {
         $db->exec("CREATE TABLE IF NOT EXISTS services (service_id INT AUTO_INCREMENT PRIMARY KEY, tenant_id INT, master_id INT DEFAULT NULL, service_name VARCHAR(100), description TEXT, price DECIMAL(10,2), category VARCHAR(50), estimated_time VARCHAR(50), status ENUM('ACTIVE', 'INACTIVE'), created_at DATETIME)");
-        try { $db->exec("ALTER TABLE services ADD COLUMN master_id INT DEFAULT NULL AFTER tenant_id"); } catch (Exception $e) {}
+        try {
+          $db->exec("ALTER TABLE services ADD COLUMN master_id INT DEFAULT NULL AFTER tenant_id");
+        } catch (Exception $e) {
+        }
         $db->exec("CREATE TABLE IF NOT EXISTS payments (payment_id INT AUTO_INCREMENT PRIMARY KEY, tenant_id INT, amount DECIMAL(10,2), status VARCHAR(20))");
         try {
           $db->exec("ALTER TABLE payments ADD COLUMN appointment_id INT NULL AFTER customer_id");
@@ -797,6 +927,22 @@ try {
             $db->exec("ALTER TABLE appointments ADD COLUMN mechanic_id INT NULL");
           }
 
+          $res = $db->query("SHOW COLUMNS FROM appointments LIKE 'requested_mechanic_id'");
+          if (!$res->fetch()) {
+            $db->exec("ALTER TABLE appointments ADD COLUMN requested_mechanic_id INT NULL");
+          }
+
+          // Heal Vehicles Status
+          try {
+            $db->exec("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'ACTIVE'");
+          } catch (Exception $e) {
+          }
+
+          // Data Migration Patch: Recover requested_mechanic_id from mechanic_id for ALL existing records where it's missing.
+          // This fixes the "(None)" issue for older bookings that were already confirmed or pending.
+          $db->exec("UPDATE appointments SET requested_mechanic_id = mechanic_id 
+                     WHERE (requested_mechanic_id IS NULL OR requested_mechanic_id = 0) AND (mechanic_id IS NOT NULL AND mechanic_id != 0)");
+
           $res = $db->query("SHOW COLUMNS FROM appointments LIKE 'bay_id'");
           if (!$res->fetch()) {
             $db->exec("ALTER TABLE appointments ADD COLUMN bay_id INT NULL");
@@ -811,6 +957,14 @@ try {
           if (!$res->fetch()) {
             $db->exec("ALTER TABLE appointments ADD COLUMN status VARCHAR(20) DEFAULT 'PENDING'");
           }
+
+          // --- BILLING ACCURACY PATCH ---
+          // Recalculate total_amount for all repair_jobs based on Service Price + Parts Total
+          $db->exec("UPDATE repair_jobs j 
+                     SET j.total_amount = (
+                        COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + 
+                        COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id), 0)
+                     ) WHERE j.status != 'SETTLED'");
 
           $res = $db->query("SHOW COLUMNS FROM appointments LIKE 'payment_status'");
           if (!$res->fetch()) {
@@ -837,6 +991,26 @@ try {
       specialization VARCHAR(100),
       status ENUM('AVAILABLE', 'BUSY', 'OFF') DEFAULT 'AVAILABLE'
     )");
+
+          $db->exec("CREATE TABLE IF NOT EXISTS repair_parts (
+            rp_id INT AUTO_INCREMENT PRIMARY KEY,
+            tenant_id INT NOT NULL,
+            job_id INT NOT NULL,
+            item_id INT NULL,
+            service_id INT NULL,
+            quantity INT DEFAULT 1,
+            unit_price DECIMAL(10,2) DEFAULT 0,
+            total_price DECIMAL(10,2) DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          )");
+          try {
+            $db->exec("ALTER TABLE repair_parts ADD COLUMN service_id INT NULL AFTER item_id");
+          } catch (Exception $e) {
+          }
+          try {
+            $db->exec("ALTER TABLE repair_parts MODIFY item_id INT NULL");
+          } catch (Exception $e) {
+          }
 
           $db->exec("CREATE TABLE IF NOT EXISTS repair_jobs (
       job_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -881,19 +1055,40 @@ try {
               $db->exec("ALTER TABLE repair_jobs ADD COLUMN total_amount DECIMAL(10,2) DEFAULT 0.00 AFTER status");
             if (!in_array('payment_status', $cols))
               $db->exec("ALTER TABLE repair_jobs ADD COLUMN payment_status VARCHAR(20) DEFAULT 'UNPAID' AFTER total_amount");
+            if (!in_array('walkin_name', $cols))
+              $db->exec("ALTER TABLE repair_jobs ADD COLUMN walkin_name VARCHAR(100) NULL AFTER notes");
+            if (!in_array('walkin_plate', $cols))
+              $db->exec("ALTER TABLE repair_jobs ADD COLUMN walkin_plate VARCHAR(20) NULL AFTER walkin_name");
+            if (!in_array('walkin_model', $cols))
+              $db->exec("ALTER TABLE repair_jobs ADD COLUMN walkin_model VARCHAR(50) NULL AFTER walkin_plate");
+
+            // Fix nullable columns for Walk-ins
+            $db->exec("ALTER TABLE repair_jobs MODIFY COLUMN customer_id INT NULL");
+            $db->exec("ALTER TABLE repair_jobs MODIFY COLUMN vehicle_id INT NULL");
           } catch (Exception $pe) {
           }
 
           $db->exec("CREATE TABLE IF NOT EXISTS repair_timeline (
       timeline_id INT AUTO_INCREMENT PRIMARY KEY,
       tenant_id INT NOT NULL,
+      user_id INT NOT NULL DEFAULT 0,
       job_id INT NOT NULL,
       status_update VARCHAR(50),
       remarks TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       INDEX (job_id),
-      INDEX (tenant_id)
+      INDEX (tenant_id),
+      INDEX (user_id)
     ) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;");
+
+          try {
+            $db->exec("ALTER TABLE repair_timeline ADD COLUMN user_id INT NOT NULL DEFAULT 0 AFTER tenant_id");
+          } catch (Exception $e) {
+          }
+          try {
+            $db->exec("ALTER TABLE repair_timeline ADD INDEX (user_id)");
+          } catch (Exception $e) {
+          }
 
           try {
             $db->exec("ALTER TABLE repair_timeline ADD COLUMN tenant_id INT NOT NULL AFTER timeline_id");
@@ -924,6 +1119,59 @@ try {
 
       // Audit Logs Table Heal/Creation
       try {
+        // Inventory Table Auto-Heal
+        $db->exec("CREATE TABLE IF NOT EXISTS inventory (
+          item_id INT AUTO_INCREMENT PRIMARY KEY,
+          tenant_id INT NOT NULL,
+          item_code VARCHAR(50),
+          item_name VARCHAR(100) NOT NULL,
+          brand VARCHAR(50),
+          quantity INT DEFAULT 0,
+          unit VARCHAR(20) DEFAULT 'pcs',
+          price DECIMAL(10,2) DEFAULT 0,
+          stock_threshold INT DEFAULT 5,
+          status VARCHAR(20) DEFAULT 'IN_STOCK',
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )");
+
+        // Ensure columns exist if table was created previously with older schema
+        try {
+          $db->exec("ALTER TABLE inventory ADD COLUMN price DECIMAL(10,2) DEFAULT 0");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE inventory ADD COLUMN stock_threshold INT DEFAULT 5");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE inventory ADD COLUMN item_code VARCHAR(50)");
+        } catch (Exception $e) {
+        }
+
+        // Repair Parts Link (Inventory -> Job Order)
+        $db->exec("CREATE TABLE IF NOT EXISTS repair_parts (
+          rp_id INT AUTO_INCREMENT PRIMARY KEY,
+          tenant_id INT NOT NULL,
+          job_id INT NOT NULL,
+          item_id INT NOT NULL,
+          quantity INT DEFAULT 1,
+          unit_price DECIMAL(10,2) DEFAULT 0,
+          total_price DECIMAL(10,2) DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )");
+
+        // Patch if subtotal exists instead
+        try {
+          $db->exec("ALTER TABLE repair_parts CHANGE subtotal total_price DECIMAL(10,2)");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE repair_parts ADD COLUMN tenant_id INT NOT NULL AFTER rp_id");
+        } catch (Exception $e) {
+        }
+
+
+        // Audit Logs
         $db->exec("CREATE TABLE IF NOT EXISTS audit_logs (
         log_id INT AUTO_INCREMENT PRIMARY KEY,
         tenant_id INT NULL,
@@ -944,6 +1192,17 @@ try {
         $db->exec("ALTER TABLE mechanics MODIFY COLUMN status VARCHAR(50) DEFAULT 'AVAILABLE'");
         $db->exec("ALTER TABLE service_bays MODIFY COLUMN status VARCHAR(50) DEFAULT 'AVAILABLE'");
         $db->exec("ALTER TABLE appointments MODIFY COLUMN status VARCHAR(50) DEFAULT 'PENDING'");
+
+        // Add shift_days to mechanics if missing
+        $checkCol = $db->query("SHOW COLUMNS FROM mechanics LIKE 'shift_days'");
+        if (!$checkCol->fetch()) {
+          $db->exec("ALTER TABLE mechanics ADD COLUMN shift_days VARCHAR(255) DEFAULT 'Mon,Tue,Wed,Thu,Fri,Sat'");
+        }
+
+        $checkReqCol = $db->query("SHOW COLUMNS FROM shift_requests LIKE 'requested_days'");
+        if (!$checkReqCol->fetch()) {
+          $db->exec("ALTER TABLE shift_requests ADD COLUMN requested_days VARCHAR(255) NULL");
+        }
       } catch (Exception $e) {
       }
 
@@ -957,8 +1216,16 @@ try {
       $stmt->execute([$tenant_id]);
       $services_list = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-      // Service Bays
-      $stmt = $db->prepare("SELECT * FROM service_bays WHERE tenant_id = ? ORDER BY bay_id ASC");
+      // Service Bays with active job info
+      $stmt = $db->prepare("SELECT b.*, 
+                   (SELECT job_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status IN ('PENDING', 'IN_PROGRESS') ORDER BY created_at DESC LIMIT 1) as active_job_id,
+                   (SELECT status FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status IN ('PENDING', 'IN_PROGRESS') ORDER BY created_at DESC LIMIT 1) as job_status,
+                   (SELECT mechanic_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status IN ('PENDING', 'IN_PROGRESS') ORDER BY created_at DESC LIMIT 1) as active_mechanic_id,
+                   (SELECT COALESCE(v.plate_no, r.walkin_plate) FROM repair_jobs r LEFT JOIN vehicles v ON r.vehicle_id = v.vehicle_id WHERE r.bay_id = b.bay_id AND r.tenant_id = b.tenant_id AND r.status IN ('PENDING', 'IN_PROGRESS') ORDER BY r.created_at DESC LIMIT 1) as plate_no,
+                   (SELECT m.full_name FROM repair_jobs r JOIN mechanics m ON r.mechanic_id = m.mechanic_id WHERE r.bay_id = b.bay_id AND r.tenant_id = b.tenant_id AND r.status IN ('PENDING', 'IN_PROGRESS') ORDER BY r.created_at DESC LIMIT 1) as mechanic_name
+                   FROM service_bays b 
+                   WHERE b.tenant_id = ? 
+                   ORDER BY b.bay_id ASC");
       $stmt->execute([$tenant_id]);
       $bays_list = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -982,7 +1249,11 @@ try {
       $inventory_list = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
       // Staff Accounts (from users table)
-      $stmt = $db->prepare("SELECT user_id, name, email, role_id, status FROM users WHERE tenant_id = ? ORDER BY role_id ASC");
+      try {
+        $db->exec("ALTER TABLE users ADD COLUMN profile_pic VARCHAR(255) NULL AFTER name");
+      } catch (Exception $e) {
+      }
+      $stmt = $db->prepare("SELECT user_id, name, email, profile_pic, role_id, status FROM users WHERE tenant_id = ? ORDER BY role_id ASC");
       $stmt->execute([$tenant_id]);
       $staff_list = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -1024,6 +1295,116 @@ try {
       if (empty($tenant_id))
         throw new Exception("Session expired.");
 
+      // --- PING TEST ---
+      if ($_GET['action'] === 'test_ping') {
+        echo "PONG";
+        exit;
+      }
+
+      // --- DASHBOARD JOBS HANDLER ---
+      if ($_GET['action'] === 'fetch_dashboard_jobs_diagnostic') {
+        @ob_clean();
+        header('Content-Type: application/json');
+        try {
+          $query = "SELECT 
+                      j.job_id, 
+                      j.status, 
+                      j.mechanic_id,
+                      j.bay_id,
+                      j.appointment_id,
+                      COALESCE(v.plate_no, v2.plate_no, j.walkin_plate, 'N/A') AS plate_no,
+                      COALESCE(v.make, v2.make, '') AS make,
+                      COALESCE(v.model, v2.model, j.walkin_model, '---') AS model,
+                      COALESCE(s.service_name, 'General Repair') AS service_name,
+                      COALESCE(m.full_name, u.name, 'Unassigned') AS mechanic_name,
+                      j.created_at,
+                      j.total_amount,
+                      j.customer_id,
+                      COALESCE(c.full_name, j.walkin_name, 'Walk-in') AS customer_name
+                    FROM repair_jobs j
+                    LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id
+                    LEFT JOIN vehicles v2 ON v2.vehicle_id = (
+                        SELECT v3.vehicle_id FROM vehicles v3 
+                        WHERE v3.customer_id = j.customer_id 
+                        LIMIT 1
+                    ) AND v.plate_no IS NULL
+                    LEFT JOIN services s ON j.service_id = s.service_id
+                    LEFT JOIN mechanics m ON j.mechanic_id = m.mechanic_id
+                    LEFT JOIN users u ON m.user_id = u.user_id
+                    LEFT JOIN customers c ON j.customer_id = c.customer_id";
+
+          $currentRole = strtoupper($_SESSION['role'] ?? '');
+
+          if ($currentRole === 'CASHIER' || $currentRole === 'STAFF') {
+            // CASHIER: Only show jobs that are COMPLETED and ready for payment collection
+            $query .= " WHERE j.tenant_id = ? AND j.status = 'COMPLETED'";
+          } elseif ($currentRole === 'MECHANIC') {
+            // MECHANIC: User only wants to see jobs that are currently being worked on
+            $query .= " WHERE j.tenant_id = ? AND j.status = 'IN_PROGRESS'";
+          } else {
+            // ADMIN: Needs to see the full queue (Upcoming and Active)
+            $query .= " WHERE j.tenant_id = ? AND j.status IN ('PENDING', 'IN_PROGRESS')";
+          }
+
+          $params = [$tenant_id];
+
+          if ($currentRole === 'MECHANIC') {
+            $mStmt = $db->prepare("SELECT mechanic_id FROM mechanics WHERE user_id = ? AND tenant_id = ?");
+            $mStmt->execute([$_SESSION['user_id'], $tenant_id]);
+            $my_mid = $mStmt->fetchColumn();
+            if ($my_mid) {
+              $query .= " AND j.mechanic_id = ?";
+              $params[] = $my_mid;
+            } else {
+              @ob_clean();
+              echo json_encode([]);
+              exit;
+            }
+          }
+          $query .= " ORDER BY j.updated_at DESC LIMIT 20";
+          $stmt = $db->prepare($query);
+          $stmt->execute($params);
+          $res = $stmt->fetchAll(PDO::FETCH_ASSOC);
+          echo json_encode($res ?: [], JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+        } catch (Throwable $e) {
+          @ob_clean();
+          echo json_encode(['error' => 'DB Error: ' . $e->getMessage()]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'fetch_settlement_history') {
+        @ob_clean();
+        header('Content-Type: application/json');
+        try {
+          $query = "SELECT 
+                      j.job_id, 
+                      j.status, 
+                      COALESCE(v.plate_no, v2.plate_no, j.walkin_plate, 'N/A') AS plate_no,
+                      COALESCE(v.make, v2.make, '') AS make,
+                      COALESCE(v.model, v2.model, j.walkin_model, '---') AS model,
+                      COALESCE(s.service_name, 'General Repair') AS service_name,
+                      j.created_at,
+                      j.total_amount,
+                      j.customer_id,
+                      COALESCE(c.full_name, j.walkin_name, 'Walk-in') AS customer_name
+                    FROM repair_jobs j
+                    LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id
+                    LEFT JOIN vehicles v2 ON v2.vehicle_id = (SELECT v3.vehicle_id FROM vehicles v3 WHERE v3.customer_id = j.customer_id LIMIT 1) AND v.plate_no IS NULL
+                    LEFT JOIN services s ON j.service_id = s.service_id
+                    LEFT JOIN customers c ON j.customer_id = c.customer_id
+                    WHERE j.tenant_id = ? AND (j.status IN ('COMPLETED', 'SETTLED')) AND j.payment_status = 'PAID'
+                    ORDER BY j.updated_at DESC LIMIT 50";
+          $stmt = $db->prepare($query);
+          $stmt->execute([$tenant_id]);
+          $res = $stmt->fetchAll(PDO::FETCH_ASSOC);
+          echo json_encode($res ?: []);
+        } catch (Throwable $e) {
+          echo json_encode(['error' => $e->getMessage()]);
+        }
+        exit;
+      }
+
       // --- SERVICES ---
       if ($_GET['action'] === 'add_service' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         try {
@@ -1043,11 +1424,11 @@ try {
             $ms->execute([$masterId]);
             $standard = $ms->fetch();
             if ($standard) {
-               if ($price < $standard['min_price'] || $price > $standard['max_price']) {
-                  throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($standard['min_price']) . " and ₱" . number_format($standard['max_price']));
-               }
-               // Force standard name and category if linked
-               $name = $standard['service_name'];
+              if ($price < $standard['min_price'] || $price > $standard['max_price']) {
+                throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($standard['min_price']) . " and ₱" . number_format($standard['max_price']));
+              }
+              // Force standard name and category if linked
+              $name = $standard['service_name'];
             }
           }
 
@@ -1087,10 +1468,10 @@ try {
             $ms->execute([$masterId]);
             $standard = $ms->fetch();
             if ($standard) {
-               if ($price < $standard['min_price'] || $price > $standard['max_price']) {
-                  throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($standard['min_price']) . " and ₱" . number_format($standard['max_price']));
-               }
-               $name = $standard['service_name'];
+              if ($price < $standard['min_price'] || $price > $standard['max_price']) {
+                throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($standard['min_price']) . " and ₱" . number_format($standard['max_price']));
+              }
+              $name = $standard['service_name'];
             }
           }
 
@@ -1135,11 +1516,84 @@ try {
         exit;
       }
       if ($_GET['action'] === 'fetch_vehicles') {
-        $stmt = $db->prepare("SELECT v.*, c.full_name as customer_name 
-                   FROM vehicles v 
-                   LEFT JOIN customers c ON v.customer_id = c.customer_id 
-                   WHERE v.tenant_id = ? 
-                   ORDER BY v.vehicle_id DESC");
+        try {
+          $stmt = $db->prepare("SELECT v.*, c.full_name as customer_name 
+                    FROM vehicles v 
+                    LEFT JOIN customers c ON v.customer_id = c.customer_id 
+                    WHERE v.tenant_id = ? 
+                    ORDER BY v.vehicle_id DESC");
+          $stmt->execute([$tenant_id]);
+          $res = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+
+          ob_clean(); // BURAHIN ANG ANUMANG WHITESPACE O WARNINGS SA TAAS
+          header('Content-Type: application/json');
+          echo json_encode($res);
+        } catch (Exception $e) {
+          ob_clean();
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'fetch_receipt_data') {
+        try {
+          $id = intval($_GET['job_id'] ?? 0);
+          $stmt = $db->prepare("SELECT j.*, 
+                               COALESCE(c.full_name, j.walkin_name) as customer, 
+                               COALESCE(v.plate_no, v2.plate_no, j.walkin_plate) as plate_no, 
+                               COALESCE(v.make, v2.make, '') as make, 
+                               COALESCE(v.model, v2.model, j.walkin_model) as model, 
+                               s.service_name 
+                               FROM repair_jobs j 
+                               LEFT JOIN customers c ON j.customer_id = c.customer_id 
+                               LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id 
+                               LEFT JOIN vehicles v2 ON v2.vehicle_id = (SELECT v3.vehicle_id FROM vehicles v3 WHERE v3.customer_id = j.customer_id LIMIT 1) AND v.plate_no IS NULL 
+                               LEFT JOIN services s ON j.service_id = s.service_id 
+                               WHERE j.job_id = ? AND j.tenant_id = ?");
+          $stmt->execute([$id, $tenant_id]);
+          $j = $stmt->fetch(PDO::FETCH_ASSOC);
+          if (!$j)
+            exit("Receipt not found.");
+
+          $shop = $db->prepare("SELECT shop_name, address, phone FROM tenants WHERE tenant_id = ?");
+          $shop->execute([$tenant_id]);
+          $s = $shop->fetch(PDO::FETCH_ASSOC);
+          $sn = $s['shop_name'] ?? 'Auto Shop';
+
+          ob_clean();
+          echo "<div style='text-align:center; margin-bottom:1.5rem; border-bottom:1px dashed #ccc; padding-bottom:1rem;'>
+                  <h2 style='margin:0;'>$sn</h2>
+                  <p style='font-size:0.8rem; color:#666; margin:5px 0;'>" . ($s['address'] ?? '') . "</p>
+                  <p style='font-size:0.8rem; color:#666; margin:0;'>Tel: " . ($s['phone'] ?? '') . "</p>
+                </div>
+                <div style='font-size:0.9rem; line-height:1.6;'>
+                  <p><strong>Job ID:</strong> #{$j['job_id']}</p>
+                  <p><strong>Date:</strong> " . date('M d, Y h:i A', strtotime($j['created_at'])) . "</p>
+                  <p><strong>Customer:</strong> " . ($j['customer'] ?: $j['walkin_name']) . "</p>
+                  <p><strong>Plate:</strong> " . ($j['plate_no'] ?: $j['walkin_plate']) . "</p>
+                  <div style='margin:1rem 0; border-top:1px solid #eee; border-bottom:1px solid #eee; padding:10px 0;'>
+                    <div style='display:flex; justify-content:space-between;'>
+                      <span>{$j['service_name']}</span>
+                      <strong>₱" . number_format($j['total_amount'], 2) . "</strong>
+                    </div>
+                  </div>
+                  <div style='display:flex; justify-content:space-between; font-size:1.1rem; font-weight:bold;'>
+                    <span>TOTAL:</span>
+                    <span>₱" . number_format($j['total_amount'], 2) . "</span>
+                  </div>
+                </div>
+                <div style='margin-top:2rem; text-align:center; font-size:0.8rem; color:#999;'>
+                  <p>Thank you for choosing $sn!</p>
+                  <p>This is your official service receipt.</p>
+                </div>";
+          exit;
+        } catch (Exception $e) {
+          exit("Error.");
+        }
+      }
+
+      if ($_GET['action'] === 'fetch_services') {
+        $stmt = $db->prepare("SELECT s.*, m.min_price, m.max_price FROM services s LEFT JOIN master_services m ON s.master_id = m.master_id WHERE s.tenant_id = ? ORDER BY s.service_name ASC");
         $stmt->execute([$tenant_id]);
         echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
         exit;
@@ -1182,19 +1636,26 @@ try {
           $id_type = trim($_POST['id_type'] ?? '');
 
           // Robust Insert with column check
-          $stmt = $db->prepare("INSERT INTO users (tenant_id, role_id, name, email, password_hash, mobile, address, id_type, id_file, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')");
-          $stmt->execute([$tenant_id, $role_id, $name, $email, $hash, $mobile, $address, $id_type, $id_file_path]);
-          $newUserId = $db->lastInsertId();
-
-          if (!$newUserId)
-            throw new Exception("Failed to retrieve new user ID.");
-
-          // Log the activity
           try {
-            $log = $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'CRUD', ?)");
-            $log->execute([$tenant_id, $_SESSION['user_id'] ?? 0, "Staff " . ($_SESSION['name'] ?? 'Owner') . " created new staff account: $email"]);
+            $db->exec("ALTER TABLE users ADD COLUMN mobile VARCHAR(20) NULL");
           } catch (Exception $e) {
           }
+          try {
+            $db->exec("ALTER TABLE users ADD COLUMN address TEXT NULL");
+          } catch (Exception $e) {
+          }
+          try {
+            $db->exec("ALTER TABLE users ADD COLUMN id_type VARCHAR(50) NULL");
+          } catch (Exception $e) {
+          }
+          try {
+            $db->exec("ALTER TABLE users ADD COLUMN id_file VARCHAR(255) NULL");
+          } catch (Exception $e) {
+          }
+
+          $stmt = $db->prepare("INSERT INTO users (tenant_id, name, email, password_hash, role_id, mobile, address, id_type, id_file, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')");
+          $stmt->execute([$tenant_id, $name, $email, $hash, $role_id, $mobile, $address, $id_type, $id_file_path]);
+          $newUserId = $db->lastInsertId();
 
           // Mechanic Sync
           if ($role_id == 5) {
@@ -1210,9 +1671,38 @@ try {
         exit;
       }
 
-      if ($_GET['action'] === 'fetch_staff') {
+      if ($_GET['action'] === 'fetch_mechanic_history') {
         try {
-          $stmt = $db->prepare("SELECT u.user_id, u.name, u.email, r.role_name, u.status FROM users u JOIN roles r ON u.role_id = r.role_id WHERE u.tenant_id = ? ORDER BY u.email DESC");
+          $mStmt = $db->prepare("SELECT mechanic_id FROM mechanics WHERE user_id = ? AND tenant_id = ?");
+          $mStmt->execute([$_SESSION['user_id'], $tenant_id]);
+          $my_mid = $mStmt->fetchColumn();
+          if (!$my_mid) {
+            echo json_encode([]);
+            exit;
+          }
+
+          $stmt = $db->prepare("SELECT t.*, 
+                                 COALESCE(v.plate_no, v2.plate_no, j.walkin_plate, 'N/A') as plate_no, 
+                                 COALESCE(v.make, v2.make, '') as make, 
+                                 COALESCE(v.model, v2.model, j.walkin_model, '---') as model, 
+                                 j.status as current_status
+                     FROM repair_timeline t
+                     JOIN repair_jobs j ON t.job_id = j.job_id
+                     LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id
+                     LEFT JOIN vehicles v2 ON v2.vehicle_id = (SELECT v3.vehicle_id FROM vehicles v3 WHERE v3.customer_id = j.customer_id LIMIT 1) AND v.plate_no IS NULL
+                     WHERE t.user_id = ? AND t.tenant_id = ? AND t.status_update = 'COMPLETED'
+                     ORDER BY t.created_at DESC LIMIT 50");
+          $stmt->execute([$_SESSION['user_id'], $tenant_id]);
+          echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
+        } catch (Exception $e) {
+          echo json_encode([]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'fetch_inventory_lookup') {
+        try {
+          $stmt = $db->prepare("SELECT item_name, brand, quantity, stock_threshold, status FROM inventory WHERE tenant_id = ? ORDER BY item_name ASC");
           $stmt->execute([$tenant_id]);
           echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
         } catch (Exception $e) {
@@ -1221,10 +1711,41 @@ try {
         exit;
       }
 
+
+      if ($_GET['action'] === 'fetch_staff') {
+        ob_clean(); // Ensure no extra output
+        try {
+          // Database Patch (Ensure column exists)
+          try {
+            $db->exec("ALTER TABLE users ADD COLUMN profile_pic VARCHAR(255) NULL AFTER name");
+          } catch (Exception $e) {
+          }
+
+          $stmt = $db->prepare("SELECT u.user_id, u.name, u.email, u.profile_pic, r.role_name, u.status FROM users u JOIN roles r ON u.role_id = r.role_id WHERE u.tenant_id = ? ORDER BY u.email DESC");
+          $stmt->execute([$tenant_id]);
+          header('Content-Type: application/json');
+          echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
+        } catch (Exception $e) {
+          header('Content-Type: application/json');
+          echo json_encode([]);
+        }
+        exit;
+      }
+
       if ($_GET['action'] === 'fetch_staff_details') {
         try {
+          // Ensure columns exist (Database Patch)
+          try {
+            $db->exec("ALTER TABLE users ADD COLUMN phone VARCHAR(20) NULL AFTER email");
+          } catch (Exception $e) {
+          }
+          try {
+            $db->exec("ALTER TABLE users ADD COLUMN address TEXT NULL AFTER phone");
+          } catch (Exception $e) {
+          }
+
           $uid = intval($_GET['user_id'] ?? 0);
-          $stmt = $db->prepare("SELECT u.user_id, u.name, u.email, r.role_name, u.status FROM users u JOIN roles r ON u.role_id = r.role_id WHERE u.user_id = ? AND u.tenant_id = ?");
+          $stmt = $db->prepare("SELECT u.user_id, u.name, u.email, u.phone, u.address, u.profile_pic, r.role_name, u.status, u.created_at FROM users u JOIN roles r ON u.role_id = r.role_id WHERE u.user_id = ? AND u.tenant_id = ?");
           $stmt->execute([$uid, $tenant_id]);
           $user = $stmt->fetch(PDO::FETCH_ASSOC);
           echo json_encode(['status' => 'success', 'data' => $user]);
@@ -1265,9 +1786,11 @@ try {
       }
       if ($_GET['action'] === 'fetch_bays') {
         $stmt = $db->prepare("SELECT b.*, 
-                   (SELECT job_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status NOT IN ('COMPLETED', 'CANCELLED') ORDER BY created_at DESC LIMIT 1) as active_job_id,
-                   (SELECT status FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status NOT IN ('COMPLETED', 'CANCELLED') ORDER BY created_at DESC LIMIT 1) as job_status,
-                   (SELECT mechanic_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status NOT IN ('COMPLETED', 'CANCELLED') ORDER BY created_at DESC LIMIT 1) as active_mechanic_id
+                   (SELECT job_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status IN ('PENDING', 'IN_PROGRESS') ORDER BY created_at DESC LIMIT 1) as active_job_id,
+                   (SELECT status FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status IN ('PENDING', 'IN_PROGRESS') ORDER BY created_at DESC LIMIT 1) as job_status,
+                   (SELECT mechanic_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status IN ('PENDING', 'IN_PROGRESS') ORDER BY created_at DESC LIMIT 1) as active_mechanic_id,
+                   (SELECT COALESCE(v.plate_no, r.walkin_plate) FROM repair_jobs r LEFT JOIN vehicles v ON r.vehicle_id = v.vehicle_id WHERE r.bay_id = b.bay_id AND r.tenant_id = b.tenant_id AND r.status IN ('PENDING', 'IN_PROGRESS') ORDER BY r.created_at DESC LIMIT 1) as plate_no,
+                   (SELECT m.full_name FROM repair_jobs r JOIN mechanics m ON r.mechanic_id = m.mechanic_id WHERE r.bay_id = b.bay_id AND r.tenant_id = b.tenant_id AND r.status IN ('PENDING', 'IN_PROGRESS') ORDER BY r.created_at DESC LIMIT 1) as mechanic_name
                    FROM service_bays b 
                    WHERE b.tenant_id = ? 
                    ORDER BY b.bay_id ASC");
@@ -1287,24 +1810,41 @@ try {
           exit;
         }
 
-        // Fetch current job
-        $stmt = $db->prepare("SELECT r.*, v.plate_no, v.make, v.model, c.full_name as customer_name, s.service_name 
+        // Fetch current job (only truly active ones)
+        $stmt = $db->prepare("SELECT r.*, 
+                   COALESCE(v.plate_no, r.walkin_plate) as plate_no, 
+                   COALESCE(v.make, '') as make, 
+                   COALESCE(v.model, r.walkin_model) as model, 
+                   COALESCE(c.full_name, r.walkin_name) as customer_name, 
+                   s.service_name 
                    FROM repair_jobs r
                    LEFT JOIN vehicles v ON r.vehicle_id = v.vehicle_id
                    LEFT JOIN customers c ON r.customer_id = c.customer_id
                    LEFT JOIN services s ON r.service_id = s.service_id
-                   WHERE r.bay_id = ? AND r.tenant_id = ? AND r.status NOT IN ('COMPLETED', 'CANCELLED')
+                   WHERE r.bay_id = ? AND r.tenant_id = ? AND r.status IN ('PENDING', 'IN_PROGRESS')
                    ORDER BY r.created_at DESC LIMIT 1");
         $stmt->execute([$bay_id, $tenant_id]);
         $current_job = $stmt->fetch(PDO::FETCH_ASSOC);
 
-        // Fetch history (last 5)
-        $stmt = $db->prepare("SELECT r.*, v.plate_no, s.service_name, c.full_name as customer_name
+        // Auto-sync bay status based on actual active jobs
+        if ($current_job) {
+          $db->prepare("UPDATE service_bays SET status = 'OCCUPIED' WHERE bay_id = ? AND tenant_id = ? AND status != 'OCCUPIED'")->execute([$bay_id, $tenant_id]);
+          $bay['status'] = 'OCCUPIED';
+        } else {
+          $db->prepare("UPDATE service_bays SET status = 'AVAILABLE' WHERE bay_id = ? AND tenant_id = ? AND status = 'OCCUPIED'")->execute([$bay_id, $tenant_id]);
+          $bay['status'] = 'AVAILABLE';
+        }
+
+        // Fetch history (last 5) - include SETTLED jobs too
+        $stmt = $db->prepare("SELECT r.*, 
+                   COALESCE(v.plate_no, r.walkin_plate) as plate_no, 
+                   s.service_name, 
+                   COALESCE(c.full_name, r.walkin_name) as customer_name
                    FROM repair_jobs r
                    LEFT JOIN vehicles v ON r.vehicle_id = v.vehicle_id
                    LEFT JOIN customers c ON r.customer_id = c.customer_id
                    LEFT JOIN services s ON r.service_id = s.service_id
-                   WHERE r.bay_id = ? AND r.tenant_id = ? AND r.status IN ('COMPLETED', 'CANCELLED')
+                   WHERE r.bay_id = ? AND r.tenant_id = ? AND r.status IN ('COMPLETED', 'CANCELLED', 'SETTLED')
                    ORDER BY r.completed_at DESC LIMIT 5");
         $stmt->execute([$bay_id, $tenant_id]);
         $history = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -1319,8 +1859,13 @@ try {
       }
 
       if ($_GET['action'] === 'fetch_mechanic_profile') {
+        @ob_clean();
+        header('Content-Type: application/json');
         $mech_id = $_GET['mechanic_id'] ?? 0;
-        $stmt = $db->prepare("SELECT * FROM mechanics WHERE mechanic_id = ? AND tenant_id = ?");
+        $stmt = $db->prepare("SELECT m.*, 
+                   (SELECT COUNT(*) FROM repair_jobs WHERE mechanic_id = m.mechanic_id AND status = 'IN_PROGRESS' AND tenant_id = m.tenant_id) as active_jobs_count
+                   FROM mechanics m 
+                   WHERE m.mechanic_id = ? AND m.tenant_id = ?");
         $stmt->execute([$mech_id, $tenant_id]);
         $mech = $stmt->fetch(PDO::FETCH_ASSOC);
 
@@ -1353,6 +1898,12 @@ try {
         $spec = trim($_POST['specialization'] ?? '');
         $email = trim($_POST['email'] ?? '');
         $password = $_POST['password'] ?? '';
+        $shift_start = $_POST['shift_start'] ?? '08:00:00';
+        $shift_end = $_POST['shift_end'] ?? '17:00:00';
+        $shift_days_arr = $_POST['shift_days'] ?? ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        $shift_days = is_array($shift_days_arr) ? implode(',', $shift_days_arr) : trim($shift_days_arr);
+        if (empty($shift_days))
+          $shift_days = 'Mon,Tue,Wed,Thu,Fri,Sat';
 
         if (empty($name) || empty($email) || empty($password)) {
           echo json_encode(['status' => 'error', 'message' => 'Name, Email, and Password are required.']);
@@ -1371,13 +1922,13 @@ try {
           }
 
           $passHash = password_hash($password, PASSWORD_DEFAULT);
-          $userStmt = $db->prepare("INSERT INTO users (tenant_id, email, password_hash, name, role_id, status) VALUES (?, ?, ?, ?, 5, 'ACTIVE')");
+          $userStmt = $db->prepare("INSERT INTO users (tenant_id, email, password_hash, name, role_id, status) VALUES (?, ?, ?, ?, ?, 'ACTIVE')");
           $userStmt->execute([$tenant_id, $email, $passHash, $name, 5]);
           $userId = $db->lastInsertId();
 
           // 2. Link to Mechanic Table
-          $stmt = $db->prepare("INSERT INTO mechanics (tenant_id, full_name, specialization, status, user_id) VALUES (?, ?, ?, 'AVAILABLE', ?)");
-          $stmt->execute([$tenant_id, $name, $spec, $userId]);
+          $stmt = $db->prepare("INSERT INTO mechanics (tenant_id, full_name, specialization, status, user_id, shift_start, shift_end, shift_days) VALUES (?, ?, ?, 'AVAILABLE', ?, ?, ?, ?)");
+          $stmt->execute([$tenant_id, $name, $spec, $userId, $shift_start, $shift_end, $shift_days]);
 
           $db->commit();
 
@@ -1403,7 +1954,8 @@ try {
                 WHEN m.full_name IS NOT NULL AND m.full_name != '' THEN m.full_name 
                 WHEN u.name IS NOT NULL AND u.name != '' THEN u.name 
                 ELSE 'Expert Mechanic' 
-               END as display_name 
+               END as display_name,
+               (SELECT COUNT(*) FROM repair_jobs WHERE mechanic_id = m.mechanic_id AND status = 'IN_PROGRESS' AND tenant_id = m.tenant_id) as active_jobs_count
                FROM mechanics m 
                LEFT JOIN users u ON m.user_id = u.user_id 
                WHERE m.tenant_id = ? 
@@ -1420,29 +1972,370 @@ try {
         exit;
       }
 
-      // --- INVENTORY ---
-      if ($_GET['action'] === 'add_inventory' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-        $code = trim($_POST['item_code'] ?? '');
-        $name = trim($_POST['item_name'] ?? '');
-        $brand = trim($_POST['brand'] ?? '');
-        $qty = intval($_POST['quantity'] ?? 0);
-        $price = floatval($_POST['price'] ?? 0);
+      if ($_GET['action'] === 'update_mechanic_shift' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        try {
+          // Role Check
+          $auth_role = strtoupper($_SESSION['role'] ?? '');
+          if ($auth_role !== 'OWNER' && $auth_role !== 'MANAGER') {
+            throw new Exception("Unauthorized: Only owners and managers can update shifts.");
+          }
 
-        if (empty($code) || empty($name))
-          throw new Exception("Code and Name required.");
+          $id = intval($_POST['mechanic_id'] ?? 0);
+          $start = $_POST['shift_start'] ?? '08:00:00';
+          $end = $_POST['shift_end'] ?? '17:00:00';
+          $shift_days_arr = $_POST['shift_days'] ?? ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+          $shift_days = is_array($shift_days_arr) ? implode(',', $shift_days_arr) : trim($shift_days_arr);
+          if (empty($shift_days))
+            $shift_days = 'Mon,Tue,Wed,Thu,Fri,Sat';
 
-        $stmt = $db->prepare("INSERT INTO inventory (tenant_id, item_code, item_name, brand, quantity, price, status) VALUES (?, ?, ?, ?, ?, ?, 'IN_STOCK')");
-        if ($stmt->execute([$tenant_id, $code, $name, $brand, $qty, $price])) {
-          $log = $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'CRUD', ?)");
-          $log->execute([$tenant_id, $_SESSION['user_id'], "Staff {$_SESSION['name']} added inventory: $name ($qty units)"]);
-          echo json_encode(['status' => 'success', 'message' => 'Item added to inventory.']);
+          if (!$id)
+            throw new Exception("Mechanic ID is required.");
+          $stmt = $db->prepare("UPDATE mechanics SET shift_start = ?, shift_end = ?, shift_days = ? WHERE mechanic_id = ? AND tenant_id = ?");
+          $stmt->execute([$start, $end, $shift_days, $id, $tenant_id]);
+          echo json_encode(['status' => 'success', 'message' => 'Shift schedule updated successfully.']);
+        } catch (Exception $e) {
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
         }
         exit;
       }
-      if ($_GET['action'] === 'fetch_inventory') {
-        $stmt = $db->prepare("SELECT * FROM inventory WHERE tenant_id = ? ORDER BY item_id DESC");
+
+      if ($_GET['action'] === 'request_shift_change' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        try {
+          $mechanic_user_id = $_SESSION['user_id'];
+          // Get mechanic_id for this user
+          $stmt = $db->prepare("SELECT mechanic_id FROM mechanics WHERE user_id = ? AND tenant_id = ?");
+          $stmt->execute([$mechanic_user_id, $tenant_id]);
+          $m_id = $stmt->fetchColumn();
+          if (!$m_id)
+            throw new Exception("Mechanic record not found.");
+
+          $start = $_POST['shift_start'] ?? '08:00:00';
+          $end = $_POST['shift_end'] ?? '17:00:00';
+          $reason = trim($_POST['reason'] ?? '');
+          $shift_days_arr = $_POST['shift_days'] ?? ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+          $shift_days = is_array($shift_days_arr) ? implode(',', $shift_days_arr) : trim($shift_days_arr);
+          if (empty($shift_days))
+            $shift_days = 'Mon,Tue,Wed,Thu,Fri,Sat';
+
+          $stmt = $db->prepare("INSERT INTO shift_requests (tenant_id, mechanic_id, requested_start, requested_end, requested_days, reason) VALUES (?, ?, ?, ?, ?, ?)");
+          $stmt->execute([$tenant_id, $m_id, $start, $end, $shift_days, $reason]);
+
+          echo json_encode(['status' => 'success', 'message' => 'Shift change request submitted.']);
+        } catch (Exception $e) {
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'fetch_shift_requests') {
+        $stmt = $db->prepare("SELECT sr.*, COALESCE(m.full_name, 'Unknown Mechanic') as full_name FROM shift_requests sr LEFT JOIN mechanics m ON sr.mechanic_id = m.mechanic_id WHERE sr.tenant_id = ? AND sr.status = 'PENDING' ORDER BY sr.created_at DESC");
         $stmt->execute([$tenant_id]);
         echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
+        exit;
+      }
+
+      if ($_GET['action'] === 'process_shift_request' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        try {
+          $auth_role = strtoupper($_SESSION['role'] ?? '');
+          if ($auth_role !== 'OWNER' && $auth_role !== 'MANAGER')
+            throw new Exception("Unauthorized.");
+
+          $req_id = intval($_POST['request_id']);
+          $status = $_POST['status']; // APPROVED or REJECTED
+
+          $db->beginTransaction();
+          $stmt = $db->prepare("UPDATE shift_requests SET status = ?, processed_by = ?, processed_at = CURRENT_TIMESTAMP WHERE request_id = ? AND tenant_id = ?");
+          $stmt->execute([$status, $_SESSION['user_id'], $req_id, $tenant_id]);
+
+          if ($status === 'APPROVED') {
+            $stmt = $db->prepare("SELECT requested_start, requested_end, requested_days, mechanic_id FROM shift_requests WHERE request_id = ?");
+            $stmt->execute([$req_id]);
+            $req = $stmt->fetch();
+            if ($req) {
+              $upd = $db->prepare("UPDATE mechanics SET shift_start = ?, shift_end = ?, shift_days = COALESCE(?, shift_days) WHERE mechanic_id = ?");
+              $upd->execute([$req['requested_start'], $req['requested_end'], $req['requested_days'] ?: null, $req['mechanic_id']]);
+            }
+          }
+          $db->commit();
+          echo json_encode(['status' => 'success', 'message' => "Request $status successfully."]);
+        } catch (Exception $e) {
+          if ($db->inTransaction())
+            $db->rollBack();
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
+      // --- INVENTORY ---
+      if ($_GET['action'] === 'add_inventory' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        try {
+          $item_code = trim($_POST['item_code'] ?? '');
+          $item_name = trim($_POST['item_name'] ?? '');
+          $brand = trim($_POST['brand'] ?? '');
+          $qty = intval($_POST['quantity'] ?? 0);
+          $price = floatval($_POST['price'] ?? 0);
+          $threshold = intval($_POST['stock_threshold'] ?? 5);
+
+          if (empty($item_name))
+            throw new Exception("Item name is required.");
+
+          $stmt = $db->prepare("INSERT INTO inventory (tenant_id, item_code, item_name, brand, quantity, price, stock_threshold, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'IN_STOCK')");
+          $stmt->execute([$tenant_id, $item_code, $item_name, $brand, $qty, $price, $threshold]);
+
+          echo json_encode(['status' => 'success', 'message' => 'Item added to inventory.']);
+        } catch (Exception $e) {
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
+
+
+      if ($_GET['action'] === 'remove_part_from_job') {
+        try {
+          $rpId = intval($_GET['rp_id'] ?? 0);
+
+          // Get details to return stock
+          $stmt = $db->prepare("SELECT item_id, quantity FROM repair_parts WHERE rp_id = ?");
+          $stmt->execute([$rpId]);
+          $part = $stmt->fetch(PDO::FETCH_ASSOC);
+
+          if ($part) {
+            $stmt = $db->prepare("UPDATE inventory SET quantity = quantity + ? WHERE item_id = ?");
+            $stmt->execute([$part['quantity'], $part['item_id']]);
+
+            $stmt = $db->prepare("DELETE FROM repair_parts WHERE rp_id = ?");
+            $stmt->execute([$rpId]);
+          }
+
+          echo json_encode(['status' => 'success', 'message' => 'Part removed and stock returned.']);
+        } catch (Exception $e) {
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
+
+
+      // --- REPAIR JOBS ENGINE (NEW) ---
+      if ($_GET['action'] === 'update_job_part_qty' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        try {
+          $rp_id = intval($_POST['rp_id'] ?? 0);
+          $new_qty = intval($_POST['quantity'] ?? 0);
+          if ($new_qty < 1)
+            throw new Exception("Quantity must be at least 1.");
+
+          $db->beginTransaction();
+          $stmt = $db->prepare("SELECT rp.*, i.quantity as stock FROM repair_parts rp JOIN inventory i ON rp.item_id = i.item_id WHERE rp.rp_id = ? AND rp.tenant_id = ?");
+          $stmt->execute([$rp_id, $tenant_id]);
+          $rp = $stmt->fetch(PDO::FETCH_ASSOC);
+
+          if (!$rp)
+            throw new Exception("Record not found.");
+
+          $diff = $new_qty - $rp['quantity'];
+          if ($diff > 0 && $rp['stock'] < $diff)
+            throw new Exception("Not enough stock.");
+
+          $new_total = $rp['unit_price'] * $new_qty;
+          $db->prepare("UPDATE repair_parts SET quantity = ?, total_price = ? WHERE rp_id = ?")->execute([$new_qty, $new_total, $rp_id]);
+          $db->prepare("UPDATE inventory SET quantity = quantity - ? WHERE item_id = ?")->execute([$diff, $rp['item_id']]);
+
+          $db->commit();
+          echo json_encode(['status' => 'success', 'message' => 'Quantity updated.']);
+        } catch (Exception $e) {
+          if ($db->inTransaction())
+            $db->rollBack();
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'get_job_details') {
+        try {
+          $jid = intval($_GET['id'] ?? 0);
+          $stmt = $db->prepare("SELECT j.*, 
+                                COALESCE(v.plate_no, v2.plate_no, j.walkin_plate, 'N/A') as plate_number, 
+                                COALESCE(v.model, v2.model, j.walkin_model, 'Walk-in') as vehicle_model, 
+                                s.service_name,
+                                s.price as service_price 
+                                FROM repair_jobs j 
+                                LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id 
+                                LEFT JOIN vehicles v2 ON j.customer_id = v2.customer_id AND v.plate_no IS NULL
+                                LEFT JOIN services s ON j.service_id = s.service_id 
+                                WHERE j.job_id = ? AND j.tenant_id = ?");
+          $stmt->execute([$jid, $tenant_id]);
+          echo json_encode($stmt->fetch(PDO::FETCH_ASSOC));
+        } catch (Exception $e) {
+          echo json_encode(null);
+        }
+        exit;
+      }
+
+      // Redundant fetch_available_resources removed (Moved to consolidated handler below)
+
+
+      if ($_GET['action'] === 'add_part_to_job' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        try {
+          $jid = intval($_POST['job_id'] ?? 0);
+          $iid = intval($_POST['item_id'] ?? 0);
+          $qty = intval($_POST['quantity'] ?? 1);
+
+          $db->beginTransaction();
+          // Check stock
+          $iStmt = $db->prepare("SELECT quantity, item_name, price FROM inventory WHERE item_id = ? AND tenant_id = ?");
+          $iStmt->execute([$iid, $tenant_id]);
+          $item = $iStmt->fetch(PDO::FETCH_ASSOC);
+
+          if (!$item || $item['quantity'] < $qty)
+            throw new Exception("Insufficient stock for " . ($item['item_name'] ?? 'item'));
+
+          // Add to repair_parts
+          $pStmt = $db->prepare("INSERT INTO repair_parts (job_id, tenant_id, item_id, quantity, unit_price, total_price) VALUES (?, ?, ?, ?, ?, ?)");
+          $total = $item['price'] * $qty;
+          $pStmt->execute([$jid, $tenant_id, $iid, $qty, $item['price'], $total]);
+
+          // Deduct from inventory
+          $db->prepare("UPDATE inventory SET quantity = quantity - ? WHERE item_id = ?")->execute([$qty, $iid]);
+
+          $db->commit();
+
+          // Sync Job Total for accuracy
+          try {
+            $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
+          } catch (Exception $ex) {
+          }
+
+          echo json_encode(['status' => 'success', 'message' => 'Part added to job.']);
+        } catch (Exception $e) {
+          if ($db->inTransaction())
+            $db->rollBack();
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'add_service_to_job' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        try {
+          $jid = intval($_POST['job_id'] ?? 0);
+          $sid = intval($_POST['service_id'] ?? 0);
+
+          $db->beginTransaction();
+
+          // Check if already added
+          $check = $db->prepare("SELECT rp_id FROM repair_parts WHERE job_id = ? AND service_id = ? AND tenant_id = ?");
+          $check->execute([$jid, $sid, $tenant_id]);
+          if ($check->fetch()) {
+            throw new Exception("This service has already been added to this job.");
+          }
+
+          $sStmt = $db->prepare("SELECT service_name, price FROM services WHERE service_id = ? AND tenant_id = ?");
+          $sStmt->execute([$sid, $tenant_id]);
+          $service = $sStmt->fetch(PDO::FETCH_ASSOC);
+          if (!$service)
+            throw new Exception("Service not found.");
+
+          $pStmt = $db->prepare("INSERT INTO repair_parts (job_id, tenant_id, service_id, quantity, unit_price, total_price) VALUES (?, ?, ?, 1, ?, ?)");
+          $pStmt->execute([$jid, $tenant_id, $sid, $service['price'], $service['price']]);
+
+          $db->commit();
+
+          // Sync Job Total
+          $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
+
+          echo json_encode(['status' => 'success', 'message' => 'Service added to job.']);
+        } catch (Exception $e) {
+          if ($db->inTransaction())
+            $db->rollBack();
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'remove_part_from_job') {
+        try {
+          $rp_id = intval($_GET['rp_id'] ?? 0);
+          $db->beginTransaction();
+
+          $sStmt = $db->prepare("SELECT item_id, quantity FROM repair_parts WHERE rp_id = ? AND tenant_id = ?");
+          $sStmt->execute([$rp_id, $tenant_id]);
+          $rp = $sStmt->fetch(PDO::FETCH_ASSOC);
+
+          if ($rp) {
+            $db->prepare("UPDATE inventory SET quantity = quantity + ? WHERE item_id = ?")->execute([$rp['quantity'], $rp['item_id']]);
+            $db->prepare("DELETE FROM repair_parts WHERE rp_id = ?")->execute([$rp_id]);
+          }
+
+          $db->commit();
+
+          // Sync Job Total for accuracy
+          try {
+            $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
+          } catch (Exception $ex) {
+          }
+
+          echo json_encode(['status' => 'success', 'message' => 'Part removed.']);
+        } catch (Exception $e) {
+          if ($db->inTransaction())
+            $db->rollBack();
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'fetch_job_parts') {
+        try {
+          $jid = intval($_GET['job_id'] ?? 0);
+          $stmt = $db->prepare("SELECT rp.*, COALESCE(i.item_name, s.service_name, 'Unknown Item') as item_name 
+                                FROM repair_parts rp 
+                                LEFT JOIN inventory i ON rp.item_id = i.item_id 
+                                LEFT JOIN services s ON rp.service_id = s.service_id
+                                WHERE rp.job_id = ? AND rp.tenant_id = ?");
+          $stmt->execute([$jid, $tenant_id]);
+          echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
+        } catch (Exception $e) {
+          echo json_encode([]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'fetch_inventory') {
+        try {
+          $stmt = $db->prepare("SELECT * FROM inventory WHERE tenant_id = ? ORDER BY item_id DESC");
+          $stmt->execute([$tenant_id]);
+          echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
+        } catch (Exception $e) {
+          echo json_encode([]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'adjust_stock' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        try {
+          $itemId = intval($_POST['item_id'] ?? 0);
+          $newQty = intval($_POST['quantity'] ?? 0);
+          $newPrice = floatval($_POST['price'] ?? 0);
+          $newThreshold = intval($_POST['stock_threshold'] ?? 5);
+
+          $stmt = $db->prepare("UPDATE inventory SET quantity = ?, price = ?, stock_threshold = ? WHERE item_id = ? AND tenant_id = ?");
+          $stmt->execute([$newQty, $newPrice, $newThreshold, $itemId, $tenant_id]);
+
+          echo json_encode(['status' => 'success', 'message' => 'Stock adjusted successfully.']);
+        } catch (Exception $e) {
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'fetch_item_details') {
+        try {
+          $itemId = intval($_GET['item_id'] ?? 0);
+          $stmt = $db->prepare("SELECT * FROM inventory WHERE item_id = ? AND tenant_id = ?");
+          $stmt->execute([$itemId, $tenant_id]);
+          echo json_encode($stmt->fetch(PDO::FETCH_ASSOC));
+        } catch (Exception $e) {
+          echo json_encode([]);
+        }
         exit;
       }
 
@@ -1709,7 +2602,7 @@ try {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
           )");
 
-          $stmt = $db->prepare("SELECT * FROM customers WHERE tenant_id = ? ORDER BY full_name ASC");
+          $stmt = $db->prepare("SELECT * FROM customers WHERE tenant_id = ? AND mobile != 'WALKIN' ORDER BY full_name ASC");
           $stmt->execute([$tenant_id]);
           $data = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -1804,18 +2697,50 @@ try {
         echo json_encode(['count' => $stmt->fetchColumn()]);
         exit;
       }
-
       if ($_GET['action'] === 'fetch_all_appointments') {
+        while (ob_get_level())
+          ob_end_clean();
+        header('Content-Type: application/json');
+        $tenant_id = $_SESSION['tenant_id'] ?? 0;
+        if (!$tenant_id) {
+          echo json_encode([]);
+          exit;
+        }
         try {
-          $stmt = $db->prepare("SELECT a.*, c.full_name as customer_name, v.plate_no, v.make, v.model, s.service_name, s.price as service_price 
-                     FROM appointments a 
-                     LEFT JOIN customers c ON a.customer_id = c.customer_id 
-                     LEFT JOIN vehicles v ON a.vehicle_id = v.vehicle_id 
-                     LEFT JOIN services s ON a.service_id = s.service_id 
-                     WHERE a.tenant_id = ? 
-                     ORDER BY a.appointment_date DESC, a.appointment_time ASC LIMIT 100");
-          $stmt->execute([$tenant_id]);
-          echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
+          $sort = $_GET['sort'] ?? 'latest';
+          $orderBy = "COALESCE(a.created_at, a.appointment_id) DESC";
+          if ($sort === 'date')
+            $orderBy = "a.appointment_date DESC, a.appointment_time DESC";
+
+          $search = $_GET['search'] ?? '';
+          $searchQuery = "";
+          $params = [$tenant_id];
+
+          if (!empty($search)) {
+            $searchQuery = " AND (c.full_name LIKE ? OR v.plate_no LIKE ? OR v2.plate_no LIKE ? OR s.service_name LIKE ?)";
+            $searchTerm = "%$search%";
+            $params = array_merge($params, [$searchTerm, $searchTerm, $searchTerm, $searchTerm]);
+          }
+
+          $stmt = $db->prepare("SELECT a.*, c.full_name as customer_name, 
+                      COALESCE(v.plate_no, v2.plate_no) as plate_no,
+                      COALESCE(v.make, v2.make) as make,
+                      COALESCE(v.model, v2.model) as model,
+                      s.service_name, s.price as service_price,
+                      m_assigned.full_name as assigned_mechanic_name,
+                      m_requested.full_name as requested_mechanic_name
+                      FROM appointments a 
+                      LEFT JOIN customers c ON a.customer_id = c.customer_id 
+                      LEFT JOIN vehicles v ON a.vehicle_id = v.vehicle_id 
+                      LEFT JOIN vehicles v2 ON a.customer_id = v2.customer_id AND v.vehicle_id IS NULL
+                      LEFT JOIN services s ON a.service_id = s.service_id 
+                      LEFT JOIN mechanics m_assigned ON a.mechanic_id = m_assigned.mechanic_id
+                      LEFT JOIN mechanics m_requested ON a.requested_mechanic_id = m_requested.mechanic_id
+                      WHERE a.tenant_id = ? AND a.status != 'COMPLETED' AND a.status != 'CANCELLED' $searchQuery
+                      ORDER BY $orderBy LIMIT 100");
+          $stmt->execute($params);
+          $data = $stmt->fetchAll(PDO::FETCH_ASSOC);
+          echo json_encode($data);
         } catch (Exception $e) {
           echo json_encode([]);
         }
@@ -1833,38 +2758,51 @@ try {
             throw new Exception("Parameters missing: ID=$id Status=$status");
           }
 
+          // Validation: If assigning resources, check availability
+          if ($status === 'CONFIRMED' && $bay_id) {
+            $bayCheck = $db->prepare("SELECT status FROM service_bays WHERE bay_id = ? AND tenant_id = ?");
+            $bayCheck->execute([$bay_id, $tenant_id]);
+            if ($bayCheck->fetchColumn() === 'OCCUPIED') {
+              throw new Exception("Selection Error: The chosen service bay is already occupied.");
+            }
+          }
+          if ($status === 'CONFIRMED' && $mechanic_id) {
+            // 1. Check Shift
+            $mechCheck = $db->prepare("SELECT full_name, shift_start, shift_end FROM mechanics WHERE mechanic_id = ? AND tenant_id = ?");
+            $mechCheck->execute([$mechanic_id, $tenant_id]);
+            $mInfo = $mechCheck->fetch();
+
+            if ($mInfo) {
+              // Get appointment info
+              $appInfo = $db->prepare("SELECT appointment_date, appointment_time FROM appointments WHERE appointment_id = ?");
+              $appInfo->execute([$id]);
+              $a = $appInfo->fetch();
+
+              if ($a) {
+                $aTime = $a['appointment_time'];
+                if ($aTime < $mInfo['shift_start'] || $aTime > $mInfo['shift_end']) {
+                  $sStr = date('h:i A', strtotime($mInfo['shift_start']));
+                  $eStr = date('h:i A', strtotime($mInfo['shift_end']));
+                  throw new Exception("Shift Error: Mechanic {$mInfo['full_name']} only works from $sStr to $eStr.");
+                }
+
+                // 2. Check Overlap (Existing Confirmed Appointments at same date/time)
+                $overlapCheck = $db->prepare("SELECT COUNT(*) FROM appointments WHERE mechanic_id = ? AND appointment_date = ? AND appointment_time = ? AND status = 'CONFIRMED' AND appointment_id != ?");
+                $overlapCheck->execute([$mechanic_id, $a['appointment_date'], $aTime, $id]);
+                if ($overlapCheck->fetchColumn() > 0) {
+                  throw new Exception("Collision Error: Mechanic {$mInfo['full_name']} already has a confirmed appointment at this time.");
+                }
+              }
+            }
+          }
+
           // 1. Basic Status Update
           $stmt = $db->prepare("UPDATE appointments SET status = ?, mechanic_id = ?, bay_id = ? WHERE appointment_id = ? AND tenant_id = ?");
           $stmt->execute([$status, $mechanic_id, $bay_id, $id, $tenant_id]);
 
-          // 2. Extra steps only for confirmation
+          // 2. Confirmation logic: Decoupled from Job Creation
           if ($status === 'CONFIRMED') {
-            $apptQ = $db->prepare("SELECT * FROM appointments WHERE appointment_id = ? AND tenant_id = ?");
-            $apptQ->execute([$id, $tenant_id]);
-            $appt = $apptQ->fetch(PDO::FETCH_ASSOC);
-
-            if ($appt) {
-              $price = $appt['total_estimate'] ?? ($appt['estimated_amount'] ?? 0);
-              $jobStmt = $db->prepare("INSERT INTO repair_jobs (tenant_id, customer_id, vehicle_id, service_id, appointment_id, mechanic_id, bay_id, status, total_amount) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)");
-              $jobStmt->execute([
-                $tenant_id,
-                $appt['customer_id'],
-                $appt['vehicle_id'],
-                $appt['service_id'],
-                $id,
-                $mechanic_id,
-                $bay_id,
-                $price
-              ]);
-              $newJobId = $db->lastInsertId();
-
-              $db->prepare("INSERT INTO repair_timeline (job_id, status_update, remarks) VALUES (?, 'PENDING', 'Repairs initialized from confirmed booking.')")->execute([$newJobId]);
-
-              if ($mechanic_id)
-                $db->prepare("UPDATE mechanics SET status = 'BUSY' WHERE mechanic_id = ?")->execute([$mechanic_id]);
-              if ($bay_id)
-                $db->prepare("UPDATE service_bays SET status = 'OCCUPIED' WHERE bay_id = ?")->execute([$bay_id]);
-            }
+            // Just confirmed the schedule
           }
 
           // 3. Log it
@@ -1881,17 +2819,78 @@ try {
         exit;
       }
 
+      if ($_GET['action'] === 'start_repair' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        try {
+          $id = intval($_POST['appointment_id'] ?? 0);
+          if (!$id)
+            throw new Exception("Invalid Appointment ID");
+
+          $db->beginTransaction();
+
+          // 1. Fetch appointment details
+          $apptQ = $db->prepare("SELECT * FROM appointments WHERE appointment_id = ? AND tenant_id = ?");
+          $apptQ->execute([$id, $tenant_id]);
+          $appt = $apptQ->fetch(PDO::FETCH_ASSOC);
+
+          if (!$appt)
+            throw new Exception("Appointment not found.");
+          if ($appt['status'] === 'COMPLETED')
+            throw new Exception("Already started or completed.");
+
+          // 2. Create Job Order
+          $price = $appt['total_estimate'] ?? 0;
+          $jobStmt = $db->prepare("INSERT INTO repair_jobs (tenant_id, customer_id, vehicle_id, service_id, appointment_id, mechanic_id, bay_id, status, total_amount) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)");
+          $jobStmt->execute([
+            $tenant_id,
+            $appt['customer_id'],
+            $appt['vehicle_id'],
+            $appt['service_id'],
+            $id,
+            $appt['mechanic_id'],
+            $appt['bay_id'],
+            $price
+          ]);
+          $newJobId = $db->lastInsertId();
+
+          // 3. Mark Appointment as COMPLETED (or STARTED/ARCHIVED) so it disappears from active list or stays as history
+          $db->prepare("UPDATE appointments SET status = 'COMPLETED' WHERE appointment_id = ?")->execute([$id]);
+
+          // 4. Initial Timeline
+          $db->prepare("INSERT INTO repair_timeline (job_id, status_update, remarks, tenant_id, user_id) VALUES (?, 'PENDING', 'Repairs initialized from manual check-in.', ?, ?)")
+            ->execute([$newJobId, $tenant_id, $_SESSION['user_id']]);
+
+          $db->commit();
+          echo json_encode(['status' => 'success', 'message' => "Job Order #$newJobId created. Repair started!"]);
+        } catch (Exception $e) {
+          if ($db->inTransaction())
+            $db->rollBack();
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
       if ($_GET['action'] === 'fetch_available_resources') {
         try {
-          $prefId = intval($_GET['preferred_id'] ?? 0);
-          // Optimized diagnostic query with fallbacks for missing columns
-          $mechanicQuery = "SELECT mechanic_id, full_name, status FROM mechanics WHERE tenant_id = ?";
+          $prefMechId = intval($_GET['current_mechanic_id'] ?? 0);
+          $prefBayId = intval($_GET['preferred_id'] ?? 0);
 
+          // Consolidated resource fetching: Show only mechanics with 0 IN_PROGRESS jobs (plus the current one)
+          $mechanicQuery = "SELECT m.mechanic_id, COALESCE(m.full_name, u.name, 'Expert Mechanic') as full_name, m.shift_start, m.shift_end, m.shift_days
+                            FROM mechanics m 
+                            LEFT JOIN users u ON m.user_id = u.user_id
+                            WHERE m.tenant_id = ? 
+                            AND (
+                                (SELECT COUNT(*) FROM repair_jobs WHERE mechanic_id = m.mechanic_id AND status = 'IN_PROGRESS' AND tenant_id = m.tenant_id) = 0
+                                OR m.mechanic_id = ?
+                            )
+                            ORDER BY m.full_name ASC";
           $mStmt = $db->prepare($mechanicQuery);
-          $mStmt->execute([$tenant_id]);
+          $mStmt->execute([$tenant_id, $prefMechId]);
 
-          $bays = $db->prepare("SELECT bay_id, bay_name, status FROM service_bays WHERE tenant_id = ? ORDER BY bay_id ASC");
-          $bays->execute([$tenant_id]);
+          // Filter out OCCUPIED bays, but keep the current/preferred one selectable
+          $bayQuery = "SELECT bay_id, bay_name, status FROM service_bays WHERE tenant_id = ? AND (status = 'AVAILABLE' OR bay_id = ?) ORDER BY bay_id ASC";
+          $bays = $db->prepare($bayQuery);
+          $bays->execute([$tenant_id, $prefBayId]);
 
           $pending = $db->prepare("SELECT r.job_id, v.plate_no, s.service_name 
                       FROM repair_jobs r 
@@ -1911,6 +2910,40 @@ try {
         }
         exit;
       }
+      if ($_GET['action'] === 'fetch_my_upcoming_appointments') {
+        try {
+          // Identify mechanic_id for the current user
+          $stmt_m = $db->prepare("SELECT mechanic_id FROM mechanics WHERE user_id = ? AND tenant_id = ?");
+          $stmt_m->execute([$_SESSION['user_id'], $tenant_id]);
+          $m_id = $stmt_m->fetchColumn();
+
+          if (!$m_id) {
+            echo json_encode([]);
+            exit;
+          }
+
+          // Fetch CONFIRMED appointments assigned to this mechanic that are today or in the future
+          $stmt = $db->prepare("SELECT a.*, c.full_name as customer_name, 
+                      COALESCE(v.plate_no, v2.plate_no) as plate_no,
+                      COALESCE(v.make, v2.make) as make,
+                      COALESCE(v.model, v2.model) as model,
+                      s.service_name 
+                      FROM appointments a 
+                      LEFT JOIN customers c ON a.customer_id = c.customer_id 
+                      LEFT JOIN vehicles v ON a.vehicle_id = v.vehicle_id 
+                      LEFT JOIN vehicles v2 ON a.customer_id = v2.customer_id AND v.vehicle_id IS NULL
+                      LEFT JOIN services s ON a.service_id = s.service_id 
+                      WHERE a.tenant_id = ? AND a.mechanic_id = ? 
+                      AND a.status = 'CONFIRMED'
+                      AND (a.appointment_date >= CURDATE())
+                      ORDER BY a.appointment_date ASC, a.appointment_time ASC");
+          $stmt->execute([$tenant_id, $m_id]);
+          echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
+        } catch (Exception $e) {
+          echo json_encode([]);
+        }
+        exit;
+      }
       if ($_GET['action'] === 'fetch_unpaid_appointments') {
         $stmt = $db->prepare("SELECT a.*, c.full_name as customer_name, v.plate_no, s.service_name 
                    FROM appointments a 
@@ -1924,18 +2957,34 @@ try {
       }
 
       if ($_GET['action'] === 'fetch_job_orders') {
+        while (ob_get_level())
+          ob_end_clean();
+        header('Content-Type: application/json');
         try {
-          $stmt = $db->prepare("SELECT j.*, v.plate_no, v.make, v.model, s.service_name, 
-                     COALESCE(m.full_name, 'No Mechanic') as mechanic_name,
-                     b.bay_name,
-                     (SELECT remarks FROM repair_timeline WHERE job_id = j.job_id AND remarks != '' ORDER BY created_at DESC LIMIT 1) as latest_remarks
-                     FROM repair_jobs j
-                     LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id
-                     LEFT JOIN services s ON j.service_id = s.service_id
-                     LEFT JOIN mechanics m ON j.mechanic_id = m.mechanic_id
-                     LEFT JOIN service_bays b ON j.bay_id = b.bay_id
-                     WHERE j.tenant_id = ? AND j.status != 'CANCELLED'
-                     ORDER BY j.created_at DESC");
+          // ELITE JO QUERY: Now with Super Forgiving Vehicle Fallback
+          $stmt = $db->prepare("SELECT j.*, 
+                      COALESCE(c.full_name, j.walkin_name) as customer_name,
+                      COALESCE(v.plate_no, v2.plate_no, j.walkin_plate) as plate_no,
+                      COALESCE(v.make, v2.make) as make,
+                      COALESCE(v.model, v2.model, j.walkin_model) as model,
+                      s.service_name, 
+                      COALESCE(m.full_name, 'No Mechanic') as mechanic_name,
+                      b.bay_name,
+                      (SELECT remarks FROM repair_timeline WHERE job_id = j.job_id AND remarks != '' ORDER BY created_at DESC LIMIT 1) as latest_remarks
+                      FROM repair_jobs j
+                      LEFT JOIN customers c ON j.customer_id = c.customer_id
+                      LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id
+                      LEFT JOIN vehicles v2 ON v2.vehicle_id = (
+                        SELECT v3.vehicle_id FROM vehicles v3 
+                        WHERE v3.customer_id = j.customer_id 
+                        LIMIT 1
+                      ) AND v.plate_no IS NULL
+                      LEFT JOIN services s ON j.service_id = s.service_id
+                      LEFT JOIN mechanics m ON j.mechanic_id = m.mechanic_id
+                      LEFT JOIN service_bays b ON j.bay_id = b.bay_id
+                      WHERE j.tenant_id = ? AND j.status NOT IN ('CANCELLED', 'SETTLED')
+                      GROUP BY j.job_id
+                      ORDER BY j.updated_at DESC");
           $stmt->execute([$tenant_id]);
           $res = $stmt->fetchAll(PDO::FETCH_ASSOC);
           echo json_encode($res ?: []);
@@ -1977,12 +3026,7 @@ try {
             throw new Exception("Invalid job data.");
           }
 
-          // Enforce rule: Must have BOTH a mechanic and a bay to save updates
-          if (empty($mechanicId) || empty($bayId)) {
-            throw new Exception("Operation Denied: A mechanic and a service bay must be assigned to this job first.");
-          }
-
-          // Get old state to handle status transfers
+          // Get old state to handle status transfers and missing fields
           $oldJob = $db->prepare("SELECT mechanic_id, bay_id, status FROM repair_jobs WHERE job_id = ? AND tenant_id = ?");
           $oldJob->execute([$jobId, $tenant_id]);
           $old = $oldJob->fetch(PDO::FETCH_ASSOC);
@@ -1991,11 +3035,32 @@ try {
             throw new Exception("Job not found.");
           }
 
-          // Critical Fix: Never wipe existing mechanic or bay if the submission didn't provide one
+          // Use old values if new ones are not provided (Critical for Mechanic Role/Locked UI)
           if (empty($mechanicId))
             $mechanicId = $old['mechanic_id'];
           if (empty($bayId))
             $bayId = $old['bay_id'];
+
+          // Enforce rule: Must have BOTH a mechanic and a bay to save updates
+          if (empty($mechanicId) || empty($bayId)) {
+            throw new Exception("Operation Denied: A mechanic and a service bay must be assigned to this job first.");
+          }
+
+          // Validation: If resource changed, check availability
+          if ($mechanicId != $old['mechanic_id']) {
+            $mechCheck = $db->prepare("SELECT status FROM mechanics WHERE mechanic_id = ? AND tenant_id = ?");
+            $mechCheck->execute([$mechanicId, $tenant_id]);
+            if ($mechCheck->fetchColumn() === 'BUSY') {
+              throw new Exception("Selection Error: The newly selected mechanic is currently busy.");
+            }
+          }
+          if ($bayId != $old['bay_id']) {
+            $bayCheck = $db->prepare("SELECT status FROM service_bays WHERE bay_id = ? AND tenant_id = ?");
+            $bayCheck->execute([$bayId, $tenant_id]);
+            if ($bayCheck->fetchColumn() === 'OCCUPIED') {
+              throw new Exception("Selection Error: The newly selected service bay is already occupied.");
+            }
+          }
 
           $checklist = $_POST['checklist'] ?? null;
 
@@ -2010,27 +3075,24 @@ try {
           $stmt = $db->prepare("UPDATE repair_jobs SET status = ?, mechanic_id = ?, bay_id = ?, checklist = ?, updated_at = NOW() $timeUpdate WHERE job_id = ? AND tenant_id = ?");
           $stmt->execute([$newStatus, $mechanicId, $bayId, $checklist, $jobId, $tenant_id]);
 
-          $db->prepare("INSERT INTO repair_timeline (job_id, status_update, remarks, tenant_id) VALUES (?, ?, ?, ?)")
-            ->execute([$jobId, $newStatus, $remarks, $tenant_id]);
+          $db->prepare("INSERT INTO repair_timeline (job_id, status_update, remarks, tenant_id, user_id) VALUES (?, ?, ?, ?, ?)")
+            ->execute([$jobId, $newStatus, $remarks, $tenant_id, $_SESSION['user_id']]);
 
-          // Resource status management
-          if ($newStatus === 'COMPLETED' || $newStatus === 'CANCELLED') {
-            if ($mechanicId) {
+          // Resource status management: Atomic Sync
+          if ($newStatus === 'COMPLETED' || $newStatus === 'CANCELLED' || $newStatus === 'PENDING') {
+            if ($mechanicId)
               $db->prepare("UPDATE mechanics SET status = 'AVAILABLE' WHERE mechanic_id = ? AND tenant_id = ?")->execute([$mechanicId, $tenant_id]);
-            }
-            if ($bayId) {
+            if ($bayId)
               $db->prepare("UPDATE service_bays SET status = 'AVAILABLE' WHERE bay_id = ? AND tenant_id = ?")->execute([$bayId, $tenant_id]);
-            }
-          } else {
-            // If assigned new resources, make them BUSY/OCCUPIED
-            if ($mechanicId) {
+          } else if ($newStatus === 'IN_PROGRESS') {
+            if ($mechanicId)
               $db->prepare("UPDATE mechanics SET status = 'BUSY' WHERE mechanic_id = ? AND tenant_id = ?")->execute([$mechanicId, $tenant_id]);
-            }
-            if ($bayId) {
+            if ($bayId)
               $db->prepare("UPDATE service_bays SET status = 'OCCUPIED' WHERE bay_id = ? AND tenant_id = ?")->execute([$bayId, $tenant_id]);
-            }
+          }
 
-            // If changed from old resources, free the old ones
+          // Handle assignment swap: Free up previous resources if they were changed
+          if ($old && ($old['mechanic_id'] != $mechanicId || $old['bay_id'] != $bayId)) {
             if ($old['mechanic_id'] && $old['mechanic_id'] != $mechanicId) {
               $db->prepare("UPDATE mechanics SET status = 'AVAILABLE' WHERE mechanic_id = ? AND tenant_id = ?")->execute([$old['mechanic_id'], $tenant_id]);
             }
@@ -2039,7 +3101,7 @@ try {
             }
           }
 
-          echo json_encode(['status' => 'success', 'message' => "Job order updated successfully with elite tracking."]);
+          echo json_encode(['status' => 'success', 'message' => "Job status and resources updated."]);
         } catch (Exception $e) {
           echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
         }
@@ -2058,42 +3120,73 @@ try {
           if ($amount <= 0 || empty($customerId))
             throw new Exception("Select a customer and enter a valid amount.");
 
-          // If Walk-in, we might want to create a guest customer or just log the name
-          // For now, let's allow customerId to be 0 or null for Walk-ins in the DB if supported, 
-          // or just use the name in a description.
-          // BUT, to keep integrity, let's see if we should create a 'Walk-in' record.
-          
           $finalCustomerId = is_numeric($customerId) ? intval($customerId) : null;
-          if ($customerId === 'WALKIN' && !empty($walkinName)) {
-              // Create a quick customer record for the walk-in
-              $stmt = $db->prepare("INSERT INTO customers (tenant_id, full_name, mobile, status) VALUES (?, ?, 'WALKIN', 'ACTIVE')");
-              $stmt->execute([$tenant_id, $walkinName]);
-              $finalCustomerId = $db->lastInsertId();
+          $finalWalkinName = null;
+
+          if ($customerId === 'WALKIN') {
+            if (empty($walkinName))
+              throw new Exception("Please provide a name for the walk-in customer.");
+            $finalCustomerId = null;
+            $finalWalkinName = $walkinName;
           }
 
-          if (!$finalCustomerId && $customerId !== 'WALKIN') throw new Exception("Invalid customer selected.");
+          if (!$finalCustomerId && $customerId !== 'WALKIN')
+            throw new Exception("Invalid customer selected.");
 
           $jobId = !empty($_POST['job_id']) ? intval($_POST['job_id']) : null;
           $apptId = !empty($_POST['appointment_id']) ? intval($_POST['appointment_id']) : null;
 
-          $stmt = $db->prepare("INSERT INTO payments (tenant_id, customer_id, job_id, appointment_id, amount, payment_method, reference_no, status, payment_date) VALUES (?, ?, ?, ?, ?, ?, ?, 'COMPLETED', NOW())");
-          $stmt->execute([$tenant_id, $finalCustomerId, $jobId, $apptId, $amount, $method, $ref]);
+          $stmt = $db->prepare("INSERT INTO payments (tenant_id, customer_id, walkin_name, job_id, appointment_id, amount, payment_method, reference_no, status, payment_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', NOW())");
+          $stmt->execute([$tenant_id, $finalCustomerId, $finalWalkinName, $jobId, $apptId, $amount, $method, $ref]);
 
-          // If linked to a job, mark the job as PAID
+          // Handle Inventory & Official Parts logging
+          $fullDataJson = $_POST['parts_json'] ?? '{"parts":[], "services":[]}';
+          $fullData = json_decode($fullDataJson, true);
+          $parts = $fullData['parts'] ?? [];
+
+          if (is_array($parts) && !empty($parts)) {
+            foreach ($parts as $p) {
+              $itemId = intval($p['item_id'] ?? 0);
+              $qty = intval($p['quantity'] ?? 0);
+              if ($itemId > 0 && $qty > 0) {
+                $db->prepare("UPDATE inventory SET quantity = quantity - ? WHERE item_id = ? AND tenant_id = ?")->execute([$qty, $itemId, $tenant_id]);
+                $stmtPrice = $db->prepare("SELECT price FROM inventory WHERE item_id = ?");
+                $stmtPrice->execute([$itemId]);
+                $uPrice = floatval($stmtPrice->fetchColumn() ?: 0);
+                if ($jobId) {
+                  $db->prepare("INSERT INTO repair_parts (tenant_id, job_id, item_id, quantity, unit_price, total_price) VALUES (?, ?, ?, ?, ?, ?)")
+                    ->execute([$tenant_id, $jobId, $itemId, $qty, $uPrice, $uPrice * $qty]);
+                }
+              }
+            }
+          }
+
+          // If linked to a job, mark the job as PAID/SETTLED and FREE RESOURCES
           if ($jobId) {
-            $db->prepare("UPDATE repair_jobs SET payment_status = 'PAID' WHERE job_id = ? AND tenant_id = ?")->execute([$jobId, $tenant_id]);
+            $db->prepare("UPDATE repair_jobs SET payment_status = 'PAID', status = 'SETTLED', total_amount = ? WHERE job_id = ? AND tenant_id = ?")->execute([$amount, $jobId, $tenant_id]);
+            
+            // Release Bay & Mechanic
+            $stmtRes = $db->prepare("SELECT bay_id, mechanic_id FROM repair_jobs WHERE job_id = ?");
+            $stmtRes->execute([$jobId]);
+            $resData = $stmtRes->fetch(PDO::FETCH_ASSOC);
+            if ($resData) {
+              if ($resData['bay_id']) {
+                $db->prepare("UPDATE service_bays SET status = 'AVAILABLE' WHERE bay_id = ? AND tenant_id = ?")->execute([$resData['bay_id'], $tenant_id]);
+              }
+              if ($resData['mechanic_id']) {
+                $db->prepare("UPDATE mechanics SET status = 'AVAILABLE' WHERE mechanic_id = ? AND tenant_id = ?")->execute([$resData['mechanic_id'], $tenant_id]);
+              }
+            }
           }
           if ($apptId) {
             $db->prepare("UPDATE appointments SET payment_status = 'PAID' WHERE appointment_id = ? AND tenant_id = ?")->execute([$apptId, $tenant_id]);
           }
 
-          // Increment customer visit log
           if ($finalCustomerId) {
-            $up = $db->prepare("UPDATE customers SET total_visits = total_visits + 1 WHERE customer_id = ?");
-            $up->execute([$finalCustomerId]);
+            $db->prepare("UPDATE customers SET total_visits = total_visits + 1 WHERE customer_id = ?")->execute([$finalCustomerId]);
           }
 
-          echo json_encode(['status' => 'success', 'message' => 'Payment logged successfully! Visit counter updated.']);
+          echo json_encode(['status' => 'success', 'message' => 'Payment of ₱' . number_format($amount, 2) . ' logged successfully!']);
         } catch (Exception $e) {
           echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
         }
@@ -2124,7 +3217,7 @@ try {
       if ($_GET['action'] === 'fetch_appointment_payment') {
         try {
           $aid = intval($_GET['appointment_id'] ?? 0);
-          $stmt = $db->prepare("SELECT p.*, c.full_name FROM payments p LEFT JOIN customers c ON p.customer_id = c.customer_id WHERE p.appointment_id = ? AND p.tenant_id = ? LIMIT 1");
+          $stmt = $db->prepare("SELECT p.*, COALESCE(c.full_name, p.walkin_name, 'Guest') as full_name FROM payments p LEFT JOIN customers c ON p.customer_id = c.customer_id WHERE p.appointment_id = ? AND p.tenant_id = ? LIMIT 1");
           $stmt->execute([$aid, $tenant_id]);
           $payment = $stmt->fetch(PDO::FETCH_ASSOC);
           echo json_encode(['status' => 'success', 'payment' => $payment]);
@@ -2157,11 +3250,15 @@ try {
 
       if ($_GET['action'] === 'fetch_payments') {
         try {
-          $stmt = $db->prepare("SELECT p.*, c.full_name as customer_name FROM payments p LEFT JOIN customers c ON p.customer_id = c.customer_id WHERE p.tenant_id = ? ORDER BY p.payment_id DESC LIMIT 100");
+          @ob_clean();
+          header('Content-Type: application/json');
+
+          $stmt = $db->prepare("SELECT p.*, COALESCE(c.full_name, p.walkin_name, 'Guest') as customer_name FROM payments p LEFT JOIN customers c ON p.customer_id = c.customer_id WHERE p.tenant_id = ? ORDER BY p.payment_id DESC LIMIT 100");
           $stmt->execute([$tenant_id]);
           $data = $stmt->fetchAll(PDO::FETCH_ASSOC);
           echo json_encode($data);
         } catch (Exception $e) {
+          @ob_clean();
           echo json_encode([]);
         }
         exit;
@@ -2170,7 +3267,7 @@ try {
       if ($_GET['action'] === 'fetch_eod_summary') {
         try {
           $today = date('Y-m-d');
-          
+
           // 1. Total Collection Today
           $stmt = $db->prepare("SELECT SUM(amount) as total FROM payments WHERE tenant_id = ? AND DATE(payment_date) = ?");
           $stmt->execute([$tenant_id, $today]);
@@ -2182,7 +3279,7 @@ try {
           $breakdown = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
           // 3. Today's Transactions
-          $stmt = $db->prepare("SELECT p.*, c.full_name as customer_name FROM payments p LEFT JOIN customers c ON p.customer_id = c.customer_id WHERE p.tenant_id = ? AND DATE(p.payment_date) = ? ORDER BY p.payment_date DESC");
+          $stmt = $db->prepare("SELECT p.*, COALESCE(c.full_name, p.walkin_name, 'Guest') as customer_name FROM payments p LEFT JOIN customers c ON p.customer_id = c.customer_id WHERE p.tenant_id = ? AND DATE(p.payment_date) = ? ORDER BY p.payment_date DESC");
           $stmt->execute([$tenant_id, $today]);
           $transactions = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -2217,27 +3314,48 @@ try {
           $serviceId = intval($_POST['service_id'] ?? 0);
           $mechanicId = intval($_POST['mechanic_id'] ?? 0);
 
-          if (!$bayId || !$vehicleId || !$serviceId)
-            throw new Exception("Please select all required fields.");
+          if (!$bayId || !$serviceId)
+            throw new Exception("Please select a service bay and repair package.");
 
-          // Fetch customer from vehicle
-          $vQ = $db->prepare("SELECT customer_id FROM vehicles WHERE vehicle_id = ? AND tenant_id = ?");
-          $vQ->execute([$vehicleId, $tenant_id]);
-          $customerId = $vQ->fetchColumn();
+          // Validate Bay Availability
+          $bayCheck = $db->prepare("SELECT status FROM service_bays WHERE bay_id = ? AND tenant_id = ?");
+          $bayCheck->execute([$bayId, $tenant_id]);
+          if ($bayCheck->fetchColumn() === 'OCCUPIED') {
+            throw new Exception("Operation Denied: This service bay is currently occupied.");
+          }
 
-          if (!$customerId)
-            throw new Exception("Invalid vehicle or owner not found.");
+          if (!$vehicleId) {
+            $walkinName = trim($_POST['new_customer_name'] ?? '');
+            $walkinPlate = trim($_POST['new_plate_no'] ?? '');
+            $walkinModel = trim($_POST['new_model'] ?? '');
+
+            if (!$walkinName || !$walkinPlate) {
+              throw new Exception("Please select an existing machine or enter walk-in details (Name & Plate).");
+            }
+            $customerId = null;
+            $vehicleId = null;
+          } else {
+            // Fetch customer from vehicle
+            $vQ = $db->prepare("SELECT customer_id FROM vehicles WHERE vehicle_id = ? AND tenant_id = ?");
+            $vQ->execute([$vehicleId, $tenant_id]);
+            $customerId = $vQ->fetchColumn();
+
+            if (!$customerId)
+              throw new Exception("Invalid vehicle or owner not found.");
+          }
 
           // Create Job Order
-          $stmt = $db->prepare("INSERT INTO repair_jobs (tenant_id, customer_id, vehicle_id, service_id, mechanic_id, bay_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', NOW())");
-          $stmt->execute([$tenant_id, $customerId, $vehicleId, $serviceId, $mechanicId, $bayId]);
+          $stmt = $db->prepare("INSERT INTO repair_jobs (tenant_id, customer_id, vehicle_id, service_id, mechanic_id, bay_id, status, walkin_name, walkin_plate, walkin_model, created_at) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, NOW())");
+          $stmt->execute([$tenant_id, $customerId, $vehicleId, $serviceId, $mechanicId, $bayId, $walkinName ?? null, $walkinPlate ?? null, $walkinModel ?? null]);
           $newJobId = $db->lastInsertId();
 
-          // Update Statuses
+          // Update Statuses (REMOVED: Only update to BUSY/OCCUPIED when work starts via update_job_status)
+          /* 
           $db->prepare("UPDATE service_bays SET status = 'OCCUPIED' WHERE bay_id = ? AND tenant_id = ?")->execute([$bayId, $tenant_id]);
           if ($mechanicId) {
             $db->prepare("UPDATE mechanics SET status = 'BUSY' WHERE mechanic_id = ? AND tenant_id = ?")->execute([$mechanicId, $tenant_id]);
           }
+          */
 
           // Log it
           $log = $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'CRUD', ?)");
@@ -2270,17 +3388,8 @@ try {
         exit;
       }
 
-      if ($_GET['action'] === 'fetch_vehicles') {
-        try {
-          $stmt = $db->prepare("SELECT v.*, c.full_name as owner_name FROM vehicles v LEFT JOIN customers c ON v.customer_id = c.customer_id WHERE v.tenant_id = ? ORDER BY v.vehicle_id DESC");
-          $stmt->execute([$tenant_id]);
-          $data = $stmt->fetchAll(PDO::FETCH_ASSOC);
-          echo json_encode($data ?: []);
-        } catch (Exception $e) {
-          echo json_encode(['status' => 'error', 'message' => 'Database error: ' . $e->getMessage()]);
-        }
-        exit;
-      }
+      // Duplicate fetch_vehicles removed - consolidated at the top AJAX block
+
 
       if ($_GET['action'] === 'fetch_customer_details') {
         try {
@@ -2291,7 +3400,7 @@ try {
           if (!$customer)
             throw new Exception("Customer not found.");
 
-          $vStmt = $db->prepare("SELECT * FROM vehicles WHERE customer_id = ? AND tenant_id = ?");
+          $vStmt = $db->prepare("SELECT * FROM vehicles WHERE customer_id = ? AND tenant_id = ? AND status = 'ACTIVE'");
           $vStmt->execute([$customerId, $tenant_id]);
           $vehicles = $vStmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -2444,29 +3553,12 @@ try {
         exit;
       }
 
-      if ($_GET['action'] === 'fetch_dashboard_repair_jobs') {
-        try {
-          $stmt = $db->prepare("SELECT j.*, v.plate_no, v.make, v.model, s.service_name, c.full_name as owner_name, m.full_name as mechanic_name
-                     FROM repair_jobs j
-                     LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id
-                     LEFT JOIN customers c ON j.customer_id = c.customer_id
-                     LEFT JOIN services s ON j.service_id = s.service_id
-                     LEFT JOIN mechanics m ON j.mechanic_id = m.mechanic_id
-                     WHERE j.tenant_id = ? AND j.status != 'CANCELLED'
-                     ORDER BY j.created_at DESC LIMIT 5");
-          $stmt->execute([$tenant_id]);
-          echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
-        } catch (Exception $e) {
-          echo json_encode([]);
-        }
-        exit;
-      }
 
       // Default response if no specific action matched
       echo json_encode(['status' => 'error', 'message' => 'Action ' . $_GET['action'] . ' not handled.']);
       exit;
 
-    } catch (Exception $ax) {
+    } catch (Throwable $ax) {
       if (ob_get_level())
         ob_end_clean();
       header('Content-Type: application/json');
@@ -2505,10 +3597,10 @@ try {
 
   try {
     if ($role === 'MECHANIC' && $my_mechanic_id) {
-      $stmt = $db->prepare("SELECT j.job_id, v.plate_no, v.make, v.model, j.status, j.mechanic_id, j.bay_id, j.started_at FROM repair_jobs j LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id WHERE j.tenant_id = ? AND j.mechanic_id = ? AND j.status IN ('PENDING', 'IN_PROGRESS', 'WAITING_FOR_PARTS', 'COMPLETED') LIMIT 15");
+      $stmt = $db->prepare("SELECT j.job_id, v.plate_no, v.make, v.model, j.status, j.mechanic_id, j.bay_id, j.started_at FROM repair_jobs j LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id WHERE j.tenant_id = ? AND j.mechanic_id = ? AND j.status = 'IN_PROGRESS' ORDER BY j.created_at DESC LIMIT 15");
       $stmt->execute([$tenant_id, $my_mechanic_id]);
     } else {
-      $stmt = $db->prepare("SELECT j.job_id, v.plate_no, v.make, v.model, j.status, j.mechanic_id, j.bay_id, j.started_at FROM repair_jobs j LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id WHERE j.tenant_id = ? AND j.status IN ('PENDING', 'IN_PROGRESS', 'WAITING_FOR_PARTS', 'COMPLETED') LIMIT 15");
+      $stmt = $db->prepare("SELECT j.job_id, v.plate_no, v.make, v.model, j.status, j.mechanic_id, j.bay_id, j.started_at FROM repair_jobs j LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id WHERE j.tenant_id = ? AND j.status = 'IN_PROGRESS' ORDER BY j.created_at DESC LIMIT 15");
       $stmt->execute([$tenant_id]);
     }
     $active_jobs = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -2539,14 +3631,1581 @@ try {
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script>
+    // V100 CORE ENGINE: INITIALIZING...
+    window.onerror = function (msg, url, lineNo, columnNo, error) {
+      const errDiv = document.createElement('div');
+      errDiv.style.cssText = 'position:fixed; bottom:20px; right:20px; background:rgba(239,68,68,0.9); color:white; padding:15px; border-radius:10px; z-index:999999; font-size:0.8rem; max-width:300px; border:1px solid white; box-shadow: 0 10px 25px rgba(0,0,0,0.5);';
+      errDiv.innerHTML = '<strong>System Diagnostic:</strong><br>' + msg + '<br><small>Line: ' + lineNo + ' | URL: ' + (url ? url.split("/").pop() : "inline") + '</small>';
+      document.body.appendChild(errDiv);
+      console.error("[CRITICAL]", { msg, url, lineNo, error });
+      setTimeout(() => errDiv.remove(), 12000);
+      return false;
+    };
+
+    window.safeValue = (id) => {
+      const el = document.getElementById(id);
+      return el ? el.value : "";
+    };
+    window.setSafeValue = (id, val) => {
+      const el = document.getElementById(id);
+      if (el) el.value = val;
+    };
+
+    // --- NAVIGATION & PAYMENT ENGINE (HOISTED) ---
+    window.basePaymentAmount = 0;
+
+    window.addCustomServiceRow = function () {
+      fetch('tenant-dashboard.php?action=fetch_services&_t=' + Date.now())
+        .then(r => r.json()).then(data => {
+          const list = document.getElementById('paymentPartsList'); if (!list) return;
+          const row = document.createElement('div');
+          row.className = 'service-row';
+          row.style = 'display:flex; gap:8px; align-items:center; padding-bottom:8px; border-bottom:1px solid rgba(255,255,255,0.05);';
+
+          let options = data.map(s => `<option value="${s.service_name}" data-price="${s.price}">${s.service_name} (₱${parseFloat(s.price).toLocaleString()})</option>`).join('');
+
+          row.innerHTML = `
+            <select class="svc-name" style="flex:2; font-size:0.8rem; background:rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.1); color:white; border-radius:8px; padding:6px;" onchange="const p=this.options[this.selectedIndex].getAttribute('data-price'); const pIn=this.parentElement.querySelector('.svc-price'); pIn.value=p; pIn.readOnly=(this.value!=='CUSTOM'); window.syncPaymentParts()">
+              <option value="">-- Select Service --</option>
+              ${options}
+              <option value="CUSTOM">-- Custom Service --</option>
+            </select>
+            <input type="number" placeholder="Price" class="svc-price" min="0" readonly style="flex:1; width:80px; background:rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.1); color:white; border-radius:8px; padding:6px;" oninput="window.syncPaymentParts()">
+            <button type="button" onclick="this.parentElement.remove(); window.syncPaymentParts();" style="background:none; border:none; color:#ef4444; cursor:pointer; font-size:1.2rem; line-height:1;">&times;</button>
+          `;
+          list.appendChild(row);
+
+          // Handle "Custom" selection to allow typing
+          const sel = row.querySelector('select');
+          sel.addEventListener('change', function () {
+            if (this.value === 'CUSTOM') {
+              // Replace select with an input? Or just let them type? 
+              // Actually, I'll just change the select to a text input if they choose CUSTOM
+              const input = document.createElement('input');
+              input.type = 'text';
+              input.className = 'svc-name';
+              input.placeholder = 'Type custom service...';
+              input.style = this.style.cssText;
+              input.style.flex = '2';
+              input.oninput = window.syncPaymentParts;
+              this.replaceWith(input);
+              input.focus();
+            }
+          });
+        });
+    };
+
+    window.showPaymentPartsSelector = function () {
+      fetch('tenant-dashboard.php?action=fetch_inventory&_t=' + Date.now())
+        .then(r => r.json()).then(data => {
+          const list = document.getElementById('paymentPartsList'); if (!list) return;
+          const row = document.createElement('div');
+          row.className = 'part-row';
+          row.style = 'display:flex; gap:8px; align-items:center; padding-bottom:8px; border-bottom:1px solid rgba(255,255,255,0.05);';
+          let options = data.map(i => {
+            const qty = parseInt(i.quantity || 0);
+            const stockLabel = qty > 0 ? `(${qty} in stock)` : '(OUT OF STOCK)';
+            const disabled = qty > 0 ? '' : 'disabled style="opacity:0.5;"';
+            return `<option value="${i.item_id}" data-price="${i.price}" ${disabled}>${i.item_name} - ₱${parseFloat(i.price).toLocaleString()} ${stockLabel}</option>`;
+          }).join('');
+          row.innerHTML = `
+            <select style="flex:2; font-size:0.8rem; background:rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.1); color:white; border-radius:8px; padding:6px;" onchange="window.syncPaymentParts()">
+              <option value="">-- Select Part --</option>
+              ${options}
+            </select>
+            <input type="number" value="1" min="1" style="flex:0.5; width:50px; background:rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.1); color:white; border-radius:8px; padding:6px;" onchange="window.syncPaymentParts()">
+            <button type="button" onclick="this.parentElement.remove(); window.syncPaymentParts();" style="background:none; border:none; color:#ef4444; cursor:pointer; font-size:1.2rem; line-height:1;">&times;</button>
+          `;
+          list.appendChild(row);
+        });
+    };
+
+    window.syncPaymentParts = function () {
+      const list = document.getElementById('paymentPartsList'); if (!list) return;
+      let extraTotal = 0;
+      const parts = [];
+      const services = [];
+
+      // Process Parts
+      list.querySelectorAll('.part-row').forEach(row => {
+        const sel = row.querySelector('select'), qtyInput = row.querySelector('input');
+        if (sel && sel.value) {
+          const opt = sel.options[sel.selectedIndex], price = parseFloat(opt.getAttribute('data-price') || 0), qty = parseInt(qtyInput.value || 1);
+          parts.push({ item_id: sel.value, quantity: qty });
+          extraTotal += price * qty;
+        }
+      });
+
+      // Process Services
+      list.querySelectorAll('.service-row').forEach(row => {
+        const nameEl = row.querySelector('.svc-name'), priceInput = row.querySelector('.svc-price');
+        const name = nameEl.value;
+        if (name && priceInput.value) {
+          const price = parseFloat(priceInput.value || 0);
+          services.push({ name: name, price: price });
+          extraTotal += price;
+        }
+      });
+
+      const partsJsonInput = document.getElementById('pay_parts_json');
+      if (partsJsonInput) partsJsonInput.value = JSON.stringify({ parts, services });
+
+      // Calculate Final with Discount
+      const base = window.basePaymentAmount || 0;
+      const subtotal = base + extraTotal;
+      const discEl = document.getElementById('pay_discount');
+      const discountPct = discEl ? parseFloat(discEl.value || 0) : 0;
+      const final = subtotal * (1 - (discountPct / 100));
+
+      const amtInput = document.getElementById('pay_amount');
+      const amtHidden = document.getElementById('pay_amount_hidden');
+      if (amtInput) amtInput.value = final.toFixed(2);
+      if (amtHidden) amtHidden.value = final.toFixed(2);
+    };
+
+    window.openRecordPaymentModal = function (jobId, customerId, customerName, amount) {
+      console.log("[PAYMENT] Opening Modal. Job:", jobId, "Base Amount:", amount);
+      const form = document.getElementById('addPaymentForm');
+      if (form) form.reset();
+
+      window.basePaymentAmount = parseFloat(amount || 0);
+      const jidInput = document.getElementById('pay_job_id');
+      if (jidInput) jidInput.value = jobId || '';
+
+      const amtInput = document.getElementById('pay_amount');
+      const amtHidden = document.getElementById('pay_amount_hidden');
+      if (amtInput) amtInput.value = window.basePaymentAmount.toFixed(2);
+      if (amtHidden) amtHidden.value = window.basePaymentAmount.toFixed(2);
+
+      const list = document.getElementById('paymentPartsList');
+      if (list) list.innerHTML = '';
+
+      // Handle Walk-in vs Registered Customer
+      const custSelect = form.querySelector('select[name="customer_id"]');
+      if (custSelect) {
+        if (!customerId || customerId === 'null' || customerId === 'undefined' || customerId === 'WALKIN') {
+          custSelect.value = 'WALKIN';
+          if (typeof window.toggleWalkInField === 'function') window.toggleWalkInField('WALKIN');
+          const walkinInput = form.querySelector('input[name="walkin_name"]');
+          if (walkinInput) walkinInput.value = customerName || '';
+        } else {
+          custSelect.value = customerId;
+          if (typeof window.toggleWalkInField === 'function') window.toggleWalkInField(customerId);
+        }
+      }
+
+      // Force initial sync to ensure base amount is captured
+      window.syncPaymentParts();
+
+      if (typeof window.openModal === 'function') window.openModal('paymentModal');
+    };
+
+    window.calculateFinalAmount = function () { window.syncPaymentParts(); };
+
+    // --- NAVIGATION ENGINE (HOISTED) ---
+    const sectionTitles = {
+      'dashboard': { title: '<?php echo ucwords(strtolower($role)); ?> Dashboard', sub: 'Overview & Real-time Stats' },
+      'appointments': { title: 'Service Appointments', sub: 'Manage bookings and schedules' },
+      'job_orders': { title: 'Job Orders & Repairs', sub: 'Track ongoing workshop tasks' },
+      'customers': { title: 'Customer Database', sub: 'Relationship management and history' },
+      'vehicles': { title: 'Vehicle Registry', sub: 'Manage fleet and customer cars' },
+      'payments': { title: 'Billing & Invoices', sub: 'Financial transactions and records' },
+      'inventory': { title: 'Parts & Inventory', sub: 'Stock levels and supply chain' },
+      'staff': { title: 'Staff Management', sub: 'Human resources and access roles' },
+      'bays': { title: 'Service Bay Management', sub: 'Allocate and track workshop physical space' },
+      'mechanics': { title: 'Mechanic Masterfile', sub: 'Personnel records and specializations' },
+      'services': { title: 'Service Catalog & Pricing', sub: 'Manage offerings and labor rates' },
+      'reports': { title: 'Business Analytics', sub: 'Performance metrics and growth' },
+      'customization': { title: 'Shop Customization', sub: 'Brand identity and UI settings' },
+      'subscription': { title: 'My Subscription', sub: 'Plan details and billing' },
+      'my_profile': { title: 'Account Settings', sub: 'Personal profile and presence' },
+      'mechanic_history': { title: 'My Work History', sub: 'Log of your recent repair activities' },
+      'mechanic_appointments': { title: 'Upcoming Appointments', sub: 'Your assigned future service bookings' },
+      'inventory_lookup': { title: 'Parts Catalog', sub: 'View available parts and stock levels' },
+      'settled_jobs': { title: 'Settled Jobs History', sub: 'Completed and cancelled repair records' }
+    };
+
+    window.navToView = function (viewId) {
+      console.log("[NAV] Switching to view:", viewId);
+      const sections = document.querySelectorAll('.view-section');
+      sections.forEach(s => { s.classList.remove('active'); s.style.display = 'none'; });
+      const target = document.getElementById(viewId);
+      if (target) {
+        target.classList.add('active');
+        target.style.display = 'block';
+        const pTitle = document.getElementById('pageTitle');
+        const pSub = document.getElementById('pageSubtitle');
+        if (pTitle && sectionTitles[viewId]) {
+          pTitle.innerText = sectionTitles[viewId].title;
+          if (pSub) pSub.innerText = sectionTitles[viewId].sub;
+        }
+        document.querySelectorAll('.nav-item').forEach(item => {
+          if (item.getAttribute('data-view') === viewId) item.classList.add('active');
+          else item.classList.remove('active');
+        });
+        if (window.innerWidth <= 1024) document.body.classList.add('sidebar-collapsed');
+
+        if (viewId === 'dashboard') {
+          if (typeof window.refreshOverviewStats === 'function') window.refreshOverviewStats();
+          if (typeof window.refreshDashboardJobs === 'function') window.refreshDashboardJobs();
+          if (typeof window.refreshShiftRequests === 'function') window.refreshShiftRequests();
+        }
+        if (viewId === 'customers') { if (typeof window.refreshAddCustomerList === 'function') window.refreshAddCustomerList(); }
+        if (viewId === 'appointments') { if (typeof window.refreshAppointmentsList === 'function') window.refreshAppointmentsList(); }
+        if (viewId === 'job_orders') { if (typeof window.refreshJobOrders === 'function') window.refreshJobOrders(); }
+        if (viewId === 'settled_jobs') { if (typeof window.refreshSettledJobs === 'function') window.refreshSettledJobs(); }
+        if (viewId === 'bays') { if (typeof window.refreshBaysList === 'function') window.refreshBaysList(); }
+        if (viewId === 'mechanics') { if (typeof window.refreshMechanicsList === 'function') window.refreshMechanicsList(); }
+        if (viewId === 'services') { if (typeof window.refreshServicesList === 'function') window.refreshServicesList(); }
+        if (viewId === 'inventory') { if (typeof window.refreshInventoryList === 'function') window.refreshInventoryList(); }
+        if (viewId === 'inventory_lookup') { if (typeof window.refreshInventoryLookup === 'function') window.refreshInventoryLookup(); }
+        if (viewId === 'payments') { if (typeof window.refreshPaymentsList === 'function') window.refreshPaymentsList(); }
+        if (viewId === 'vehicles') { if (typeof window.refreshVehiclesList === 'function') window.refreshVehiclesList(); }
+        if (viewId === 'mechanic_appointments') { if (typeof window.refreshMyUpcomingAppointments === 'function') window.refreshMyUpcomingAppointments(); }
+        if (viewId === 'mechanic_history') { if (typeof window.refreshMechanicHistory === 'function') window.refreshMechanicHistory(); }
+        if (viewId === 'staff') {
+          if (typeof window.renderStaffTable === 'function') window.renderStaffTable();
+          if (typeof window.refreshShiftRequests === 'function') window.refreshShiftRequests();
+        }
+        if (viewId === 'customer_logs') { if (typeof loadAuditLogs === 'function') loadAuditLogs(); }
+        if (viewId === 'payments_history') { if (typeof window.loadBillingHistory === 'function') window.loadBillingHistory(); }
+      } else {
+        console.warn("[NAV] View not found:", viewId);
+      }
+    };
+
+    // --- GLOBAL UTILITIES (HOISTED) ---
+    window.executeThermalPrint = function () {
+      const content = document.getElementById('receiptPreviewContent').innerHTML;
+      const win = window.open('', '', 'height=600,width=400');
+      win.document.write('<html><head><title>Print Receipt</title>');
+      win.document.write('<style>body { font-family: monospace; padding: 20px; width: 300px; } button { display: none; } </style>');
+      win.document.write('</head><body>');
+      win.document.write(content);
+      win.document.write('</body></html>');
+      win.document.close();
+      win.focus();
+      setTimeout(() => { win.print(); win.close(); }, 500);
+    };
+
+    window.viewJobReceipt = function (id) {
+      const preview = document.getElementById('receiptPreviewContent');
+      if (!preview) return;
+      preview.innerHTML = '<div style="text-align:center; padding:2rem;"><i class="fas fa-spinner fa-spin"></i> Loading Receipt...</div>';
+      openModal('receiptModal');
+      fetch('tenant-dashboard.php?action=fetch_receipt_data&job_id=' + id)
+        .then(r => r.text()).then(html => { preview.innerHTML = html; })
+        .catch(err => { preview.innerHTML = '<div style="color:red">Error loading receipt.</div>'; });
+    };
+
+    window.openMechanicProfile = function (mechanicId) {
+      if (!mechanicId) return;
+      const content = document.getElementById('mechProfileContent');
+      if (content) content.innerHTML = '<div style="text-align:center; padding:3rem;"><i class="fas fa-spinner fa-spin fa-2x"></i><br><br>Fetching profile...</div>';
+      openModal('mechanicProfileModal');
+      fetch('tenant-dashboard.php?action=fetch_mechanic_profile&mechanic_id=' + mechanicId)
+        .then(r => r.json()).then(data => {
+          if (!content) return;
+          if (data.status === 'error') { content.innerHTML = '<div style="color:red; padding:2rem;">' + data.message + '</div>'; return; }
+
+          const m = data.mechanic;
+          const history = data.history || [];
+
+          let html = `
+            <div style="display:grid; grid-template-columns:1fr; gap:20px; padding:10px;">
+                <div style="text-align:center; padding-bottom:20px; border-bottom:1px solid rgba(255,255,255,0.1);">
+                    <div style="width:80px; height:80px; background:linear-gradient(135deg, var(--accent), #3b82f6); border-radius:50%; margin:0 auto 15px; display:flex; align-items:center; justify-content:center; font-size:2rem; color:white; font-weight:bold;">
+                        ${m.full_name.charAt(0)}
+                    </div>
+                    <h2 style="margin:0; font-size:1.4rem;">${m.full_name}</h2>
+                    <p style="color:var(--text-dim); font-size:0.9rem; margin:5px 0;">${m.specialization || 'General Mechanic'}</p>
+                    <div class="badge badge-active" style="margin-top:10px;">${m.active_jobs_count || 0} Active Jobs</div>
+                </div>
+                <div>
+                    <h4 style="margin:0 0 10px; color:var(--accent); font-size:0.8rem; text-transform:uppercase; letter-spacing:1px;">Shift Details</h4>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:20px; background:rgba(255,255,255,0.03); padding:10px; border-radius:12px;">
+                        <span style="font-size:0.85rem;"><i class="fas fa-clock" style="color:var(--accent);"></i> ${m.shift_start} - ${m.shift_end}</span>
+                        <span style="font-size:0.85rem;"><i class="fas fa-calendar-alt" style="color:var(--accent);"></i> ${m.shift_days}</span>
+                    </div>
+
+                    <h4 style="margin:0 0 10px; color:var(--accent); font-size:0.8rem; text-transform:uppercase; letter-spacing:1px;">Recent Assignments</h4>
+                    <div style="max-height:180px; overflow-y:auto; border-radius:12px; background:rgba(0,0,0,0.2);">
+                        ${history.length ? history.map(h => `
+                            <div style="padding:12px; border-bottom:1px solid rgba(255,255,255,0.05); display:flex; justify-content:space-between; align-items:center;">
+                                <div>
+                                    <div style="font-weight:bold; font-size:0.85rem;">${h.plate_no}</div>
+                                    <div style="color:var(--text-dim); font-size:0.75rem;">${h.service_name}</div>
+                                </div>
+                                <span style="font-size:0.7rem; padding:2px 8px; border-radius:20px; background:${h.status === 'COMPLETED' ? 'rgba(16,185,129,0.1)' : 'rgba(245,158,11,0.1)'}; color:${h.status === 'COMPLETED' ? '#10b981' : '#f59e0b'}; border:1px solid currentColor;">${h.status}</span>
+                            </div>
+                        `).join('') : '<div style="color:var(--text-dim); padding:20px; text-align:center; font-size:0.85rem;">No recent history.</div>'}
+                    </div>
+                </div>
+            </div>
+          `;
+          content.innerHTML = html;
+        }).catch(err => {
+          if (content) content.innerHTML = '<div style="color:red; padding:2rem; text-align:center;">Sync failed. Please try again.</div>';
+        });
+    };
+
+    window.editService = function (id, name, desc, price, masterId = null, minPrice = null, maxPrice = null) {
+      if (document.getElementById('edit_service_id')) document.getElementById('edit_service_id').value = id;
+      if (document.getElementById('edit_service_name')) document.getElementById('edit_service_name').value = name;
+      if (document.getElementById('edit_service_desc')) document.getElementById('edit_service_desc').value = (desc === 'null' || !desc) ? '' : desc;
+
+      const priceInput = document.getElementById('edit_service_price');
+      const form = document.getElementById('editServiceForm');
+      const submitBtn = form ? form.querySelector('button[onclick*="saveEditService"]') : null;
+      let hint = form ? form.querySelector('.price-hint') : null;
+
+      if (!hint && form && priceInput) {
+        hint = document.createElement('div');
+        hint.className = 'price-hint';
+        hint.style.fontSize = '0.75rem';
+        hint.style.marginTop = '5px';
+        priceInput.parentNode.appendChild(hint);
+      }
+
+      if (priceInput) {
+        priceInput.value = price;
+        if (minPrice !== null && maxPrice !== null && parseFloat(minPrice) > 0) {
+          priceInput.min = minPrice;
+          priceInput.max = maxPrice;
+          priceInput.placeholder = `Range: ₱${parseFloat(minPrice).toLocaleString()} - ₱${parseFloat(maxPrice).toLocaleString()}`;
+
+          const validate = () => {
+            const val = parseFloat(priceInput.value || 0);
+            const isInvalid = (val < parseFloat(minPrice) || val > parseFloat(maxPrice));
+            if (hint) {
+              hint.style.color = isInvalid ? '#ef4444' : 'var(--accent)';
+              hint.innerHTML = `<i class="fas fa-${isInvalid ? 'exclamation-triangle' : 'info-circle'}"></i> Recommended Price: ₱${parseFloat(minPrice).toLocaleString()} - ₱${parseFloat(maxPrice).toLocaleString()}`;
+            }
+            if (submitBtn) {
+              submitBtn.disabled = isInvalid;
+              submitBtn.style.opacity = isInvalid ? '0.5' : '1';
+              submitBtn.style.cursor = isInvalid ? 'not-allowed' : 'pointer';
+            }
+          };
+          priceInput.oninput = validate;
+          validate();
+        } else {
+          priceInput.removeAttribute('min');
+          priceInput.removeAttribute('max');
+          priceInput.placeholder = "";
+          priceInput.oninput = null;
+          if (hint) hint.innerHTML = '';
+          if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.style.opacity = '1';
+            submitBtn.style.cursor = 'pointer';
+          }
+        }
+      }
+
+      const masterInput = document.getElementById('edit_service_master_id');
+      if (masterInput) masterInput.value = masterId || "";
+      openModal('editServiceModal');
+    };
+
+
+    window.processAppointment = function (id, status, reqMechName = null) {
+      if (status === 'CONFIRMED') {
+        const idF = document.getElementById('confirm_appt_id');
+        if (idF) idF.value = id;
+        const display = document.getElementById('requested_mechanic_display');
+        const text = document.getElementById('requested_mechanic_name_text');
+        if (display && text) {
+          if (reqMechName && reqMechName.trim() !== '' && reqMechName !== 'null') {
+            text.innerText = reqMechName;
+            display.style.display = 'block';
+          } else display.style.display = 'none';
+        }
+        const mS = document.getElementById('confirm_mechanic_id');
+        const bS = document.getElementById('confirm_bay_id');
+        if (mS && bS) {
+          mS.innerHTML = '<option>Loading...</option>';
+          bS.innerHTML = '<option>Loading...</option>';
+          fetch('tenant-dashboard.php?action=fetch_available_resources')
+            .then(r => r.json()).then(data => {
+              mS.innerHTML = '<option value="">-- Assign Mechanic --</option>';
+              (data.mechanics || []).forEach(m => {
+                const shift = (m.shift_start && m.shift_end)
+                  ? ` — ${new Date('1970-01-01T'+m.shift_start).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} – ${new Date('1970-01-01T'+m.shift_end).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}${m.shift_days ? ' | '+m.shift_days.replace(/,/g,'·') : ''}` : '';
+                mS.innerHTML += `<option value="${m.mechanic_id}">${m.full_name}${shift}</option>`;
+              });
+              bS.innerHTML = '<option value="">-- Assign Bay --</option>';
+              (data.bays || []).forEach(b => { bS.innerHTML += `<option value="${b.bay_id}">${b.bay_name}</option>`; });
+            });
+        }
+        window.openModal('confirmAppointmentModal');
+      } else {
+        if (!confirm('Are you sure you want to ' + status.toLowerCase() + ' this appointment?')) return;
+        const fd = new FormData();
+        fd.append('appointment_id', id);
+        fd.append('status', status);
+        fetch('tenant-dashboard.php?action=update_appointment_status', { method: 'POST', body: fd })
+          .then(r => r.json()).then(data => {
+            if (data.status === 'success') {
+              if (typeof showToast === 'function') showToast("Appointment " + status.toLowerCase());
+              location.reload();
+            } else alert(data.message);
+          });
+      }
+    };
+
+    window.processAppointmentConfirmation = function () {
+      const id = safeValue('confirm_appt_id');
+      const mid = safeValue('confirm_mechanic_id');
+      const bid = safeValue('confirm_bay_id');
+
+      if (!mid || !bid) {
+        alert("Please assign both a mechanic and a bay.");
+        return;
+      }
+
+      const fd = new FormData();
+      fd.append('appointment_id', id);
+      fd.append('status', 'CONFIRMED');
+      fd.append('mechanic_id', mid);
+      fd.append('bay_id', bid);
+
+      const btn = document.querySelector('#confirmApptForm button');
+      const originalText = btn ? btn.innerText : 'Confirm';
+      if (btn) {
+        btn.innerText = 'Processing...';
+        btn.disabled = true;
+      }
+
+      fetch('tenant-dashboard.php?action=update_appointment_status', { method: 'POST', body: fd })
+        .then(r => r.json()).then(data => {
+          if (data.status === 'success') {
+            if (typeof showToast === 'function') showToast("Appointment confirmed and Job Order created!");
+            location.reload();
+          } else {
+            alert(data.message);
+            if (btn) {
+              btn.innerText = originalText;
+              btn.disabled = false;
+            }
+          }
+        })
+        .catch(err => {
+          alert("Network error. Please try again.");
+          if (btn) {
+            btn.innerText = originalText;
+            btn.disabled = false;
+          }
+        });
+    };
+
+    window.deleteService = function (id) {
+      if (!confirm('Are you sure you want to delete this service?')) return;
+      fetch('tenant-dashboard.php?action=delete_service&service_id=' + id, { method: 'POST' })
+        .then(r => r.json()).then(res => {
+          if (res.status === 'success') {
+            alert('Service deleted!');
+            if (window.refreshServicesList) window.refreshServicesList();
+          } else alert(res.message || 'Delete failed');
+        });
+    };
+
+    // --- ULTIMATE JOB STATUS ENGINE (UNIQUE NAMESPACE) ---
+    window.handleJobClick = function (id, status, mid, bid, edit, focus) {
+      console.log("!!! JOB_CLICK_TRACE !!!", { id, status, mid, bid, edit, focus });
+      const editMode = (edit === true || edit === 'true' || edit === '1');
+      const focusParts = (focus === true || focus === 'true' || focus === '1');
+
+      if (typeof window.openRepairJobStatusModal_Final === 'function') {
+        window.openRepairJobStatusModal_Final(id, status, mid, bid, editMode, focusParts);
+      } else {
+        alert("System still initializing... please wait a moment.");
+      }
+      return false;
+    };
+
+    window.openRepairJobStatusModal_Final = function (id, currentStatus, currentMechId, currentBayId, editMode = false, focusParts = false) {
+      console.log("MODAL_OPEN_START_UNIQUE", { id, currentStatus, currentMechId, currentBayId, editMode });
+      try {
+        const modalEl = document.getElementById('repairJobStatusModal_Final');
+        if (!modalEl) { alert("DOM Error: #repairJobStatusModal_Final NOT FOUND!"); return; }
+
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+
+        modalEl.style.setProperty('display', 'flex', 'important');
+        modalEl.style.setProperty('z-index', '2147483647', 'important');
+        modalEl.style.setProperty('opacity', '1', 'important');
+        modalEl.style.setProperty('visibility', 'visible', 'important');
+        modalEl.style.pointerEvents = 'auto';
+
+        const jidInput = document.getElementById('status_job_id');
+        const statusSelect = document.getElementById('job_current_status');
+        if (jidInput) jidInput.value = id;
+        if (statusSelect) {
+          statusSelect.value = currentStatus;
+          const pendingOpt = statusSelect.querySelector('option[value="PENDING"]');
+          if (pendingOpt) {
+            if (currentStatus === 'IN_PROGRESS' || currentStatus === 'COMPLETED') {
+              pendingOpt.style.display = 'none';
+            } else {
+              pendingOpt.style.display = 'block';
+            }
+          }
+        }
+
+        const mH = document.getElementById('status_mechanic_id_hidden');
+        const bH = document.getElementById('status_bay_id_hidden');
+        if (mH) mH.value = currentMechId || '';
+        if (bH) bH.value = currentBayId || '';
+
+        const sVehicle = document.getElementById('summary_vehicle');
+        const sService = document.getElementById('summary_service');
+        if (sVehicle) sVehicle.innerText = "Loading details...";
+        if (sService) sService.innerText = "Please wait...";
+
+        fetch(`tenant-dashboard.php?action=get_job_details&id=${id}`)
+          .then(r => r.json()).then(job => {
+            if (job) {
+              if (sVehicle) sVehicle.innerText = `${job.plate_number || 'N/A'} - ${job.vehicle_model || 'Unknown'}`;
+              if (sService) sService.innerText = job.service_name || 'General Repair';
+              window.currentJobServicePrice = parseFloat(job.service_price) || 0;
+              const remField = document.getElementById('status_remarks');
+              if (remField) remField.value = job.remarks || '';
+              const checkboxes = document.querySelectorAll('.ann-chk');
+              const savedChecks = (job.checklist || "").split(',');
+              checkboxes.forEach(cb => { cb.checked = savedChecks.includes(cb.value); });
+
+              // REFRESH BILLING - Now that window.currentJobServicePrice is set
+              if (window.refreshJobPartsList) window.refreshJobPartsList(id);
+            }
+          });
+
+        const mS = document.getElementById('status_mechanic_id');
+        const bS = document.getElementById('status_bay_id');
+        if (mS) mS.innerHTML = '<option>Loading...</option>';
+        if (bS) bS.innerHTML = '<option>Loading...</option>';
+        fetch(`tenant-dashboard.php?action=fetch_available_resources&preferred_id=${currentBayId || 0}&current_mechanic_id=${currentMechId || 0}`)
+          .then(r => r.json()).then(data => {
+            if (mS) {
+              let mHtml = '<option value="">-- Select Mechanic --</option>';
+              mHtml += (data.mechanics || []).map(m => {
+                const shift = (m.shift_start && m.shift_end)
+                  ? ` — ${new Date('1970-01-01T'+m.shift_start).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} – ${new Date('1970-01-01T'+m.shift_end).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}${m.shift_days ? ' | '+m.shift_days.replace(/,/g,'·') : ''}` : '';
+                return `<option value="${m.mechanic_id}" ${m.mechanic_id == currentMechId ? 'selected' : ''}>${m.full_name}${shift}</option>`;
+              }).join('');
+              if (!mS.value && currentMechId && currentMechId != 0) mHtml += `<option value="${currentMechId}" selected>Current Mechanic</option>`;
+              mS.innerHTML = mHtml;
+            }
+            if (bS) {
+              let bHtml = '<option value="">-- Select Service Bay --</option>';
+              bHtml += (data.bays || []).map(b => `<option value="${b.bay_id}" ${b.bay_id == currentBayId ? 'selected' : ''}>${b.bay_name}</option>`).join('');
+              if (!bS.value && currentBayId && currentBayId != 0) bHtml += `<option value="${currentBayId}" selected>Current Bay</option>`;
+              bS.innerHTML = bHtml;
+            }
+          });
+
+        if (window.toggleJobStatusEdit) window.toggleJobStatusEdit(editMode);
+      } catch (e) { console.error("Modal Open Error:", e); alert("Modal Error: " + e.message); }
+    };
+
+    window.toggleJobStatusEdit = function (editing) {
+      const mS = document.getElementById('status_mechanic_id');
+      const bS = document.getElementById('status_bay_id');
+      const sS = document.getElementById('job_current_status');
+      const eb = document.getElementById('editJobBtn');
+      const sb = document.getElementById('saveJobBtn');
+      const userRole = '<?php echo strtoupper($role); ?>';
+      const isMech = userRole === 'MECHANIC';
+      const currentStatus = sS ? sS.value : '';
+      const isCompleted = (currentStatus === 'COMPLETED');
+      if (mS) mS.disabled = !editing || isCompleted || isMech;
+      if (bS) bS.disabled = !editing || isCompleted || isMech;
+      if (eb) eb.style.display = editing ? 'none' : 'flex';
+      if (sb) sb.style.display = editing ? 'flex' : 'none';
+
+      // Dynamic Status Enforcer: If they select IN_PROGRESS or COMPLETED, hide PENDING
+      if (sS) {
+        sS.onchange = function () {
+          const val = this.value;
+          const pendingOpt = this.querySelector('option[value="PENDING"]');
+          if (pendingOpt && (val === 'IN_PROGRESS' || val === 'COMPLETED')) {
+            pendingOpt.style.display = 'none';
+          }
+        };
+      }
+    };
+
+    // --- PARTS & MATERIALS ENGINE ---
+    window.togglePartResults = function () {
+      const list = document.getElementById('partResultsList');
+      if (list) list.style.display = list.style.display === 'none' ? 'block' : 'none';
+    };
+
+    window.showPartResults = function () {
+      const list = document.getElementById('partResultsList');
+      if (list) {
+        window.loadPartSelector();
+        list.style.display = 'block';
+      }
+    };
+
+
+    window.selectPartForJob = function (id, name, price, stock) {
+      const inp = document.getElementById('partComboboxInput');
+      const hiddenId = document.getElementById('selectedPartId');
+      if (inp) inp.value = name;
+      if (hiddenId) hiddenId.value = id;
+      window.togglePartResults();
+      // Focus quantity for speed
+      const qty = document.getElementById('partQty');
+      if (qty) qty.focus();
+    };
+
+
+    window.refreshJobPartsList = function (jid) {
+      const list = document.getElementById('jobPartsList');
+      const bill = document.getElementById('totalPartsBill');
+      if (!list) return;
+      fetch(`tenant-dashboard.php?action=fetch_job_parts&job_id=${jid}`)
+        .then(r => r.json()).then(data => {
+          window.currentlyAddedServiceIds = data.filter(p => p.service_id).map(p => parseInt(p.service_id));
+          if (!data.length) {
+            list.innerHTML = '<div style="text-align:center; color:var(--text-dim); font-size:0.8rem; padding:20px;">No parts recorded.</div>';
+            if (bill) bill.innerText = '₱0.00';
+            const overall = document.getElementById('totalOverallBill');
+            if (overall) {
+              const sP = window.currentJobServicePrice || 0;
+              overall.innerText = '₱' + sP.toLocaleString(undefined, { minimumFractionDigits: 2 });
+            }
+            return;
+          }
+          let total = 0;
+          list.innerHTML = data.map(p => {
+            const itemTotal = parseFloat(p.total_price) || 0;
+            const itemUnit = parseFloat(p.unit_price) || 0;
+            total += itemTotal;
+            return `<div style="display:flex; justify-content:space-between; align-items:center; background:rgba(255,255,255,0.03); padding:10px 15px; border-radius:12px; border:1px solid rgba(255,255,255,0.05); margin-bottom:8px;">
+                      <div style="flex:1;">
+                        <div style="font-weight:700; font-size:0.85rem; color:white;">${p.item_name}</div>
+                        <div style="font-size:0.7rem; color:var(--text-dim);">${p.service_id ? 'Labor / Service' : `${p.quantity} units @ ₱${itemUnit.toLocaleString()}`}</div>
+                      </div>
+                      <div style="display:flex; align-items:center; gap:12px;">
+                        <div style="font-weight:800; color:var(--accent); font-size:0.9rem;">₱${itemTotal.toLocaleString()}</div>
+                        <i class="fas fa-times-circle" onclick="window.removePartFromJob(${p.rp_id}, ${jid})" style="color:var(--danger); cursor:pointer;"></i>
+                      </div>
+                    </div>`;
+          }).join('');
+          if (bill) bill.innerText = '₱' + total.toLocaleString(undefined, { minimumFractionDigits: 2 });
+          const overall = document.getElementById('totalOverallBill');
+          if (overall) {
+            const sP = window.currentJobServicePrice || 0;
+            const combined = total + sP;
+            overall.innerText = '₱' + combined.toLocaleString(undefined, { minimumFractionDigits: 2 });
+          }
+        });
+    };
+
+    window.addPartToJob = function () {
+      const jid = document.getElementById('status_job_id').value;
+      const iid = document.getElementById('selectedPartId').value;
+      const qty = document.getElementById('partQty').value;
+      if (!jid || !iid || !qty) return alert("Please select a part and quantity");
+      const fd = new FormData();
+      fd.append('job_id', jid);
+      fd.append('item_id', iid);
+      fd.append('quantity', qty);
+      fetch('tenant-dashboard.php?action=add_part_to_job', { method: 'POST', body: fd })
+        .then(r => r.json()).then(data => {
+          if (data.status === 'success') {
+            showToast(data.message);
+            window.refreshJobPartsList(jid);
+            document.getElementById('selectedPartId').value = '';
+            document.getElementById('partComboboxInput').value = '';
+            window.loadPartSelector();
+          } else alert(data.message);
+        });
+    };
+
+    window.removePartFromJob = function (rpId, jid) {
+      if (!confirm("Remove this part from the job?")) return;
+      fetch(`tenant-dashboard.php?action=remove_part_from_job&rp_id=${rpId}`)
+        .then(r => r.json()).then(data => {
+          if (data.status === 'success') {
+            showToast(data.message);
+            window.refreshJobPartsList(jid);
+            window.loadPartSelector();
+          } else alert(data.message);
+        });
+    };
+
+    window.loadPartSelector = function () {
+      const list = document.getElementById('partResultsList');
+      if (!list) return;
+      fetch('tenant-dashboard.php?action=fetch_inventory')
+        .then(r => r.json()).then(data => {
+          window.allPartsCache = data;
+          window.filterPartCombobox("");
+        });
+    };
+
+    window.editPartQty = function (rp_id, currentQty, jid) {
+      const newQty = prompt("Enter new quantity:", currentQty);
+      if (newQty === null || newQty === "" || parseInt(newQty) === currentQty) return;
+      const q = parseInt(newQty);
+      if (isNaN(q) || q < 1) return showToast("Invalid quantity", "error");
+      const fd = new FormData();
+      fd.append('rp_id', rp_id);
+      fd.append('quantity', q);
+      fetch('tenant-dashboard.php?action=update_job_part_qty', { method: 'POST', body: fd })
+        .then(r => r.json()).then(data => {
+          if (data.status === 'success') {
+            showToast(data.message, 'success');
+            window.refreshJobPartsList(jid);
+          } else {
+            showAlert("Error", data.message, "error");
+          }
+        });
+    };
+
+
+    window.filterPartCombobox = function (q) {
+      const query = (q || "").toLowerCase().trim();
+      const list = document.getElementById('partResultsList');
+      if (!list || !window.allPartsCache) return;
+
+      const filtered = window.allPartsCache.filter(p =>
+        (p.item_name || "").toLowerCase().includes(query) ||
+        (p.brand || "").toLowerCase().includes(query) ||
+        (p.item_code || "").toLowerCase().includes(query)
+      );
+
+      list.innerHTML = filtered.map(p => {
+        const itemPrice = parseFloat(p.price || 0);
+        const qty = parseInt(p.quantity || 0);
+        const isOut = qty <= 0;
+        return `<div onclick="${isOut ? '' : `window.selectPartForJob(${p.item_id}, '${(p.item_name || "").replace(/'/g, "\\'")}', ${itemPrice}, ${qty})`}" 
+                     style="padding:12px 15px; cursor:${isOut ? 'not-allowed' : 'pointer'}; border-bottom:1px solid rgba(255,255,255,0.05); transition:0.2s; opacity:${isOut ? '0.5' : '1'};"
+                     onmouseover="${isOut ? '' : "this.style.background='rgba(255,255,255,0.05)'"}" onmouseout="this.style.background='transparent'">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <div>
+                <div style="font-weight:700; font-size:0.85rem; color:white;">${p.item_name} ${isOut ? '<span style="color:var(--danger); font-size:0.6rem; margin-left:5px;">OUT OF STOCK</span>' : ''}</div>
+                <div style="font-size:0.7rem; color:var(--text-dim);">${p.brand || 'No Brand'} • ${qty} in stock</div>
+              </div>
+              <div style="font-weight:800; color:var(--accent); font-size:0.9rem;">₱${itemPrice.toLocaleString()}</div>
+            </div>
+          </div>`;
+      }).join('') || '<div style="padding:20px; text-align:center; color:var(--text-dim); font-size:0.85rem;">No parts found.</div>';
+    };
+
+    window.filterServiceCombobox = function (q) {
+      const query = (q || "").toLowerCase().trim();
+      const list = document.getElementById('serviceResultsList');
+      if (!list || !window.allServicesCache) return;
+
+      const filtered = window.allServicesCache.filter(s => {
+        const matches = (s.service_name || "").toLowerCase().includes(query);
+        const alreadyAdded = (window.currentlyAddedServiceIds || []).includes(parseInt(s.service_id));
+        return matches && !alreadyAdded;
+      });
+
+      list.innerHTML = filtered.map(s => {
+        const price = parseFloat(s.price || 0);
+        return `<div onclick="window.selectServiceForJob(${s.service_id}, '${(s.service_name || "").replace(/'/g, "\\'")}', ${price})" 
+                     style="padding:12px 15px; cursor:pointer; border-bottom:1px solid rgba(255,255,255,0.05); transition:0.2s;"
+                     onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <div>
+                <div style="font-weight:700; font-size:0.85rem; color:white;">${s.service_name}</div>
+                <div style="font-size:0.7rem; color:var(--text-dim);">${s.category || 'Service'}</div>
+              </div>
+              <div style="font-weight:800; color:var(--accent); font-size:0.9rem;">₱${price.toLocaleString()}</div>
+            </div>
+          </div>`;
+      }).join('') || '<div style="padding:20px; text-align:center; color:var(--text-dim); font-size:0.85rem;">No services found.</div>';
+    };
+
+    window.selectServiceForJob = function (id, name, price) {
+      document.getElementById('selectedServiceId').value = id;
+      document.getElementById('serviceComboboxInput').value = name;
+      document.getElementById('serviceResultsList').style.display = 'none';
+    };
+
+    window.addServiceToJob = function () {
+      const jid = document.getElementById('status_job_id').value;
+      const sid = document.getElementById('selectedServiceId').value;
+      if (!jid || !sid) return alert("Please select a service first.");
+      const fd = new FormData();
+      fd.append('job_id', jid);
+      fd.append('service_id', sid);
+      fetch('tenant-dashboard.php?action=add_service_to_job', { method: 'POST', body: fd })
+        .then(r => r.json()).then(data => {
+          if (data.status === 'success') {
+            showToast(data.message);
+            window.refreshJobPartsList(jid);
+            document.getElementById('selectedServiceId').value = '';
+            document.getElementById('serviceComboboxInput').value = '';
+          } else alert(data.message);
+        });
+    };
+
+    window.loadServiceSelector = function () {
+      fetch('tenant-dashboard.php?action=fetch_services')
+        .then(r => r.json()).then(data => {
+          window.allServicesCache = data;
+          window.filterServiceCombobox("");
+        });
+    };
+
+    // Close floating lists when clicking outside
+    window.addEventListener('click', function (e) {
+      const partList = document.getElementById('partResultsList');
+      const partInput = document.getElementById('partComboboxInput');
+      const partArrow = document.getElementById('comboboxArrow');
+      const serviceList = document.getElementById('serviceResultsList');
+      const serviceInput = document.getElementById('serviceComboboxInput');
+
+      if (partList && !partList.contains(e.target) && e.target !== partInput && e.target !== partArrow) {
+        partList.style.display = 'none';
+      }
+      if (serviceList && !serviceList.contains(e.target) && e.target !== serviceInput) {
+        serviceList.style.display = 'none';
+      }
+    });
+
+
+    // --- REPAIR STATUS SUBMIT ENGINE ---
+    window.handleStatusSubmit = function (e) {
+      if (e) e.preventDefault();
+      const form = e ? e.target : document.getElementById('jobStatusForm');
+      if (!form) return;
+      const fd = new FormData(form);
+      const mS = document.getElementById('status_mechanic_id');
+      const bS = document.getElementById('status_bay_id');
+      const mH = document.getElementById('status_mechanic_id_hidden');
+      const bH = document.getElementById('status_bay_id_hidden');
+      const mId = (mS && mS.value) ? mS.value : (mH ? mH.value : '');
+      const bId = (bS && bS.value) ? bS.value : (bH ? bH.value : '');
+      if (!mId || !bId) return window.showAlert('Assignment Required', 'Please assign a mechanic and bay.', 'error');
+      if (!fd.has('mechanic_id')) fd.append('mechanic_id', mId);
+      if (!fd.has('bay_id')) fd.append('bay_id', bId);
+      const checked = [];
+      document.querySelectorAll('.ann-chk:checked').forEach(c => checked.push(c.value));
+      fd.append('checklist', checked.join(', '));
+      fetch('tenant-dashboard.php?action=update_job_status', { method: 'POST', body: fd })
+        .then(r => r.json()).then(data => {
+          if (data.status === 'success') {
+            showToast("Job status updated!");
+            window.closeModal('repairJobStatusModal_Final');
+            if (typeof refreshJobOrders === 'function') refreshJobOrders();
+            if (typeof refreshDashboardJobs === 'function') refreshDashboardJobs();
+          } else window.showAlert('Error', data.message, 'error');
+        });
+    };
+
+    window.highlightInPreview = function (field) {
+      const frame = document.getElementById('livePreviewFrame');
+      if (frame && frame.contentWindow) {
+        frame.contentWindow.postMessage({ action: 'highlight', field: field }, '*');
+      }
+    };
+
+    window.saveSingleSetting = function (field) {
+      const input = document.getElementById('setting_' + field);
+      if (!input) return;
+      const value = input.value;
+      const btn = event.currentTarget;
+      const originalHtml = btn.innerHTML;
+      btn.classList.add('saving');
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
+      const fd = new FormData();
+      fd.append('field', field);
+      fd.append('value', value);
+      fetch('tenant-dashboard.php?action=save_setting_item', { method: 'POST', body: fd })
+        .then(r => r.json()).then(data => {
+          if (data.status === 'success') {
+            showToast("Feature updated successfully!");
+            if (['primary_color', 'secondary_color', 'ui_style', 'border_radius', 'logo_url', 'banner_url', 'shop_name'].includes(field)) {
+              const frame = document.getElementById('livePreviewFrame');
+              if (frame) frame.src = frame.src;
+            }
+          } else showToast(data.message, 'error');
+        }).catch(err => showToast("Connection error", "error"))
+        .finally(() => {
+          btn.classList.remove('saving');
+          btn.innerHTML = originalHtml;
+        });
+    };
+
+    window.saveSettingWithFile = function (field) {
+      const input = document.getElementById('setting_' + field);
+      if (!input || !input.files[0]) return showToast("Please select a file first", "error");
+      const btn = event.currentTarget;
+      const originalHtml = btn.innerHTML;
+      btn.classList.add('saving');
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Uploading...';
+      const fd = new FormData();
+      fd.append('field', field);
+      fd.append(field, input.files[0]);
+      fetch('tenant-dashboard.php?action=save_setting_item', { method: 'POST', body: fd })
+        .then(r => r.json()).then(data => {
+          if (data.status === 'success') {
+            showToast("File uploaded and saved!");
+            const urlInput = document.getElementById('setting_' + field.replace('_file', '_url'));
+            if (urlInput) urlInput.value = data.new_url;
+            const frame = document.getElementById('livePreviewFrame');
+            if (frame) frame.src = frame.src;
+          } else showToast(data.message, 'error');
+        }).catch(err => showToast("Upload error", "error"))
+        .finally(() => {
+          btn.classList.remove('saving');
+          btn.innerHTML = originalHtml;
+        });
+    };
+
+    window.toggleBillingCycle = function (y) {
+      const mBtn = document.getElementById('toggleMonthly');
+      const yBtn = document.getElementById('toggleYearly');
+      if (mBtn) {
+        mBtn.style.background = !y ? '#6366f1' : 'rgba(255,255,255,0.05)';
+        mBtn.style.color = !y ? 'white' : '#94a3b8';
+        if (!y) mBtn.classList.add('active'); else mBtn.classList.remove('active');
+      }
+      if (yBtn) {
+        yBtn.style.background = y ? '#6366f1' : 'rgba(255,255,255,0.05)';
+        yBtn.style.color = y ? 'white' : '#94a3b8';
+        if (y) yBtn.classList.add('active'); else yBtn.classList.remove('active');
+      }
+      const selectedCycle = y ? 'yearly' : 'monthly';
+      document.querySelectorAll('.plan-card').forEach(card => {
+        const isPlanMatch = card.dataset.isMatch === 'true';
+        const activeCycle = card.dataset.activeCycle; // This is the user's actual cycle
+        const badge = card.querySelector('.active-badge');
+        const btn = card.querySelector('.upgrade-select-btn');
+        const isFullMatch = isPlanMatch && activeCycle === selectedCycle;
+
+        if (badge) badge.style.display = isFullMatch ? 'block' : 'none';
+        if (btn) {
+          if (isFullMatch) {
+            btn.innerText = 'Current Plan';
+            btn.disabled = true;
+            btn.style.opacity = '0.5';
+            btn.style.pointerEvents = 'none';
+          } else {
+            btn.innerText = 'Select Plan';
+            btn.disabled = false;
+            btn.style.opacity = '1';
+            btn.style.pointerEvents = 'auto';
+          }
+        }
+      });
+      document.querySelectorAll('.plan-price-val').forEach(el => {
+        const v = y ? el.dataset.yearly : el.dataset.monthly;
+        el.innerText = '₱' + parseFloat(v).toLocaleString();
+      });
+      document.querySelectorAll('.plan-cycle-label').forEach(el => el.innerText = y ? '/yr' : '/mo');
+    };
+
+
+    window.openUpgradeModal = function (e) {
+      if (e) { e.preventDefault(); e.stopPropagation(); }
+      const modal = document.getElementById('upgradeModal');
+      if (modal) {
+        modal.style.setProperty('display', 'flex', 'important');
+        modal.style.setProperty('z-index', '2147483647', 'important');
+        modal.style.setProperty('visibility', 'visible', 'important');
+        modal.style.setProperty('opacity', '1', 'important');
+        window.toggleBillingCycle(false);
+      }
+    };
+
+    window.closeUpgradeModal = function () {
+      console.log('[SUBS] closeUpgradeModal called');
+      const m = document.getElementById('upgradeModal');
+      if (m) {
+        m.style.display = 'none';
+      }
+    };
+
+    window.processUpgrade = function (planId, planName, e) {
+      const btn = e && e.currentTarget ? e.currentTarget : (event && event.currentTarget ? event.currentTarget : null);
+      const originalHtml = btn ? btn.innerHTML : 'Select Plan';
+      const isYearly = document.getElementById('toggleYearly').classList.contains('active');
+      const cycleText = isYearly ? 'Yearly' : 'Monthly';
+      const card = btn ? btn.closest('.plan-card') : null;
+      let price = 0;
+      if (card) {
+        const priceEl = card.querySelector('.plan-price-val');
+        price = isYearly ? priceEl.getAttribute('data-yearly') : priceEl.getAttribute('data-monthly');
+      }
+      const confirmMsg = "Confirm your switch to the " + planName + " plan (" + cycleText + "). Please select your payment method below.";
+
+      const executeUpgrade = (method) => {
+        showPayMongoSimulation(price, method, planName + " (" + cycleText + ")", () => {
+          if (btn) {
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
+          }
+          const fd = new FormData();
+          fd.append('plan_id', planId);
+          fd.append('billing_cycle', isYearly ? 'yearly' : 'monthly');
+          fd.append('method', method);
+          fetch('tenant-dashboard.php?action=upgrade_plan', { method: 'POST', body: fd })
+            .then(r => r.json()).then(data => {
+              if (data.status === 'success') {
+                alert("✅ " + data.message + "\nReference: " + data.ref);
+                window.closeUpgradeModal();
+                setTimeout(() => location.reload(), 1000);
+              } else {
+                alert("❌ Error: " + data.message);
+                if (btn) { btn.disabled = false; btn.innerHTML = originalHtml; }
+              }
+            }).catch(() => {
+              alert("❌ Connection error. Please try again.");
+              if (btn) { btn.disabled = false; btn.innerHTML = originalHtml; }
+            });
+        });
+      };
+
+      const modalId = 'upgradePayModal_' + Date.now();
+      const modalHTML = `
+        <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.9); backdrop-filter:blur(15px); z-index:2147483648; display:flex; align-items:center; justify-content:center; padding:20px;">
+          <div style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:32px; padding:3rem; width:100%; max-width:480px; text-align:center; box-shadow:0 30px 60px rgba(0,0,0,0.8);">
+            <div style="width:80px; height:80px; background:linear-gradient(135deg, var(--accent) 0%, rgba(var(--accent-rgb), 0.7) 100%); border-radius:50%; display:flex; align-items:center; justify-content:center; margin:0 auto 2rem; color:white; font-size:2.5rem; box-shadow:0 10px 25px var(--accent-glow);"><i class="fas fa-rocket"></i></div>
+            <h2 style="color:white; margin-bottom:0.8rem; font-size:1.8rem; font-weight:800;">Confirm Upgrade</h2>
+            <p style="color:#94a3b8; margin-bottom:2rem; line-height:1.6;">${confirmMsg}</p>
+            <div style="text-align:left; margin-bottom:2.5rem;">
+              <label style="color:white; font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; display:block; opacity:0.7;">Payment Method</label>
+              <select id="upgMethod_${modalId}">
+                <option value="GCASH" style="background:#111827;">GCash</option>
+                <option value="MAYA" style="background:#111827;">Maya</option>
+                <option value="BANK_TRANSFER" style="background:#111827;">Bank Transfer (BDO/BPI)</option>
+                <option value="CARD" style="background:#111827;">Credit/Debit Card</option>
+              </select>
+            </div>
+            <div style="display:flex; gap:15px; justify-content:center;">
+              <button id="upgConfirmBtn_${modalId}" style="flex:2; padding:16px; background:var(--accent); color:white; border:none; border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem; transition:0.3s; box-shadow:0 10px 20px var(--accent-glow);">Go to Payment</button>
+              <button id="upgCancelBtn_${modalId}" style="flex:1; padding:16px; background:rgba(255,255,255,0.05); color:white; border:1px solid rgba(255,255,255,0.1); border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem;">Cancel</button>
+            </div>
+          </div>
+        </div>`;
+      document.body.insertAdjacentHTML('beforeend', modalHTML);
+      document.getElementById('upgConfirmBtn_' + modalId).onclick = function () {
+        const selectedMethod = document.getElementById('upgMethod_' + modalId).value;
+        document.getElementById(modalId).remove();
+        executeUpgrade(selectedMethod);
+      };
+      document.getElementById('upgCancelBtn_' + modalId).onclick = function () { document.getElementById(modalId).remove(); };
+    };
+
+    window.loadBillingHistory = function () {
+      const body = document.getElementById('billingHistoryTableBody');
+      if (!body) return;
+      body.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:2rem;"><div class="spinner"></div></td></tr>';
+      fetch('tenant-dashboard.php?action=fetch_billing_history')
+        .then(res => res.json()).then(data => {
+          if (!data || data.length === 0) {
+            body.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:3rem; opacity:0.5;">No billing history found.</td></tr>';
+            return;
+          }
+          body.innerHTML = data.map(p => `
+            <tr>
+              <td>${p.payment_date}</td>
+              <td><code style="background:rgba(255,255,255,0.05); padding:2px 6px; border-radius:4px;">${p.transaction_reference}</code></td>
+              <td>₱${parseFloat(p.amount).toLocaleString()}</td>
+              <td><span class="badge" style="background:rgba(16,185,129,0.1); color:var(--success); border:1px solid rgba(16,185,129,0.2);">${p.payment_status}</span></td>
+            </tr>`).join('');
+        });
+    };
+
+    window.loadAuditLogs = function () {
+      console.log("[AUDIT] Initiative started...");
+      const body = document.getElementById('auditLogsTableBody');
+      if (!body) return;
+      body.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:3rem;"><div class="spinner" style="margin:0 auto 1rem;"></div><p>Synchronizing audit records...</p></td></tr>';
+      fetch('tenant-dashboard.php?action=fetch_audit_logs&_t=' + Date.now())
+        .then(res => res.json()).then(data => {
+          if (!data || data.length === 0) {
+            body.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:5rem; opacity:0.5;"><i class="fas fa-fingerprint" style="font-size:3rem; margin-bottom:1.5rem; color:var(--accent);"></i><br>No system activities logged yet.</td></tr>';
+            return;
+          }
+          body.innerHTML = data.map(l => {
+            let actor = l.actor_name || 'System Agent';
+            let badgeClass = 'badge-active';
+            let icon = 'fa-bolt';
+            if (l.activity_type === 'AUTH') { badgeClass = 'badge-pending'; icon = 'fa-key'; }
+            if (l.activity_type === 'CRUD') { badgeClass = 'badge-active'; icon = 'fa-database'; }
+            if (l.activity_type === 'SECURITY') { badgeClass = 'badge-danger'; icon = 'fa-shield-alt'; }
+            if (l.activity_type === 'CUSTOMER_REG') { badgeClass = 'badge-active'; icon = 'fa-user-plus'; }
+            if (l.activity_type === 'INFO') { badgeClass = 'badge-active'; icon = 'fa-info-circle'; }
+            if (l.activity_type === 'SUBSCRIPTION') { badgeClass = 'badge-active'; icon = 'fa-rocket'; }
+
+            return `
+              <tr class="hover-bright" style="border-bottom:1px solid rgba(255,255,255,0.03);">
+                <td style="font-size:0.85rem; color:var(--text-dim); font-weight:700;">${new Date(l.created_at).toLocaleString()}</td>
+                <td>
+                  <div style="display:flex; align-items:center; gap:10px;">
+                    <div style="width:28px; height:28px; border-radius:50%; background:rgba(255,255,255,0.05); display:flex; align-items:center; justify-content:center; font-size:0.75rem; color:var(--accent);">
+                      <i class="fas fa-user-circle"></i>
+                    </div>
+                    <span style="font-weight:700; color:white;">${actor}</span>
+                  </div>
+                </td>
+                <td>
+                  <span class="badge ${badgeClass}" style="font-size:0.7rem; padding:4px 10px;">
+                    <i class="fas ${icon}" style="margin-right:5px;"></i> ${l.activity_type}
+                  </span>
+                </td>
+                <td style="font-size:0.85rem; color:var(--text-dim); line-height:1.5; max-width:400px;">${l.description || '-'}</td>
+              </tr>`;
+          }).join('');
+        });
+    };
+
+
+
+
+
+
+    // --- INITIALIZATION ---
+    document.addEventListener('DOMContentLoaded', () => {
+      const jsf = document.getElementById('jobStatusForm');
+      if (jsf) {
+        jsf.addEventListener('submit', window.handleStatusSubmit);
+      }
+    });
+
+
+
+    window.prepareAddServiceModal = function () {
+      const form = document.getElementById('addServiceForm');
+      if (form) {
+        form.reset();
+        const nameInp = form.querySelector('input[name="service_name"]');
+        if (nameInp) {
+          nameInp.readOnly = false;
+          nameInp.style.opacity = "1";
+        }
+        const masterSelect = form.querySelector('select[name="master_id"]');
+        if (masterSelect) {
+          masterSelect.disabled = false;
+          masterSelect.style.opacity = "1";
+        }
+        const hint = form.querySelector('.price-hint');
+        if (hint) hint.remove();
+
+        const submitBtn = form.querySelector('button[onclick*="Service"]');
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.style.opacity = "1";
+        }
+      }
+      openModal('addServiceModal');
+    };
+
+    window.syncMasterService = function (el, formId) {
+      const form = document.getElementById(formId);
+      if (!form) return;
+      const priceInput = form.querySelector('input[name="price"]');
+      const nameInput = form.querySelector('input[name="service_name"]');
+      const submitBtn = form.querySelector('button[onclick*="submit"]');
+      const hint = form.querySelector('.price-hint') || document.createElement('div');
+
+      const opt = el.options[el.selectedIndex];
+      const min = parseFloat(opt.dataset.min || 0);
+      const max = parseFloat(opt.dataset.max || 0);
+
+      // Auto-fill Service Name if a master service is selected
+      if (nameInput) {
+        if (el.value) {
+          nameInput.value = opt.text;
+          nameInput.readOnly = true;
+          nameInput.style.opacity = "0.7";
+        } else {
+          nameInput.readOnly = false;
+          nameInput.style.opacity = "1";
+        }
+      }
+
+      const validate = () => {
+        if (!priceInput || isNaN(min) || min === 0) {
+          if (submitBtn) { submitBtn.disabled = false; submitBtn.style.opacity = '1'; submitBtn.style.cursor = 'pointer'; }
+          return;
+        }
+        const val = parseFloat(priceInput.value || 0);
+        const isInvalid = (val < min || val > max);
+
+        hint.style.color = isInvalid ? '#ef4444' : 'var(--accent)';
+        hint.innerHTML = `<i class="fas fa-${isInvalid ? 'exclamation-triangle' : 'info-circle'}"></i> Recommended Price: ₱${min.toLocaleString()} - ₱${max.toLocaleString()}`;
+
+        if (submitBtn) {
+          submitBtn.disabled = isInvalid;
+          submitBtn.style.opacity = isInvalid ? '0.5' : '1';
+          submitBtn.style.cursor = isInvalid ? 'not-allowed' : 'pointer';
+        }
+      };
+
+      if (priceInput) {
+        priceInput.min = min;
+        priceInput.max = max;
+        priceInput.placeholder = (min > 0) ? `Range: ₱${min.toLocaleString()} - ₱${max.toLocaleString()}` : "0.00";
+
+        hint.className = 'price-hint';
+        hint.style.fontSize = '0.75rem';
+        hint.style.marginTop = '5px';
+        if (min > 0) {
+          if (!form.querySelector('.price-hint')) priceInput.parentNode.appendChild(hint);
+          priceInput.oninput = validate;
+          validate();
+        } else {
+          if (form.querySelector('.price-hint')) form.querySelector('.price-hint').remove();
+          if (submitBtn) { submitBtn.disabled = false; submitBtn.style.opacity = '1'; submitBtn.style.cursor = 'pointer'; }
+        }
+      }
+    };
+
+    window.refreshPaymentsList = function () {
+      const b = document.getElementById('completedPaymentsBody'); if (!b) return;
+      b.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:2rem;"><i class="fas fa-spinner fa-spin"></i> Fetching logs...</td></tr>';
+      fetch('tenant-dashboard.php?action=fetch_payments&_t=' + Date.now())
+        .then(r => r.text()).then(t => {
+          try {
+            const s = t.indexOf('['), e = t.lastIndexOf(']') + 1;
+            const data = JSON.parse(t.substring(s, e));
+            if (!data.length) { b.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:2rem;">No logs found.</td></tr>'; return; }
+            b.innerHTML = data.map(p => `
+              <tr>
+                <td>#${p.payment_id}</td>
+                <td><strong>${p.customer_name}</strong></td>
+                <td><small>${p.reference_no || '---'}</small> (${p.payment_method})</td>
+                <td>₱${parseFloat(p.amount || 0).toLocaleString()}</td>
+                <td>${new Date(p.payment_date).toLocaleDateString()}</td>
+                <td><span class="badge badge-active">${p.status}</span></td>
+              </tr>
+            `).join('');
+          } catch (e) { b.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:2rem;">Sync failed.</td></tr>'; }
+        });
+    };
+
+
+
+
+    window.openModal = function (id) {
+      const el = document.getElementById(id);
+      if (el) {
+        el.style.display = 'flex';
+        const firstInput = el.querySelector('input, select, textarea');
+        if (firstInput) setTimeout(() => firstInput.focus(), 100);
+      }
+    };
+
+    window.toggleAnnouncement = function () {
+      const ann = document.getElementById('announcement-banner');
+      if (ann) {
+        ann.style.display = (ann.style.display === 'none' || ann.style.display === '') ? 'flex' : 'none';
+      }
+    };
+    window.toggleVehicleGroup = function (id) {
+      document.querySelectorAll('.vehicle-child-' + id).forEach(r => {
+        r.style.display = (r.style.display === 'none') ? 'table-row' : 'none';
+      });
+    };
+
+    // refreshAppointmentsList
+    window.refreshAppointmentsList = function () {
+      console.log("[DEBUG] refreshAppointmentsList triggered at " + new Date().toLocaleTimeString());
+      const body = document.getElementById('appointmentsTableBody'); if (!body) return;
+
+      // Immediate UI Feedback
+      body.innerHTML = '<tr><td colspan="7" style="text-align:center; padding:3rem; color:var(--accent);"><i class="fas fa-spinner fa-spin"></i> Refreshing bookings...</td></tr>';
+
+      const sort = document.getElementById('appointmentSortFilter')?.value || 'latest';
+      const search = document.getElementById('appointmentSearchInput')?.value || '';
+
+      fetch(`tenant-dashboard.php?action=fetch_all_appointments&sort=${sort}&search=${encodeURIComponent(search)}&_=${Date.now()}`)
+        .then(res => res.text())
+        .then(text => {
+          try {
+            // Find JSON part
+            const start = text.indexOf('[');
+            const end = text.lastIndexOf(']') + 1;
+            if (start === -1 || end === 0) {
+              // IF NO JSON FOUND, SHOW RAW ERROR IN TABLE
+              body.innerHTML = `<tr><td colspan="7" style="text-align:center; color:#ef4444; padding:3rem;"><i class="fas fa-bug"></i> Server Error:<br><pre style="background:rgba(0,0,0,0.3); padding:1rem; border-radius:10px; margin-top:1rem; font-size:0.7rem; color:#f87171; white-space:pre-wrap;">${text.substring(0, 500)}</pre></td></tr>`;
+              return;
+            }
+            const data = JSON.parse(text.substring(start, end));
+
+            if (!Array.isArray(data) || data.length === 0) {
+              body.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--text-dim); padding:3rem;">No upcoming appointments found in the system.</td></tr>';
+              return;
+            }
+            body.innerHTML = data.map(a => {
+              const isPending = a.status === 'PENDING';
+              const isConfirmed = a.status === 'CONFIRMED';
+
+              // Date/Time Formatter
+              let displayDate = a.appointment_date;
+              let displayTime = a.appointment_time;
+              try {
+                if (a.appointment_date && a.appointment_date !== '0000-00-00') {
+                  displayDate = new Date(a.appointment_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                }
+                if (a.appointment_time && a.appointment_time !== '00:00:00') {
+                  const [h, m] = a.appointment_time.split(':');
+                  const hh = parseInt(h);
+                  const ampm = hh >= 12 ? 'PM' : 'AM';
+                  displayTime = ((hh % 12) || 12) + ':' + m + ' ' + ampm;
+                }
+              } catch (e) { console.error("Format Error", e); }
+
+              let actionHtml = '';
+              if (isPending) {
+                actionHtml = `
+              <div style="display:flex; gap:8px;">
+                <button class="btn-action" style="flex:1; padding:8px; font-size:0.75rem; background:#10b981; color:white; border:none; border-radius:10px;" onclick="window.processAppointment(${a.appointment_id}, 'CONFIRMED', '${(a.requested_mechanic_name || '').replace(/'/g, "\\'")}')">
+                  <i class="fas fa-check"></i> Approve
+                </button>
+                <button class="btn-action" style="flex:1; padding:8px; font-size:0.75rem; background:#ef4444; color:white; border:none; border-radius:10px;" onclick="window.processAppointment(${a.appointment_id}, 'CANCELLED')">
+                  <i class="fas fa-times"></i> Reject
+                </button>
+              </div>`;
+              } else if (isConfirmed) {
+                actionHtml = `
+              <div style="display:flex; flex-direction:column; gap:8px;">
+                <button class="btn-action" style="padding:8px; font-size:0.75rem; background:var(--accent); color:white; border:none; border-radius:10px; font-weight:700;" onclick="window.startRepairFromAppointment(${a.appointment_id})">
+                  <i class="fas fa-play-circle"></i> Start Repair
+                </button>
+                <button class="btn-outline" style="padding:4px; font-size:0.65rem; border-color:rgba(239,68,68,0.3); color:#ef4444;" onclick="window.processAppointment(${a.appointment_id}, 'CANCELLED')">
+                   Cancel Appointment
+                </button>
+              </div>`;
+              } else {
+                actionHtml = `<div style="text-align:center;"><em style="font-size:0.75rem; color:var(--text-dim); opacity:0.6;"><i class="fas fa-history"></i> Archived</em></div>`;
+              }
+              return `
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.03);">
+            <td>
+              <div style="font-weight:800; color:white; font-size:0.9rem;">${displayDate}</div>
+              <div style="font-size:0.75rem; color:var(--accent); font-weight:700;"><i class="far fa-clock"></i> ${displayTime}</div>
+            </td>
+            <td><strong>${a.customer_name}</strong></td>
+            <td>
+              <div style="font-weight:700; color:var(--accent);">${a.plate_no || 'No Plate'}</div>
+              <small style="color:var(--text-dim);">${a.make ? a.make + ' ' + a.model : 'No Vehicle Info'}</small>
+            </td>
+            <td><span style="font-size:0.85rem; font-weight:700;">${a.service_name || 'General Repair'}</span></td>
+            <td><i class="fas fa-user-check" style="color:${a.requested_mechanic_name ? 'var(--accent)' : 'var(--text-dim)'}; opacity:0.6;"></i> ${a.requested_mechanic_name || '(None)'}</td>
+            <td><span class="badge ${a.status === 'PENDING' ? 'badge-pending' : (a.status === 'CONFIRMED' ? 'badge-active' : 'badge-danger')}">${a.status}</span></td>
+            <td>${actionHtml}</td>
+          </tr>`;
+            }).join('');
+          } catch (e) {
+            console.error("Parse Error:", e, text);
+            body.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#ef4444; padding:3rem;"><i class="fas fa-exclamation-circle"></i> Error parsing bookings.</td></tr>';
+          }
+        })
+        .catch(err => {
+          console.error("Fetch Error:", err);
+          body.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#ef4444; padding:3rem;"><i class="fas fa-wifi"></i> Connection error.</td></tr>';
+        });
+    };
+
+    window.refreshVehiclesList = function () {
+      const b = document.getElementById('vehiclesBody'); if (!b) return;
+      const search = document.getElementById('vehicleSearchInput')?.value || '';
+      b.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:3rem;"><i class="fas fa-spinner fa-spin"></i> Loading...</td></tr>';
+      fetch(`tenant-dashboard.php?action=fetch_vehicles&search=${encodeURIComponent(search)}&_=${Date.now()}`)
+        .then(res => res.text()).then(text => {
+          try {
+            const s = text.indexOf('['), e = text.lastIndexOf(']') + 1;
+            const data = JSON.parse(text.substring(s, e));
+            if (!data.length) { b.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:3rem;">No vehicles found.</td></tr>'; return; }
+            const groups = {};
+            data.forEach(v => {
+              const o = v.customer_name || 'Generic';
+              if (!groups[o]) groups[o] = [];
+              groups[o].push(v);
+            });
+            let html = '';
+            Object.keys(groups).forEach((o, i) => {
+              const gid = 'vg-' + i;
+              html += `<tr onclick="window.toggleVehicleGroup('${gid}')" style="cursor:pointer; background:rgba(255,255,255,0.02);">
+                        <td colspan="4" style="padding:1rem;"><strong>${o}</strong> (${groups[o].length} units)</td>
+                    </tr>`;
+              groups[o].forEach(v => {
+                html += `<tr class="vehicle-child-${gid}" style="display:none; background:rgba(0,0,0,0.1);">
+                            <td style="padding-left:3rem;"><code>${v.plate_no}</code></td>
+                            <td>${v.make} ${v.model}</td>
+                            <td>${v.year_model || v.year || '---'}</td>
+                            <td><button class="btn-outline" onclick="window.openVehicleProfile(${v.vehicle_id})">View</button></td>
+                        </tr>`;
+              });
+            });
+            b.innerHTML = html;
+          } catch (err) { b.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:3rem;">Data parsing error.</td></tr>'; }
+        });
+    };
+
+    function showToast(msg, type = 'success') {
+      const container = document.getElementById('toastContainer');
+      if (!container) return;
+      const toast = document.createElement('div');
+      toast.className = 'toast-box';
+      toast.style.borderLeftColor = type === 'error' ? 'var(--danger)' : 'var(--accent)';
+      toast.innerHTML = `<i class="fas fa-${type === 'error' ? 'exclamation-circle' : 'check-circle'}" style="color:${type === 'error' ? 'var(--danger)' : 'var(--accent)'}"></i> ${msg}`;
+      container.appendChild(toast);
+      setTimeout(() => toast.remove(), 4000);
+    }
+    window.showToast = showToast;
+
+    function closeModal(id) {
+      const el = document.getElementById(id);
+      if (el) el.style.display = 'none';
+    }
+    window.closeModal = closeModal;
+
+    function closeNotiModal() {
+      const m = document.getElementById('notificationModal');
+      if (m) m.style.display = 'none';
+    }
+    window.closeNotiModal = closeNotiModal;
+
+    function showAlert(title, message, type = 'info') {
+      const modal = document.getElementById('notificationModal');
+      if (!modal) return;
+      document.getElementById('notiTitle').innerText = title;
+      document.getElementById('notiMessage').innerText = message;
+      const icon = document.getElementById('notiIcon');
+      const btn = document.getElementById('notiConfirmBtn');
+      const cancelBtn = document.getElementById('notiCancelBtn');
+      if (cancelBtn) cancelBtn.style.display = 'none';
+      if (btn) {
+        btn.innerText = 'Okay';
+        btn.onclick = closeNotiModal;
+      }
+      if (icon) {
+        if (type === 'error') {
+          icon.innerHTML = '<i class="fa-solid fa-circle-xmark"></i>';
+          icon.style.color = 'var(--danger)';
+          icon.style.background = 'rgba(239, 68, 68, 0.1)';
+        } else if (type === 'success') {
+          icon.innerHTML = '<i class="fa-solid fa-circle-check"></i>';
+          icon.style.color = 'var(--success)';
+          icon.style.background = 'rgba(16, 185, 129, 0.1)';
+        } else {
+          icon.innerHTML = '<i class="fa-solid fa-circle-info"></i>';
+          icon.style.color = 'var(--accent)';
+          icon.style.background = 'rgba(99, 102, 241, 0.1)';
+        }
+      }
+      modal.style.display = 'flex';
+    }
+    window.showAlert = showAlert;
+
+    function showConfirm(title, message, onConfirm) {
+      const modal = document.getElementById('notificationModal');
+      if (!modal) { if (confirm(message)) onConfirm(); return; }
+      document.getElementById('notiTitle').innerText = title;
+      document.getElementById('notiMessage').innerText = message;
+      const btn = document.getElementById('notiConfirmBtn');
+      const cbtn = document.getElementById('notiCancelBtn');
+      if (cbtn) cbtn.style.display = 'block';
+      if (btn) {
+        btn.innerText = 'Confirm';
+        btn.onclick = () => { onConfirm(); closeNotiModal(); };
+      }
+      modal.style.display = 'flex';
+    }
+    window.showConfirm = showConfirm;
+
+    console.log('HIGH_PRIORITY_ENGINE_LOADED');
+    window.refreshShiftRequests = function () {
+      fetch('tenant-dashboard.php?action=fetch_shift_requests')
+        .then(r => r.json())
+        .then(data => {
+          const body = document.getElementById('shiftRequestsBody');
+          const section = document.getElementById('shiftRequestsSection');
+          const badge = document.getElementById('shiftRequestBadge');
+          const staffBody = document.getElementById('staffShiftRequestsBody');
+          const staffSection = document.getElementById('staffShiftRequestsSection');
+          if (!data || data.length === 0) {
+            if (section) section.style.display = 'none';
+            if (staffSection) staffSection.style.display = 'none';
+            return;
+          }
+          if (section) section.style.display = 'block';
+          if (staffSection) staffSection.style.display = 'block';
+          if (badge) { badge.innerText = data.length; badge.style.display = 'inline-block'; }
+          const mapReq = (req, isStaff) => {
+            const start = new Date('2000-01-01 ' + req.requested_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const end = new Date('2000-01-01 ' + req.requested_end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            return `
+              <tr style="border-bottom:1px solid rgba(255,255,255,0.03);">
+                <td style="padding:${isStaff ? '10px 15px' : '15px 20px'};">
+                  <div style="font-weight:700; color:#fff;">${req.full_name}</div>
+                  ${isStaff ? '' : `<div style="font-size:0.75rem; color:var(--text-dim);">Mechanic ID: #${req.mechanic_id}</div>`}
+                </td>
+                <td style="padding:${isStaff ? '10px 15px' : '15px 20px'};">
+                  <div style="display:flex; align-items:center; gap:8px; color:var(--accent); font-weight:700;">
+                    <i class="far fa-clock"></i> ${start} – ${end}
+                  </div>
+                  ${req.requested_days ? `<div style="font-size:0.75rem; color:var(--text-dim); margin-top:4px;"><i class="fas fa-calendar-week" style="margin-right:4px; color:var(--accent);"></i> ${req.requested_days.split(',').join(' · ')}</div>` : ''}
+                </td>
+                ${isStaff ? '' : `<td style="padding:15px 20px;"><div style="font-size:0.85rem; color:var(--text-dim); max-width:250px;">${req.reason}</div></td>`}
+                <td style="padding:${isStaff ? '10px 15px' : '15px 20px'}; text-align:right;">
+                  <div style="display:flex; gap:10px; justify-content:flex-end;">
+                    <button onclick="window.processShiftRequest(${req.request_id}, 'APPROVED')" class="btn-action" style="padding:6px 14px; font-size:0.75rem; background:var(--success); border:none; color:white; font-weight:800; border-radius:10px; cursor:pointer;">Approve</button>
+                    <button onclick="window.processShiftRequest(${req.request_id}, 'REJECTED')" class="btn-action" style="padding:6px 14px; font-size:0.75rem; background:var(--danger); border:none; color:white; font-weight:800; border-radius:10px; cursor:pointer;">Reject</button>
+                  </div>
+                </td>
+              </tr>`;
+          };
+          if (body) body.innerHTML = data.map(req => mapReq(req, false)).join('');
+          if (staffBody) staffBody.innerHTML = data.map(req => mapReq(req, true)).join('');
+        });
+    };
+    window.processShiftRequest = function (requestId, status) {
+      if (!confirm(`Are you sure you want to ${status.toLowerCase()} this request?`)) return;
+      const fd = new FormData();
+      fd.append('request_id', requestId);
+      fd.append('status', status);
+      fetch('tenant-dashboard.php?action=process_shift_request', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(data => {
+          if (data.status === 'success') {
+            if (typeof showToast === 'function') showToast(data.message, 'success'); else alert(data.message);
+            window.refreshShiftRequests();
+            if (typeof window.refreshMechanicsList === 'function') window.refreshMechanicsList();
+          } else {
+            if (typeof showToast === 'function') showToast(data.message, 'error'); else alert(data.message);
+          }
+        });
+    };
+  </script>
   <style>
+    @keyframes pulse {
+      0% {
+        opacity: 1;
+        transform: scale(1);
+      }
+
+      50% {
+        opacity: 0.8;
+        transform: scale(1.05);
+      }
+
+      100% {
+        opacity: 1;
+        transform: scale(1);
+      }
+    }
+
     :root {
       --bg-deep:
-        <?php echo $tenant_custom['secondary_color'] ?: '#030712'; ?>
-        !important;
+        <?php echo $tenant_custom['secondary_color'] ?: '#030712'; ?> !important;
       --accent:
-        <?php echo $tenant_custom['primary_color'] ?: '#10b981'; ?>
-        !important;
+        <?php echo $tenant_custom['primary_color'] ?: '#10b981'; ?> !important;
       --accent-rgb:
         <?php
         $hex = ($tenant_custom['primary_color'] ?? '') ?: '#10b981';
@@ -2559,25 +5218,28 @@ try {
           $b = 129;
         }
         echo "$r, $g, $b";
-        ?>
-        !important;
+        ?> !important;
       --accent-glow: rgba(var(--accent-rgb), 0.4);
-      --radius:
-        <?php echo $tenant_custom['border_radius'] ?: '24px'; ?>
-      ;
-      --glass:
-        <?php echo ($tenant_custom['ui_style'] === 'SOLID') ? 'rgba(15, 23, 42, 0.95)' : 'rgba(255, 255, 255, 0.03)'; ?>
-      ;
-      --glass-border:
-        <?php echo ($tenant_custom['ui_style'] === 'SOLID') ? 'rgba(255, 255, 255, 0.12)' : 'rgba(255, 255, 255, 0.08)'; ?>
-      ;
-      --glass-blur:
-        <?php echo ($tenant_custom['ui_style'] === 'SOLID') ? 'none' : 'blur(20px)'; ?>
-      ;
+      --radius: <?php echo $tenant_custom['border_radius'] ?: '24px'; ?>;
+      --glass: <?php echo ($tenant_custom['ui_style'] === 'SOLID') ? 'rgba(15, 23, 42, 0.95)' : 'rgba(255, 255, 255, 0.03)'; ?>;
+      --glass-border: <?php echo ($tenant_custom['ui_style'] === 'SOLID') ? 'rgba(255, 255, 255, 0.12)' : 'rgba(255, 255, 255, 0.08)'; ?>;
+      --glass-blur: <?php echo ($tenant_custom['ui_style'] === 'SOLID') ? 'none' : 'blur(20px)'; ?>;
       --text-main: #f8fafc;
       --text-dim: #94a3b8;
+      --success: #10b981;
       --danger: #ef4444;
       --warning: #f59e0b;
+      --card-bg: rgba(255, 255, 255, 0.03);
+    }
+
+    [data-theme="light"] {
+      --bg-deep: #f1f5f9;
+      --text-main: #0f172a;
+      --text-dim: #475569;
+      --glass: rgba(255, 255, 255, 0.9);
+      --glass-border: rgba(0, 0, 0, 0.1);
+      --accent-glow: rgba(var(--accent-rgb), 0.2);
+      --card-bg: #ffffff;
     }
 
     /* Custom Scrollbar for Premium Feel */
@@ -2918,6 +5580,7 @@ try {
       height: 100vh;
       z-index: 5000;
       pointer-events: auto;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     }
 
     .main-content {
@@ -2928,6 +5591,74 @@ try {
       position: relative;
       min-height: 100vh;
       z-index: 1;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    /* Collapsed Sidebar Styles */
+    body.sidebar-collapsed .sidebar {
+      width: 85px;
+      min-width: 85px;
+    }
+
+    body.sidebar-collapsed .main-content {
+      margin-left: 85px;
+    }
+
+    body.sidebar-collapsed .brand div:not(.brand-icon),
+    body.sidebar-collapsed .nav-group-title,
+    body.sidebar-collapsed .nav-item .nav-label,
+    body.sidebar-collapsed .nav-item-link .nav-label,
+    body.sidebar-collapsed .nav-item span:not(.notif-badge) {
+      display: none;
+    }
+
+    body.sidebar-collapsed .nav-item,
+    body.sidebar-collapsed .nav-item-link {
+      justify-content: center;
+      padding: 1rem;
+      gap: 0;
+    }
+
+    body.sidebar-collapsed .nav-item i,
+    body.sidebar-collapsed .nav-item-link i {
+      font-size: 1.25rem;
+      margin: 0;
+    }
+
+    body.sidebar-collapsed .brand {
+      justify-content: center;
+      padding: 0 0 2rem 0;
+    }
+
+    /* Sidebar Trigger (Floating Arrow) */
+    .sidebar-trigger {
+      position: absolute;
+      right: -14px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 28px;
+      height: 28px;
+      background: var(--accent);
+      border: 1px solid var(--glass-border);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #000;
+      cursor: pointer;
+      z-index: 5001;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    }
+
+    .sidebar-trigger:hover {
+      transform: translateY(-50%) scale(1.15);
+      background: #059669;
+      box-shadow: 0 0 15px var(--accent-glow);
+    }
+
+    body.sidebar-collapsed .sidebar-trigger {
+      /* Adjust if needed for collapsed state */
     }
 
     .brand {
@@ -3598,24 +6329,29 @@ try {
               ?>
               <div class="plan-card" data-plan-id="<?php echo $p['plan_id']; ?>"
                 data-is-match="<?php echo $is_plan_match ? 'true' : 'false'; ?>"
+                data-active-cycle="<?php echo $user_cycle; ?>"
                 style="background: rgba(30, 41, 59, 0.5); border: 1px solid rgba(255,255,255,0.05); padding: 35px; border-radius: 24px; text-align: center; position: relative;">
                 <div class="active-badge"
-                  style="display:none; position:absolute; top:15px; right:15px; background:var(--accent); color:white; padding:5px 12px; border-radius:100px; font-size:0.7rem; font-weight:900;">
-                  ACTIVE</div>
+                  style="<?php echo $is_current ? 'display:block;' : 'display:none;'; ?> position:absolute; top:15px; right:15px; background:var(--accent); color:white; padding:5px 12px; border-radius:100px; font-size:0.7rem; font-weight:900;">
+                  CURRENT PLAN</div>
                 <h3 style="font-size:1.6rem; color:#fff; margin-bottom:10px;">
                   <?php echo htmlspecialchars($p['plan_name']); ?>
                 </h3>
                 <div style="margin-bottom:25px;">
                   <span class="plan-price-val" data-monthly="<?php echo $monthly; ?>" data-yearly="<?php echo $yearly; ?>"
                     style="font-size:2.8rem; font-weight:900; color:#fff;">₱
-                    <?php echo number_format($monthly); ?>
+                    <?php echo ($user_cycle === 'yearly') ? number_format($yearly) : number_format($monthly); ?>
                   </span>
-                  <span class="plan-cycle-label" style="font-size:1rem; color:#64748b;">/mo</span>
+                  <span class="plan-cycle-label" style="font-size:1rem; color:#64748b;">
+                    <?php echo ($user_cycle === 'yearly') ? '/yr' : '/mo'; ?>
+                  </span>
                 </div>
                 <button class="upgrade-select-btn btn-action"
-                  style="width:100%; padding:15px; border-radius:15px; font-weight:800;" type="button"
-                  onclick="processUpgrade(<?php echo $p['plan_id']; ?>, '<?php echo addslashes($p['plan_name']); ?>', event)">
-                  Select Plan
+                  style="width:100%; padding:15px; border-radius:15px; font-weight:800; <?php echo $is_current ? 'opacity:0.5; pointer-events:none;' : ''; ?>"
+                  type="button" <?php echo $is_current ? 'disabled' : ''; ?> onclick="processUpgrade(
+            <?php echo $p['plan_id']; ?>, '
+            <?php echo addslashes($p['plan_name']); ?>', event)">
+                  <?php echo $is_current ? 'Current Plan' : 'Select Plan'; ?>
                 </button>
               </div>
             <?php endforeach; else: ?>
@@ -3626,36 +6362,8 @@ try {
       </div>
     </div>
     <script>
-      window.openUpgradeModal = function (e) {
-        if (e) { e.preventDefault(); e.stopPropagation(); }
-        const modal = document.getElementById('upgradeModal');
-        if (modal) {
-          modal.style.setProperty('display', 'flex', 'important');
-          modal.style.setProperty('z-index', '2147483647', 'important');
-          modal.style.setProperty('visibility', 'visible', 'important');
-          modal.style.setProperty('opacity', '1', 'important');
-          window.toggleBillingCycle(false); // ALWAYS DEFAULT TO MONTHLY
-        }
-      };
-      window.toggleBillingCycle = function (y) {
-        const mBtn = document.getElementById('toggleMonthly');
-        const yBtn = document.getElementById('toggleYearly');
-        if (mBtn) {
-          mBtn.style.background = !y ? '#6366f1' : 'rgba(255,255,255,0.05)';
-          mBtn.style.color = !y ? 'white' : '#94a3b8';
-          if (!y) mBtn.classList.add('active'); else mBtn.classList.remove('active');
-        }
-        if (yBtn) {
-          yBtn.style.background = y ? '#6366f1' : 'rgba(255,255,255,0.05)';
-          yBtn.style.color = y ? 'white' : '#94a3b8';
-          if (y) yBtn.classList.add('active'); else yBtn.classList.remove('active');
-        }
-        document.querySelectorAll('.plan-price-val').forEach(el => {
-          const v = y ? el.dataset.yearly : el.dataset.monthly;
-          el.innerText = '₱' + parseFloat(v).toLocaleString();
-        });
-        document.querySelectorAll('.plan-cycle-label').forEach(el => el.innerText = y ? '/yr' : '/mo');
-      };
+      // Upgrade Modal Logic moved to top engine
+
     </script>
     <style>
       #toggleMonthly.active,
@@ -3666,291 +6374,49 @@ try {
     </style>
   <?php endif; ?>
   <script>
-    const sectionTitles = {
-      'dashboard': { title: '<?php echo ucwords(strtolower($role)); ?> Dashboard', sub: 'Overview & Real-time Stats' },
-      'appointments': { title: 'Service Appointments', sub: 'Manage bookings and schedules' },
-      'job_orders': { title: 'Job Orders & Repairs', sub: 'Track ongoing workshop tasks' },
-      'customers': { title: 'Customer Database', sub: 'Relationship management and history' },
-      'vehicles': { title: 'Vehicle Registry', sub: 'Manage fleet and customer cars' },
-      'payments': { title: 'Billing & Invoices', sub: 'Financial transactions and records' },
-      'inventory': { title: 'Parts & Inventory', sub: 'Stock levels and supply chain' },
-      'staff': { title: 'Staff Management', sub: 'Human resources and access roles' },
-      'reports': { title: 'Business Analytics', sub: 'Performance metrics and growth' },
-      'customization': { title: 'Shop Customization', sub: 'Brand identity and UI settings' },
-      'subscription': { title: 'My Subscription', sub: 'Plan details and billing' },
-      'my_profile': { title: 'Account Settings', sub: 'Personal profile and presence' }
-    };
+    window.toggleSidebar = function () {
+      document.body.classList.toggle('sidebar-collapsed');
+      const isCollapsed = document.body.classList.contains('sidebar-collapsed');
+      localStorage.setItem('sidebarCollapsed', isCollapsed);
 
-    window.navToView = function (viewId) {
-      console.log("[NAV] Requesting View: " + viewId);
-      if (window.closeUpgradeModal) window.closeUpgradeModal();
-
-      // 1. Switch Active Section
-      const sections = document.querySelectorAll('.view-section');
-      sections.forEach(s => {
-        s.classList.remove('active');
-        s.style.display = 'none';
-      });
-
-      const target = document.getElementById(viewId);
-      if (target) {
-        target.classList.add('active');
-        target.style.display = 'block';
-
-        // Standard View for all views
-        const sidebar = document.querySelector('.sidebar');
-        const mainContent = document.querySelector('.main-content');
-        if (sidebar) sidebar.style.display = 'flex';
-        if (mainContent) {
-          mainContent.style.marginLeft = '280px';
-          mainContent.style.padding = '3rem 4rem';
-        }
-
-        // Update Page Title
-        const pTitle = document.getElementById('pageTitle');
-        const pSub = document.getElementById('pageSubtitle');
-        const mainHeader = document.querySelector('header');
-
-        if (pTitle && sectionTitles[viewId]) {
-          pTitle.innerText = sectionTitles[viewId].title;
-          if (pSub) pSub.innerText = sectionTitles[viewId].sub;
-
-          // Ensure header is always visible
-          if (mainHeader) mainHeader.style.display = 'flex';
-        }
-      }
-
-      // 2. Update Sidebar State
-      const navItems = document.querySelectorAll('.nav-item');
-      navItems.forEach(n => n.classList.remove('active'));
-      const activeNav = document.querySelector(`.nav-item[data-view="${viewId}"]`);
-      if (activeNav) activeNav.classList.add('active');
-
-      // 3. Trigger context-aware data refresh
-      const refreshMap = {
-        'dashboard': () => typeof dashboardOverviewRefresh === 'function' && dashboardOverviewRefresh(),
-        'job_orders': () => typeof window.refreshJobOrders === 'function' && window.refreshJobOrders(),
-        'appointments': () => typeof window.refreshAppointmentsList === 'function' && window.refreshAppointmentsList(),
-        'staff': () => typeof window.refreshStaffList === 'function' && window.refreshStaffList(),
-        'bays': () => typeof window.refreshBaysList === 'function' && window.refreshBaysList(),
-        'inventory': () => typeof window.refreshInventoryList === 'function' && window.refreshInventoryList(),
-        'payments': () => typeof window.refreshPaymentsList === 'function' && window.refreshPaymentsList(),
-        'customers': () => typeof window.refreshAddCustomerList === 'function' && window.refreshAddCustomerList(),
-        'vehicles': () => typeof refreshVehiclesList === 'function' && refreshVehiclesList(),
-        'customer_logs': () => typeof loadAuditLogs === 'function' && loadAuditLogs(),
-        'payments_history': () => typeof loadBillingHistory === 'function' && loadBillingHistory()
-      };
-      if (refreshMap[viewId]) refreshMap[viewId]();
-    };
-
-
-
-    // renewSubscription moved to bottom for better reliability
-
-
-    // Removed launchUpgradeWizard from here to move it to the bottom for better reliability
-
-    // Moved to top for reliability
-
-    // Cleaned up old listeners
-
-    window.closeUpgradeModal = function () {
-      console.log('[SUBS] closeUpgradeModal called');
-      const m = document.getElementById('upgradeModal');
-      if (m) {
-        m.style.display = 'none';
+      // Update Icon
+      const icon = document.querySelector('#sidebarToggle i');
+      if (icon) {
+        icon.className = isCollapsed ? 'fas fa-chevron-right' : 'fas fa-chevron-left';
       }
     };
 
-    window.processUpgrade = function (planId, planName, e) {
-      const btn = e && e.currentTarget ? e.currentTarget : (event && event.currentTarget ? event.currentTarget : null);
-      const originalHtml = btn ? btn.innerHTML : 'Select Plan';
-      const isYearly = document.getElementById('toggleYearly').classList.contains('active');
-      const cycleText = isYearly ? 'Yearly' : 'Monthly';
+    window.toggleTheme = function () {
+      const html = document.documentElement;
+      const current = html.getAttribute('data-theme') || 'dark';
+      const next = current === 'dark' ? 'light' : 'dark';
+      html.setAttribute('data-theme', next);
+      localStorage.setItem('tenant_theme', next);
 
-      // Extract price from the plan card in the DOM
-      const card = btn ? btn.closest('.plan-card') : null;
-      let price = 0;
-      if (card) {
-        const priceEl = card.querySelector('.plan-price-val');
-        price = isYearly ? priceEl.getAttribute('data-yearly') : priceEl.getAttribute('data-monthly');
+      const icon = document.querySelector('#theme-toggle-btn i');
+      if (icon) icon.className = next === 'dark' ? 'fas fa-moon' : 'fas fa-sun';
+    };
+
+    // Restore Sidebar & Theme State on Load
+    document.addEventListener('DOMContentLoaded', () => {
+      const isCollapsed = localStorage.getItem('sidebarCollapsed') === 'true';
+      if (isCollapsed) {
+        document.body.classList.add('sidebar-collapsed');
+        const icon = document.querySelector('#sidebarToggle i');
+        if (icon) icon.className = 'fas fa-chevron-right';
       }
 
-      const confirmMsg = "Confirm your switch to the " + planName + " plan (" + cycleText + "). Please select your payment method below.";
+      const savedTheme = localStorage.getItem('tenant_theme') || 'dark';
+      document.documentElement.setAttribute('data-theme', savedTheme);
+      const icon = document.querySelector('#theme-toggle-btn i');
+      if (icon) icon.className = savedTheme === 'dark' ? 'fas fa-moon' : 'fas fa-sun';
+    });
 
-      const executeUpgrade = (method) => {
-        showPayMongoSimulation(price, method, planName + " (" + cycleText + ")", () => {
-          if (btn) {
-            btn.disabled = true;
-            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
-          }
+    // Billing logic moved to top engine
 
-          const fd = new FormData();
-          fd.append('plan_id', planId);
-          fd.append('billing_cycle', isYearly ? 'yearly' : 'monthly');
-          fd.append('method', method);
 
-          fetch('tenant-dashboard.php?action=upgrade_plan', { method: 'POST', body: fd })
-            .then(r => r.json())
-            .then(data => {
-              if (data.status === 'success') {
-                alert("\u2705 " + data.message + "\nReference: " + data.ref);
-                window.closeUpgradeModal();
-                setTimeout(() => location.reload(), 1000);
-              } else {
-                alert("\u274C Error: " + data.message);
-                if (btn) { btn.disabled = false; btn.innerHTML = originalHtml; }
-              }
-            })
-            .catch(() => {
-              alert("\u274C Connection error. Please try again.");
-              if (btn) { btn.disabled = false; btn.innerHTML = originalHtml; }
-            });
-        });
-      };
+    // loadAuditLogs moved to top engine
 
-      // DYNAMIC MODAL (For Upgrade Payment Selection)
-      const modalId = 'upgradePayModal_' + Date.now();
-      const modalHTML = `
-        <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.9); backdrop-filter:blur(15px); z-index:2147483648; display:flex; align-items:center; justify-content:center; padding:20px;">
-          <div style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:32px; padding:3rem; width:100%; max-width:480px; text-align:center; box-shadow:0 30px 60px rgba(0,0,0,0.8);">
-            <div style="width:80px; height:80px; background:linear-gradient(135deg, #f97316 0%, #ef4444 100%); border-radius:50%; display:flex; align-items:center; justify-content:center; margin:0 auto 2rem; color:white; font-size:2.5rem; box-shadow:0 10px 25px rgba(249, 115, 22, 0.4);">
-              <i class="fas fa-rocket"></i>
-            </div>
-            <h2 style="color:white; margin-bottom:0.8rem; font-size:1.8rem; font-weight:800;">Confirm Upgrade</h2>
-            <p style="color:#94a3b8; margin-bottom:2rem; line-height:1.6;">${confirmMsg}</p>
-            
-            <div style="text-align:left; margin-bottom:2.5rem;">
-              <label style="color:white; font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; display:block; opacity:0.7;">Payment Method</label>
-              <select id="upgMethod_${modalId}">
-                <option value="GCASH" style="background:#111827;">GCash</option>
-                <option value="MAYA" style="background:#111827;">Maya</option>
-                <option value="BANK_TRANSFER" style="background:#111827;">Bank Transfer (BDO/BPI)</option>
-                <option value="CARD" style="background:#111827;">Credit/Debit Card</option>
-              </select>
-            </div>
-
-            <div style="display:flex; gap:15px; justify-content:center;">
-              <button id="upgConfirmBtn_${modalId}" style="flex:2; padding:16px; background:#f97316; color:white; border:none; border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem; transition:0.3s; box-shadow:0 10px 20px rgba(249, 115, 22, 0.3);">Go to Payment</button>
-              <button id="upgCancelBtn_${modalId}" style="flex:1; padding:16px; background:rgba(255,255,255,0.05); color:white; border:1px solid rgba(255,255,255,0.1); border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem;">Cancel</button>
-            </div>
-          </div>
-        </div>`;
-      document.body.insertAdjacentHTML('beforeend', modalHTML);
-
-      document.getElementById('upgConfirmBtn_' + modalId).onclick = function () {
-        const selectedMethod = document.getElementById('upgMethod_' + modalId).value;
-        document.getElementById(modalId).remove();
-        executeUpgrade(selectedMethod);
-      };
-      document.getElementById('upgCancelBtn_' + modalId).onclick = function () {
-        document.getElementById(modalId).remove();
-      };
-    };
-    window.loadBillingHistory = function () {
-      const body = document.getElementById('billingHistoryTableBody');
-      if (!body) return;
-      body.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:2rem;"><div class="spinner"></div></td></tr>';
-
-      fetch('tenant-dashboard.php?action=fetch_billing_history')
-        .then(res => res.json())
-        .then(data => {
-          if (!data || data.length === 0) {
-            body.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:3rem; opacity:0.5;">No billing history found.</td></tr>';
-            return;
-          }
-          body.innerHTML = data.map(p => `
-            <tr>
-              <td>${p.payment_date}</td>
-              <td><code style="background:rgba(255,255,255,0.05); padding:2px 6px; border-radius:4px;">${p.transaction_reference}</code></td>
-              <td>₱${parseFloat(p.amount).toLocaleString()}</td>
-              <td><span class="badge" style="background:rgba(16,185,129,0.1); color:var(--success); border:1px solid rgba(16,185,129,0.2);">${p.payment_status}</span></td>
-            </tr>
-          `).join('');
-        });
-    };
-
-    window.loadAuditLogs = function () {
-      console.log("[AUDIT] Initiative started...");
-      const body = document.getElementById('auditLogsTableBody');
-      if (!body) {
-        console.error("[AUDIT] Target element 'auditLogsTableBody' not found.");
-        return;
-      }
-      body.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:3rem;"><div class="spinner" style="margin:0 auto 1rem;"></div><p>Synchronizing audit records...</p></td></tr>';
-
-      fetch('tenant-dashboard.php?action=fetch_audit_logs&_t=' + Date.now())
-        .then(res => res.json())
-        .then(data => {
-          console.log("[AUDIT] Data received:", data.length, "records");
-          if (!data || data.length === 0) {
-            body.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:5rem; opacity:0.5;"><i class="fas fa-fingerprint" style="font-size:3rem; margin-bottom:1.5rem; color:var(--accent);"></i><br>No system activities logged yet.</td></tr>';
-            return;
-          }
-          body.innerHTML = data.map(l => {
-            let actor = l.actor_name || 'System Agent';
-            let badgeClass = 'badge-active';
-            let icon = 'fa-bolt';
-
-            if (l.activity_type === 'AUTH') { badgeClass = 'badge-pending'; icon = 'fa-key'; }
-            if (l.activity_type === 'CRUD') { badgeClass = 'badge-active'; icon = 'fa-database'; }
-            if (l.activity_type === 'SECURITY') { badgeClass = 'badge-danger'; icon = 'fa-shield-alt'; }
-            if (l.activity_type === 'CUSTOMER_REG') { badgeClass = 'badge-active'; icon = 'fa-user-plus'; }
-            if (l.activity_type === 'INFO') { badgeClass = 'badge-active'; icon = 'fa-info-circle'; }
-
-            return `
-              <tr class="hover-bright" style="border-bottom:1px solid rgba(255,255,255,0.03);">
-                <td style="font-size:0.85rem; color:var(--text-dim); white-space:nowrap;">
-                  <i class="fas fa-clock" style="margin-right:5px; opacity:0.5;"></i> ${new Date(l.created_at).toLocaleString()}
-                </td>
-                <td>
-                  <div style="display:flex; align-items:center; gap:10px;">
-                    <div style="width:30px; height:30px; border-radius:50%; background:rgba(255,255,255,0.05); display:flex; align-items:center; justify-content:center; font-size:0.7rem; color:var(--accent);">
-                      <i class="fas fa-user-shield"></i>
-                    </div>
-                    <span style="font-weight:700;">${actor}</span>
-                  </div>
-                </td>
-                <td>
-                  <span class="badge ${badgeClass}" style="font-size:0.7rem;">
-                    <i class="fas ${icon}" style="margin-right:4px;"></i> ${l.activity_type}
-                  </span>
-                </td>
-                <td style="font-size:0.9rem; opacity:0.8; max-width:400px; line-height:1.4;">
-                  ${l.description}
-                </td>
-              </tr>`;
-          }).join('');
-        }).catch(err => {
-          console.error("[AUDIT] Fetch error:", err);
-          body.innerHTML = '<tr><td colspan="4" style="text-align:center; color:var(--danger); padding:3rem;">Communication failure with log server.</td></tr>';
-        });
-    };
-
-    window.openModal = function (id) { const el = document.getElementById(id); if (el) el.style.display = 'flex'; };
-
-    window.processAppointment = function (id, status) {
-      // Existing process logic...
-      const confirmMsg = status === 'CONFIRMED' ? "Accept this appointment and create a Job Order?" : "Are you sure you want to REJECT this appointment?";
-      if (!confirm(confirmMsg)) return;
-
-      const formData = new FormData();
-      formData.append('appointment_id', id);
-      formData.append('status', status);
-
-      fetch('tenant-dashboard.php?action=update_appointment_status', {
-        method: 'POST',
-        body: formData
-      }).then(r => r.json()).then(data => {
-        if (data.status === 'success') {
-          showToast("Appointment processed successfully!");
-          window.refreshAppointmentsList();
-          if (status === 'CONFIRMED') window.refreshJobOrders();
-        } else {
-          alert("Error: " + (data.message || "Failed to update status"));
-        }
-      }).catch(e => alert("Network Error: Could not process request."));
-    };
 
     window.viewPaymentDetails = function (appointmentId) {
       const body = document.getElementById('paymentProofContent');
@@ -4011,76 +6477,6 @@ try {
         });
     };
 
-    window.openMechanicProfile = function (mechanicId) {
-      console.log("[SYSTEM] Priority call for Mechanic ID:", mechanicId);
-      const body = document.getElementById('mechProfileContent');
-      if (!body) return;
-      body.innerHTML = '<div style="text-align:center; padding:3rem;"><div class="spinner" style="margin:0 auto 1rem;"></div><p>Syncing mechanic profile...</p></div>';
-      window.openModal('mechanicProfileModal');
-
-      const url = `tenant-dashboard.php?action=fetch_mechanic_profile&mechanic_id=${mechanicId}&_v=${new Date().getTime()}`;
-      fetch(url).then(r => r.text()).then(text => {
-        try {
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          const data = JSON.parse(jsonMatch ? jsonMatch[0] : text);
-          if (data.status === 'success') {
-            const m = data.mechanic;
-            let html = `
-            <div style="display:flex; align-items:center; gap:20px; margin-bottom:2rem; padding-bottom:1rem; border-bottom:1px solid rgba(255,255,255,0.1);">
-              <div style="width:80px; height:80px; border-radius:50%; background:rgba(255,255,255,0.05); display:flex; align-items:center; justify-content:center; border:2px solid var(--accent); font-size:2rem; color:var(--accent);">
-                <i class="fas fa-tools"></i>
-              </div>
-              <div>
-                <h3 style="margin:0; font-size:1.4rem; letter-spacing:-0.5px;">${m.full_name}</h3>
-                <div style="color:var(--text-dim); margin-top:2px;">${m.specialization || 'General Mechanic'}</div>
-                <div style="margin-top:8px;">
-                  <span class="badge ${m.status === 'AVAILABLE' ? 'badge-active' : 'badge-warning'}">
-                    <i class="fas fa-circle" style="font-size:0.5rem; margin-right:4px;"></i> ${m.status || 'UNKNOWN'}
-                  </span>
-                </div>
-              </div>
-            </div>
-            <h4 style="margin-bottom:1rem; display:flex; align-items:center; gap:8px;"><i class="fas fa-history" style="color:var(--accent)"></i> Recent Work History</h4>
-            <div style="max-height:280px; overflow-y:auto; border-radius:15px; border:1px solid rgba(255,255,255,0.05); background:rgba(0,0,0,0.2);">
-              <table class="data-table" style="width:100%; border:none;">
-                <thead style="position:sticky; top:0; background:rgba(15,23,42,0.95); backdrop-filter:blur(10px); z-index:10;">
-                  <tr>
-                    <th style="font-size:0.75rem;">Timeline</th>
-                    <th style="font-size:0.75rem;">Vehicle</th>
-                    <th style="font-size:0.75rem;">Repair</th>
-                    <th style="font-size:0.75rem;">Status</th>
-                  </tr>
-                </thead>
-                <tbody>`;
-            if (data.history && data.history.length > 0) {
-              data.history.forEach(h => {
-                const bdgStyle = h.status === 'COMPLETED' ? 'badge-active' : (h.status === 'IN_PROGRESS' ? 'badge-warning' : 'badge-pending');
-                html += `
-                <tr style="border-bottom:1px solid rgba(255,255,255,0.03);">
-                  <td style="font-size:0.8rem; color:var(--text-dim);">${new Date(h.created_at).toLocaleDateString()}</td>
-                  <td style="font-size:0.85rem; font-weight:700;">${h.plate_no}<br><span style="font-weight:400; font-size:0.75rem; color:var(--text-dim);">${h.make || ''}</span></td>
-                  <td style="font-size:0.8rem;">${h.service_name || 'N/A'}</td>
-                  <td><span class="badge ${bdgStyle}" style="font-size:0.65rem;">${h.status}</span></td>
-                </tr>`;
-              });
-            } else {
-              html += `<tr><td colspan="4" style="text-align:center; padding:3rem; color:var(--text-dim);">No recent assignments documented.</td></tr>`;
-            }
-            html += `</tbody></table></div>`;
-            body.innerHTML = html;
-          } else {
-            body.innerHTML = `<div style="color:var(--danger); padding:2rem; text-align:center;">${data.message || "Account fetch failed"}</div>`;
-          }
-        } catch (e) {
-          console.error("[PROFILE] Parsing error:", e);
-          body.innerHTML = '<div style="color:var(--danger); padding:2rem; text-align:center;">Data parsing error.</div>';
-        }
-      }).catch(err => {
-        console.error("[PROFILE] Fetch error:", err);
-        body.innerHTML = '<div style="color:var(--danger); text-align:center; padding:2rem;">Connection error.</div>';
-      });
-    };
-
     window.startEditCustomer = function (id) {
       console.log("[SYSTEM] Fetching data for editing Customer ID:", id);
       const idF = document.getElementById('edit_customer_id');
@@ -4104,15 +6500,6 @@ try {
           alert("Sync Error.");
         });
     };
-    window.closeModal = function (id) { const el = document.getElementById(id); if (el) el.style.display = 'none'; };
-
-    window.showToast = function (msg, type = 'success') {
-      const container = document.getElementById('toastContainer'); if (!container) return;
-      const toast = document.createElement('div'); toast.className = 'toast-box';
-      toast.style.borderLeftColor = type === 'error' ? 'var(--danger)' : 'var(--accent)';
-      toast.innerHTML = `<i class="fas fa-${type === 'error' ? 'exclamation-circle' : 'check-circle'}" style="color:${type === 'error' ? 'var(--danger)' : 'var(--accent)'}"></i> ${msg}`;
-      container.appendChild(toast); setTimeout(() => toast.remove(), 4000);
-    };
 
     // --- MASTER DATA SYNC ENGINE ---
     window.refreshServicesList = function () {
@@ -4120,116 +6507,48 @@ try {
       fetch('tenant-dashboard.php?action=fetch_services&_t=' + Date.now())
         .then(r => r.json()).then(data => {
           if (!Array.isArray(data)) return;
-          body.innerHTML = data.map(s => `<tr><td><strong>${s.service_name}</strong></td><td><small>${s.description || 'No desc'}</small></td><td>₱${parseFloat(s.price || 0).toLocaleString()}</td><td><span class="badge badge-active">ACTIVE</span></td><td><button class="btn-outline" onclick="window.editService('${s.service_id}','${(s.service_name || '').replace(/'/g, "\\'")}')">Edit</button></td></tr>`).join('');
+          body.innerHTML = data.map(s => {
+            const safeName = (s.service_name || '').replace(/'/g, "\\'");
+            const safeDesc = (s.description || '').replace(/'/g, "\\'");
+            return `<tr>
+              <td><strong>${s.service_name}</strong></td>
+              <td><small>${s.description || 'No description'}</small></td>
+              <td>₱${parseFloat(s.price || 0).toLocaleString()}</td>
+              <td><span class="badge badge-active">ACTIVE</span></td>
+              <td>
+                <button class="btn-outline" onclick="window.editService(${s.service_id}, '${safeName}', '${safeDesc}', ${s.price}, ${s.master_id || 'null'}, ${s.min_price || 'null'}, ${s.max_price || 'null'})">Edit</button>
+                <button class="btn-outline" style="color:var(--danger); border-color:rgba(239,68,68,0.3); margin-left:5px;" onclick="window.deleteService(${s.service_id})">Delete</button>
+              </td>
+            </tr>`;
+          }).join('');
         }).catch(e => console.error("Services load failed"));
     };
 
-    // Consolidated customer refresh logic moved to main helper section
-
-    window.refreshVehiclesList = function () {
-      const body = document.getElementById('vehiclesBody'); if (!body) return;
-      fetch('tenant-dashboard.php?action=fetch_vehicles&_t=' + Date.now())
-        .then(r => r.json()).then(data => {
-          if (!Array.isArray(data) || data.length === 0) { body.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:2rem;">No vehicles registered.</td></tr>'; return; }
-
-          const groups = {};
-          data.forEach(v => {
-            const owner = v.customer_name || 'Walk-in / Generic';
-            if (!groups[owner]) groups[owner] = [];
-            groups[owner].push(v);
-          });
-
-          let html = '';
-          Object.keys(groups).forEach((owner, idx) => {
-            const ownerId = 'grp-' + idx;
-            const vehicles = groups[owner];
-            html += `<tr class="owner-group-header" onclick="window.toggleVehicleGroup('${ownerId}')" style="cursor:pointer; background:rgba(255,255,255,0.01); border-bottom:1px solid rgba(255,255,255,0.03); transition:0.3s;">
-                  <td colspan="4" style="padding:1.2rem 1.5rem;">
-                    <div style="display:flex; align-items:center; justify-content:space-between;">
-                      <div style="display:flex; align-items:center; gap:15px;">
-                        <div style="width:36px; height:36px; border-radius:10px; background:rgba(255,255,255,0.05); display:flex; align-items:center; justify-content:center; color:var(--accent);">
-                          <i class="fas fa-user-circle" style="font-size:1.2rem;"></i>
-                        </div>
-                        <div>
-                          <strong style="font-size:1.1rem; color:#fff; display:block; letter-spacing:-0.2px;">${owner}</strong>
-                          <span style="font-size:0.75rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px; font-weight:600;">Account Holder</span>
-                        </div>
-                      </div>
-                      <div style="display:flex; align-items:center; gap:15px;">
-                        <span class="badge" style="background:rgba(255,255,255,0.05); color:var(--accent); border:1px solid rgba(255,255,255,0.1); padding:5px 12px; font-size:0.75rem; font-weight:800; border-radius:30px;">
-                          ${vehicles.length} ${vehicles.length > 1 ? 'VEHICLES' : 'VEHICLE'}
-                        </span>
-                        <i class="fas fa-chevron-right" id="icon-${ownerId}" style="transition:0.4s cubic-bezier(0.4, 0, 0.2, 1); color:rgba(255,255,255,0.2); font-size:0.9rem;"></i>
-                      </div>
-                    </div>
-                  </td>
-                 </tr>`;
-            vehicles.forEach(v => {
-              html += `<tr class="vehicle-child-${ownerId}" style="display:none; background:rgba(0,0,0,0.15); border-bottom:1px solid rgba(255,255,255,0.02);">
-                    <td style="padding-left:4.5rem; padding-top:1.2rem; padding-bottom:1.2rem;">
-                      <div style="display:flex; align-items:center; gap:12px;">
-                        <i class="fas fa-car-side" style="color:var(--accent); opacity:0.6; font-size:0.9rem;"></i>
-                        <code style="color:var(--accent); font-weight:900; font-size:1rem; letter-spacing:1px; background:rgba(16,185,129,0.05); padding:4px 10px; border-radius:8px; border:1px solid rgba(16,185,129,0.1);">${v.plate_no}</code>
-                      </div>
-                    </td>
-                    <td><strong style="color:rgba(255,255,255,0.9); font-size:0.95rem;">${v.make || ''} ${v.model || ''}</strong></td>
-                    <td><span style="font-weight:700; color:var(--text-dim);">${v.year_model || v.year || '---'}</span></td>
-                    <td style="text-align:right; padding-right:1.5rem;">
-                      <button class="btn-outline" style="padding:8px 20px; font-size:0.8rem; border-radius:12px; border:1px solid rgba(255,255,255,0.1); font-weight:800; text-transform:uppercase; letter-spacing:0.5px;" onclick="window.openVehicleProfile(${v.vehicle_id})">
-                        <i class="fas fa-search" style="margin-right:6px; opacity:0.6;"></i> Profile
-                      </button>
-                    </td>
-                   </tr>`;
-            });
-          });
-          body.innerHTML = html;
-        }).catch(e => { body.innerHTML = '<tr><td colspan="5">Sync Error</td></tr>'; });
-    };
-
-    window.toggleVehicleGroup = function (id) {
-      const rows = document.querySelectorAll('.vehicle-child-' + id);
-      const icon = document.getElementById('icon-' + id);
-      rows.forEach(r => {
-        if (r.style.display === 'none') {
-          r.style.display = 'table-row';
-          if (icon) icon.style.transform = 'rotate(90deg)';
-        } else {
-          r.style.display = 'none';
-          if (icon) icon.style.transform = 'rotate(0deg)';
+    window.prepareAddServiceModal = function () {
+      const form = document.getElementById('addServiceForm');
+      if (form) {
+        form.reset();
+        const nameInp = form.querySelector('input[name="service_name"]');
+        if (nameInp) {
+          nameInp.readOnly = false;
+          nameInp.style.opacity = "1";
         }
-      });
-    };
+        const masterSelect = form.querySelector('select[name="master_id"]');
+        if (masterSelect) {
+          masterSelect.disabled = false;
+          masterSelect.style.opacity = "1";
+        }
+        const hint = form.querySelector('.price-hint');
+        if (hint) hint.remove();
 
-    window.refreshPaymentsList = function () {
-      const body = document.getElementById('completedPaymentsBody'); if (!body) return;
-      fetch('tenant-dashboard.php?action=fetch_payments&_t=' + Date.now())
-        .then(r => r.json()).then(data => {
-          if (!Array.isArray(data) || data.length === 0) { body.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:2rem;">No payments yet.</td></tr>'; return; }
-          body.innerHTML = data.map(p => {
-            const amt = parseFloat(p.amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 });
-            const method = (p.payment_method || 'CASH').toUpperCase();
-            const ref = p.reference_no && p.reference_no !== 'Manual' ? p.reference_no : '---';
-            return `<tr>
-                  <td>#PY-${p.payment_id}</td>
-                  <td><strong>${p.customer_name || 'Generic'}</strong></td>
-                  <td>
-                    <span style="font-weight:700; color:var(--text-main);">${method}</span><br>
-                    <small style="color:var(--text-dim);">Ref: ${ref}</small>
-                  </td>
-                  <td style="color:var(--accent); font-weight:700;">₱${amt}</td>
-                  <td style="font-size:0.85rem;">${p.payment_date || '---'}</td>
-                  <td><span class="badge badge-active">PAID</span></td>
-                </tr>`;
-          }).join('');
-        }).catch(e => { body.innerHTML = '<tr><td colspan="6" style="text-align:center;">Sync Error (Payments)</td></tr>'; });
-    };
-
-    window.editService = function (id, name, desc, price) {
-      document.getElementById('edit_service_id').value = id;
-      document.getElementById('edit_service_name').value = name;
-      document.getElementById('edit_service_desc').value = desc === 'null' ? '' : desc;
-      document.getElementById('edit_service_price').value = price;
-      openModal('editServiceModal');
+        const submitBtn = form.querySelector('button[onclick*="Service"]');
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.style.opacity = "1";
+          submitBtn.style.cursor = "pointer";
+        }
+      }
+      openModal('serviceModal');
     };
 
     window.submitAddService = function () {
@@ -4240,6 +6559,17 @@ try {
       const originalText = btn.innerText;
       btn.innerText = 'Saving...';
       btn.disabled = true;
+
+      const priceInput = form.querySelector('input[name="price"]');
+      if (priceInput.min && priceInput.max) {
+        const val = parseFloat(priceInput.value);
+        const min = parseFloat(priceInput.min);
+        const max = parseFloat(priceInput.max);
+        if (val < min || val > max) {
+          showToast(`Price must be between ₱${min.toLocaleString()} and ₱${max.toLocaleString()}`, 'error');
+          return;
+        }
+      }
 
       const formData = new FormData(form);
       fetch('tenant-dashboard.php?action=add_service', { method: 'POST', body: formData })
@@ -4263,18 +6593,39 @@ try {
     };
 
     window.saveEditService = function () {
-      const id = document.getElementById('edit_service_id').value;
-      const name = document.getElementById('edit_service_name').value;
-      const desc = document.getElementById('edit_service_desc').value;
-      const price = document.getElementById('edit_service_price').value;
+      const idEl = document.getElementById('edit_service_id');
+      const nameEl = document.getElementById('edit_service_name');
+      const descEl = document.getElementById('edit_service_desc');
+      const priceEl = document.getElementById('edit_service_price');
 
-      if (!name) return showToast('Service name is required', 'error');
+      if (!idEl || !nameEl || !priceEl) {
+        showToast('System Error: Missing form fields in Edit Modal', 'error');
+        return;
+      }
+
+      const id = idEl.value;
+      const name = nameEl.value;
+      const desc = descEl ? descEl.value : '';
+      const price = priceEl.value;
+
+      const priceInput = document.querySelector('#editServiceForm input[name="price"]');
+      if (priceInput && priceInput.min && priceInput.max) {
+        const val = parseFloat(priceInput.value);
+        const min = parseFloat(priceInput.min);
+        const max = parseFloat(priceInput.max);
+        if (val < min || val > max) {
+          showToast(`Price must be between ₱${min.toLocaleString()} and ₱${max.toLocaleString()}`, 'error');
+          return;
+        }
+      }
 
       const fd = new FormData();
       fd.append('service_id', id);
       fd.append('service_name', name);
       fd.append('description', desc);
       fd.append('price', price);
+      const masterInput = document.getElementById('edit_service_master_id');
+      if (masterInput && masterInput.value) fd.append('master_id', masterInput.value);
 
       const btn = document.querySelector('#editServiceForm button[onclick*="saveEditService"]');
       const originalText = btn ? btn.innerText : 'Update Service';
@@ -4326,50 +6677,63 @@ try {
           body.innerHTML = '<tr><td colspan="4" style="text-align:center; color:var(--text-dim); padding: 2rem;">No mechanics registered yet.</td></tr>';
           return;
         }
-        body.innerHTML = data.map(m => `
+        body.innerHTML = data.map(m => {
+          const isBusy = (parseInt(m.active_jobs_count) > 0);
+          const statusLabel = isBusy ? 'BUSY' : 'AVAILABLE';
+          const badgeClass = isBusy ? 'badge-warning' : 'badge-active';
+
+          const formatT = (t) => {
+            if (!t) return '08:00 AM';
+            let [h, min] = t.split(':');
+            h = parseInt(h);
+            const ampm = h >= 12 ? 'PM' : 'AM';
+            h = h % 12 || 12;
+            return `${h}:${min} ${ampm}`;
+          };
+          const shiftDaysStr = m.shift_days ? m.shift_days.split(',').join(' · ') : 'Mon · Tue · Wed · Thu · Fri · Sat';
+          const shiftStr = `<div style="line-height:1.6;"><span style="font-size:0.8rem; color:white; font-weight:600;"><i class="far fa-clock" style="color:var(--accent); margin-right:4px;"></i>${formatT(m.shift_start)} – ${formatT(m.shift_end)}</span><br><span style="font-size:0.7rem; color:var(--text-dim);">${shiftDaysStr}</span></div>`;
+
+          return `
           <tr>
             <td><strong>${m.display_name}</strong></td>
             <td>${m.specialization}</td>
-            <td><span class="badge ${m.status === 'AVAILABLE' ? 'badge-active' : 'badge-warning'}">${m.status}</span></td>
-            <td><button type="button" class="btn-outline" style="padding:6px 12px; font-size:0.75rem; border-color:var(--accent); color:var(--accent); cursor:pointer; position:relative; z-index:10; pointer-events:auto !important;" onclick="window.openMechanicProfile(${m.mechanic_id})">View Profile</button></td>
-          </tr>`).join('');
+            <td>${shiftStr}</td>
+            <td><span class="badge ${badgeClass}">${statusLabel}</span></td>
+            <td>
+              <div style="display:flex; gap:6px;">
+                <button type="button" class="btn-outline" style="padding:6px 12px; font-size:0.75rem; border-color:var(--accent); color:var(--text-main); cursor:pointer; position:relative; z-index:10; pointer-events:auto !important;" onclick="window.openMechanicProfile(${m.mechanic_id})">View Profile</button>
+                <?php if (strtoupper($role) === 'OWNER' || strtoupper($role) === 'MANAGER'): ?>
+                <button type="button" class="btn-outline" style="padding:6px 12px; font-size:0.75rem; border-color:var(--accent); color:var(--text-main); cursor:pointer; position:relative; z-index:10; pointer-events:auto !important;" onclick="window.openEditShiftModal(${m.mechanic_id}, '${m.shift_start}', '${m.shift_end}', '${m.display_name.replace(/'/g, "\\'")}', '${m.shift_days || 'Mon,Tue,Wed,Thu,Fri,Sat'}')">Edit Shift</button>
+                <?php endif; ?>
+              </div>
+            </td>
+          </tr>`;
+        }).join('');
       });
     };
 
 
-    window.refreshAppointmentsList = function () {
-      const body = document.getElementById('appointmentsTableBody'); if (!body) return;
-      fetch('tenant-dashboard.php?action=fetch_all_appointments').then(res => res.json()).then(data => {
-        if (!Array.isArray(data) || data.length === 0) {
-          body.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--text-dim); padding:3rem;">No upcoming appointments found in the system.</td></tr>';
-          return;
-        }
-        body.innerHTML = data.map(a => {
-          const isPending = a.status === 'PENDING';
-          const actionHtml = isPending ? `
-            <div style="display:flex; flex-direction:column; gap:6px;">
-              <div style="display:flex; gap:5px;">
-                <button class="btn-outline" style="flex:1; padding:6px; font-size:0.7rem; border-color:#10b981; color:#10b981; background:rgba(16,185,129,0.05);" onclick="window.processAppointment(${a.appointment_id}, 'CONFIRMED')">Accept</button>
-                <button class="btn-outline" style="flex:1; padding:6px; font-size:0.7rem; border-color:#ef4444; color:#ef4444; background:rgba(239,68,68,0.05);" onclick="window.processAppointment(${a.appointment_id}, 'CANCELLED')">Reject</button>
-              </div>
-              <button class="btn-outline" style="width:100%; padding:6px; font-size:0.7rem; border-color:var(--accent); color:var(--accent); background:rgba(255,255,255,0.02);" onclick="window.viewPaymentDetails(${a.appointment_id})">
-                <i class="fas fa-receipt"></i> View Payment
-              </button>
-            </div>
-          ` : `<div style="text-align:center;"><em style="font-size:0.75rem; color:var(--text-dim); opacity:0.6;"><i class="fas fa-check-circle"></i> ${a.status === 'CONFIRMED' ? 'Automated Tracking' : 'Archived Log'}</em></div>`;
+    // refreshAppointmentsList — canonical version defined earlier at line ~4417 (with full error handling)
 
-          return `
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.03);">
-            <td><div style="font-weight:700;">${new Date(a.appointment_date).toLocaleDateString()}</div><small style="color:var(--text-dim);">${a.appointment_time || '---'}</small></td>
-            <td><strong>${a.customer_name}</strong></td>
-            <td><code style="color:var(--accent);">${a.plate_no || 'N/A'}</code></td>
-            <td>${a.service_name}</td>
-            <td style="font-weight:700;">₱${parseFloat(a.service_price).toLocaleString()}</td>
-            <td><span class="badge ${a.status === 'CONFIRMED' ? 'badge-active' : (a.status === 'CANCELLED' ? 'badge-danger' : 'badge-pending')}">${a.status}</span></td>
-            <td>${actionHtml}</td>
-          </tr>`;
-        }).join('');
-      });
+    window.startRepairFromAppointment = function (id) {
+      if (!confirm("Are you sure you want to start this repair now? This will create a Job Order and move it to Active Repairs.")) return;
+
+      const formData = new FormData();
+      formData.append('appointment_id', id);
+
+      fetch('tenant-dashboard.php?action=start_repair', {
+        method: 'POST',
+        body: formData
+      }).then(r => r.json()).then(data => {
+        if (data.status === 'success') {
+          showToast(data.message);
+          if (typeof refreshAppointmentsList === 'function') refreshAppointmentsList();
+          if (typeof window.refreshJobOrders === 'function') window.refreshJobOrders();
+          if (typeof window.dashboardOverviewRefresh === 'function') window.dashboardOverviewRefresh();
+        } else {
+          alert('Error: ' + data.message);
+        }
+      }).catch(e => alert('Network error. Check connection.'));
     };
 
     window.dashboardOverviewRefresh = function () {
@@ -4386,20 +6750,40 @@ try {
       fetch('tenant-dashboard.php?action=fetch_bays')
         .then(r => r.json()).then(data => {
           grid.innerHTML = data.map(b => {
-            const isAvail = b.status === 'AVAILABLE';
-            const action = isAvail ? `openBayProfile(${b.bay_id})` : `openJobStatusModal(${b.active_job_id}, '${b.job_status}', ${b.active_mechanic_id}, ${b.bay_id})`;
+            // Safety: A bay is available if DB says so OR if it has no truly active job (PENDING/IN_PROGRESS)
+            const isAvail = (b.status === 'AVAILABLE' || !b.active_job_id);
+            const displayStatus = isAvail ? 'AVAILABLE' : b.status.toUpperCase();
+            
+            const action = isAvail ? `openBayProfile(${b.bay_id})` : `window.handleJobClick(${b.active_job_id}, '${b.job_status}', ${b.active_mechanic_id}, ${b.bay_id}, true, false)`;
+
+            // NEW: Dynamic Info for Occupied Bays
+            const occupiedInfo = !isAvail ? `
+                <div style="margin-top:1rem; padding:12px; background:rgba(255,255,255,0.03); border-radius:15px; border:1px solid rgba(255,255,255,0.05);">
+                  <div style="font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase; margin-bottom:4px;">In Service</div>
+                  <div style="font-weight:800; color:var(--accent); font-size:1.1rem;">${b.plate_no || 'N/A'}</div>
+                  <div style="font-size:0.8rem; color:var(--text-dim); margin-top:5px;"><i class="fas fa-wrench" style="font-size:0.7rem;"></i> ${b.mechanic_name || 'Unassigned'}</div>
+                </div>
+              ` : '';
+
             return `
-            <div class="bay-card" style="padding:2.2rem 2rem; border-radius:28px; border:1px solid rgba(255,255,255,0.08); background:rgba(255,255,255,0.02); position:relative; overflow:hidden;">
-              <div style="position:absolute; top:-30px; right:-30px; width:120px; height:120px; background:${isAvail ? 'var(--accent)' : '#ef4444'}; opacity:0.05; filter:blur(40px);"></div>
-              <span class="badge ${isAvail ? 'badge-active' : 'badge-danger'}" style="font-weight:800;">${(b.status && b.status.trim() !== '') ? b.status.toUpperCase() : 'OCCUPIED'}</span>
-              <h2 style="margin:1.2rem 0 0.5rem; font-size:1.8rem; font-weight:900; letter-spacing:-1px;">${b.bay_name}</h2>
-              <button class="btn-action" style="width:100%; margin-top:1.5rem; background:${isAvail ? 'var(--accent)' : 'rgba(239,68,68,0.1)'}; color:${isAvail ? 'white' : '#ef4444'}; border:1px solid ${isAvail ? 'transparent' : 'rgba(239,68,68,0.3)'}; padding:1rem; border-radius:15px; font-weight:800; cursor:pointer; transition:all 0.4s; box-shadow:${isAvail ? '0 8px 20px rgba(var(--accent-rgb), 0.2)' : 'none'}; display:flex; align-items:center; justify-content:center; gap:10px;" 
-                  onmouseover="this.style.transform='translateY(-3px)'; ${isAvail ? '' : "this.style.background='#ef4444'; this.style.color='white';"}" 
-                  onmouseout="this.style.transform='translateY(0)'; ${isAvail ? '' : "this.style.background='rgba(239,68,68,0.1)'; this.style.color='#ef4444';"}" 
-                  onclick="${action}">
-                ${isAvail ? '<i class="fas fa-eye"></i> View Bay Profile' : '<i class="fas fa-tools"></i> Repair Details'}
-              </button>
-            </div>`;
+              <div class="bay-card ${!isAvail ? 'clickable' : ''}" 
+                   onclick="${!isAvail ? action : ''}"
+                   style="padding:2rem; border-radius:28px; border:1px solid rgba(255,255,255,0.08); background:rgba(255,255,255,0.02); position:relative; overflow:hidden; display:flex; flex-direction:column; justify-content:space-between; min-height:280px; cursor:${!isAvail ? 'pointer' : 'default'}; transition:all 0.3s;">
+                <div style="position:absolute; top:-30px; right:-30px; width:120px; height:120px; background:${isAvail ? 'var(--accent)' : '#ef4444'}; opacity:0.05; filter:blur(40px);"></div>
+                <div>
+                  <span class="badge ${isAvail ? 'badge-active' : 'badge-danger'}" style="font-weight:800;">${displayStatus}</span>
+                  <h2 style="margin:1rem 0 0.5rem; font-size:1.6rem; font-weight:900; letter-spacing:-1px;">${b.bay_name}</h2>
+                  ${occupiedInfo}
+                </div>
+                ${isAvail ? `
+                <button class="btn-action" style="width:100%; margin-top:1.5rem; background:var(--accent); color:white; border:none; padding:0.9rem; border-radius:15px; font-weight:800; cursor:pointer; transition:all 0.4s; display:flex; align-items:center; justify-content:center; gap:10px;" 
+                    onmouseover="this.style.transform='translateY(-3px)';" 
+                    onmouseout="this.style.transform='translateY(0)';" 
+                    onclick="event.stopPropagation(); ${action}">
+                  <i class="fas fa-eye"></i> View Bay
+                </button>` : ''}
+              </div>`;
+
           }).join('');
         });
     };
@@ -4407,12 +6791,14 @@ try {
     window.refreshJobOrders = function () {
       const body = document.getElementById('jobOrdersTableBody'); if (!body) return;
       console.log("[REFRESH] Active Jobs...");
+      body.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:3rem; color:var(--text-dim);"><i class="fas fa-spinner fa-spin"></i> Loading active jobs...</td></tr>';
       fetch('tenant-dashboard.php?action=fetch_job_orders&_v=' + Date.now())
         .then(r => r.text()).then(text => {
           try {
-            const jsonMatch = text.match(/\[[\s\S]*\]/) || text.match(/\{[\s\S]*\}/);
-            if (!jsonMatch) throw new Error("Invalid response format");
-            const data = JSON.parse(jsonMatch[0]);
+            const start = text.indexOf('[');
+            const end = text.lastIndexOf(']') + 1;
+            if (start === -1 || end === 0) throw new Error('No JSON found: ' + text.substring(0, 200));
+            const data = JSON.parse(text.substring(start, end));
 
             if (!Array.isArray(data) || data.length === 0) {
               body.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:3rem; color:var(--text-dim);">No active job orders in the shop.</td></tr>';
@@ -4420,16 +6806,22 @@ try {
             }
             body.innerHTML = data.map(j => `
               <tr>
-                <td><strong>JO-${(j.job_id || 0).toString().padStart(4, '0')}</strong></td>
+                <td>
+                  <strong>JO-${(j.job_id || 0).toString().padStart(4, '0')}</strong><br>
+                  <span style="font-size:0.6rem; font-weight:900; padding:2px 6px; border-radius:4px; margin-top:4px; display:inline-block; background:${j.appointment_id > 0 ? 'rgba(59,130,246,0.1)' : 'rgba(16,185,129,0.1)'}; color:${j.appointment_id > 0 ? '#3b82f6' : '#10b981'}; border:1px solid ${j.appointment_id > 0 ? 'rgba(59,130,246,0.2)' : 'rgba(16,185,129,0.2)'};">
+                    ${j.appointment_id > 0 ? 'APPOINTMENT' : 'WALK-IN'}
+                  </span>
+                </td>
                 <td>
                   <div style="font-weight:700; color:var(--text-main); font-size:1rem;">${j.plate_no || '---'}</div>
                   <div style="font-size:0.75rem; color:var(--text-dim);">${j.make || ''} ${j.model || ''}</div>
+                  <div style="font-size:0.8rem; color:var(--accent); font-weight:600; margin-top:3px;"><i class="fas fa-user"></i> ${j.customer_name || 'Walking Customer'}</div>
                   ${j.latest_remarks ? `<div style="font-size:0.75rem; background:rgba(255,255,255,0.05); padding:4px 8px; border-radius:6px; margin-top:5px; color:#94a3b8; border-left:2px solid var(--accent);"><strong>Remarks:</strong> ${j.latest_remarks}</div>` : ''}
                 </td>
                 <td>
                   <div style="font-weight:600;">${j.service_name || 'General Repair'}</div>
                   <small style="color:var(--text-dim); background:rgba(255,255,255,0.05); padding:4px 8px; border-radius:6px; display:inline-flex; align-items:center; gap:5px;">
-                    <i class="fas fa-wrench" style="color:var(--accent);"></i> ${j.mechanic_name || 'No Mechanic'} 
+                    <i class="fas fa-wrench" style="color:var(--accent);"></i> ${j.mechanic_name || 'No Mechanic'}
                     <i class="fas fa-warehouse" style="margin-left:8px; color:var(--accent);"></i> ${j.bay_name || 'No Bay'}
                   </small>
                 </td>
@@ -4438,21 +6830,95 @@ try {
                     ${j.status || 'PENDING'}
                   </span>
                 </td>
-                 <td>
-                   ${j.status !== 'COMPLETED' ? `
-                   <button class="btn-outline" style="padding:4px 10px; font-size:0.75rem; border-color:var(--accent); color:var(--accent);" onclick="window.openJobStatusModal(${j.job_id}, '${j.status}', ${j.mechanic_id || 'null'}, ${j.bay_id || 'null'}, true)">
+                <td>
+                  ${j.status !== 'COMPLETED' ? `
+                  <button class="btn-outline job-status-btn" style="padding:4px 10px; font-size:0.75rem; border-color:var(--accent); color:var(--accent); cursor:pointer !important;"
+                          onclick="window.handleJobClick(${j.job_id}, '${j.status}', ${j.mechanic_id || 0}, ${j.bay_id || 0}, true, false)"
+                          data-jid="${j.job_id}" data-status="${j.status}" data-mid="${j.mechanic_id || 0}" data-bid="${j.bay_id || 0}" data-edit="true" data-focus="false">
                     <i class="fas fa-user-cog"></i> Assign / Update
-                   </button>
-                   ` : '<span style="font-size:0.75rem; color:var(--text-dim); opacity:0.6;"><i class="fas fa-check-double"></i> Finalized</span>'}
+                  </button>
+                  ` : '<span style="font-size:0.75rem; color:var(--text-dim); opacity:0.6;"><i class="fas fa-check-double"></i> Finalized</span>'}
                 </td>
               </tr>`).join('');
           } catch (e) {
-            console.error("Jobs Fetch Scrub Failed:", text);
-            body.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--danger); padding:2rem;">Data Error: Could not display jobs.</td></tr>';
+            console.error("[refreshJobOrders] Parse Error:", e.message, "\nRaw response:", text.substring(0, 500));
+            body.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--danger); padding:2rem;"><i class="fas fa-exclamation-circle"></i> Data Error: Could not display jobs.<br><small style="opacity:0.6;">${e.message}</small></td></tr>`;
           }
         }).catch(err => {
-          body.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--danger); padding:2rem;">Network Error: Could not reach server.</td></tr>';
+          console.error("[refreshJobOrders] Network Error:", err);
+          body.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--danger); padding:2rem;"><i class="fas fa-wifi"></i> Network Error: Could not reach server.</td></tr>';
         });
+    };
+
+    window.refreshMechanicHistory = function () {
+      const body = document.getElementById('mechanicHistoryTable');
+      if (!body) return;
+      fetch('tenant-dashboard.php?action=fetch_mechanic_history')
+        .then(r => r.json())
+        .then(data => {
+          if (!data.length) {
+            body.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:2rem;">No history found.</td></tr>';
+            return;
+          }
+          body.innerHTML = data.map(log => `
+             <tr>
+               <td><small>${new Date(log.created_at).toLocaleString()}</small></td>
+               <td><strong>${log.plate_no || 'N/A'}</strong><br><small style="color:var(--text-dim)">${log.make || ''} ${log.model || ''}</small></td>
+               <td><span class="badge ${log.status_update === 'COMPLETED' ? 'badge-active' : 'badge-info'}" style="font-size:0.65rem;">${log.status_update}</span></td>
+               <td style="font-size:0.9rem;">${log.remarks || '---'}</td>
+             </tr>
+           `).join('');
+        });
+    };
+
+    window.refreshInventoryLookup = function () {
+      const body = document.getElementById('inventoryLookupTable');
+      if (!body) return;
+      fetch('tenant-dashboard.php?action=fetch_inventory_lookup')
+        .then(r => r.json())
+        .then(data => {
+          window.allInventoryLookup = data;
+          renderInventoryLookup(data);
+        });
+    };
+
+    function renderInventoryLookup(data) {
+      const body = document.getElementById('inventoryLookupTable');
+      if (!body) return;
+      if (!data.length) {
+        body.innerHTML = '<tr><td colspan="4" style="text-align:center; padding:2rem;">No parts found.</td></tr>';
+        return;
+      }
+      body.innerHTML = data.map(i => {
+        let statusText = 'IN STOCK';
+        let statusClass = 'badge-active';
+        const qty = parseInt(i.quantity);
+        const threshold = parseInt(i.stock_threshold || 5);
+
+        if (qty <= threshold) {
+          statusText = qty <= 0 ? 'OUT OF STOCK' : 'LOW STOCK';
+          statusClass = 'badge-danger';
+        }
+
+        return `
+        <tr>
+          <td><strong>${i.item_name}</strong></td>
+          <td>${i.brand || '---'}</td>
+          <td><span style="font-weight:700; color:${statusClass === 'badge-danger' ? 'var(--danger)' : 'var(--accent)'};">${i.quantity}</span> pcs</td>
+          <td><span class="badge ${statusClass}">${statusText}</span></td>
+        </tr>
+      `;
+      }).join('');
+    }
+
+    window.filterInventoryLookup = function (query) {
+      if (!window.allInventoryLookup) return;
+      const q = query.toLowerCase();
+      const filtered = window.allInventoryLookup.filter(i =>
+        i.item_name.toLowerCase().includes(q) ||
+        (i.brand && i.brand.toLowerCase().includes(q))
+      );
+      renderInventoryLookup(filtered);
     };
 
     // GHOST LAYER PURGER
@@ -4475,6 +6941,12 @@ try {
   <!-- SIDEBAR NAV (Restored to top for consistent layout) -->
   <nav class="sidebar"
     style="position:fixed !important; left:0 !important; top:0 !important; z-index:2147483647 !important; pointer-events:auto !important; display:flex !important; opacity:1 !important; visibility:visible !important;">
+
+    <!-- Sidebar Toggle (Floating Arrow) -->
+    <button id="sidebarToggle" onclick="window.toggleSidebar()" class="sidebar-trigger">
+      <i class="fas fa-chevron-left"></i>
+    </button>
+
     <div class="brand">
       <div class="brand-icon">
         <?php if (!empty($tenant_custom['logo_url'])): ?>
@@ -4500,14 +6972,14 @@ try {
       <div class="nav-item active" data-view="dashboard" onclick="window.navToView('dashboard')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-home"></i> Dashboard
+        <i class="fas fa-home"></i> <span class="nav-label">Dashboard</span>
       </div>
 
       <div class="nav-group-title">Public Presence</div>
       <a href="shop.php?id=<?php echo urlencode($tenant_custom['slug'] ?? ''); ?>" target="_blank" class="nav-item-link"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-external-link-alt"></i> View My Website
+        <i class="fas fa-external-link-alt"></i> <span class="nav-label">View My Website</span>
       </a>
 
       <?php if (in_array($role, ['OWNER', 'MANAGER'])): ?>
@@ -4515,50 +6987,61 @@ try {
       <div class="nav-item" data-view="appointments" onclick="window.navToView('appointments')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-calendar-check"></i> Appointments
+        <i class="fas fa-calendar-check"></i> <span class="nav-label">Appointments</span>
       </div>
       <div class="nav-item" data-view="job_orders" onclick="window.navToView('job_orders')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-tools"></i> Active Repairs
+        <i class="fas fa-tools"></i> <span class="nav-label">Active Repairs</span>
       </div>
       <div class="nav-item" data-view="bays" onclick="window.navToView('bays')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-warehouse"></i> Service Bays
+        <i class="fas fa-warehouse"></i> <span class="nav-label">Service Bays</span>
       </div>
       <div class="nav-item" data-view="mechanics" onclick="window.navToView('mechanics')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-user-cog"></i> Mechanics
+        <i class="fas fa-user-cog"></i> <span class="nav-label">Mechanics</span>
       </div>
       <div class="nav-item" data-view="services" onclick="window.navToView('services')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-list-ul"></i> Services & Pricing
+        <i class="fas fa-list-ul"></i> <span class="nav-label">Services & Pricing</span>
       </div>
       <?php elseif ($role === 'CASHIER'): ?>
       <div class="nav-group-title">Cashier Portal</div>
       <div class="nav-item" data-view="customers" onclick="window.navToView('customers')">
-        <i class="fas fa-users"></i> Customer Registry
+        <i class="fas fa-users"></i> <span class="nav-label">Customer Registry</span>
       </div>
-      <div class="nav-item" data-view="vehicles" onclick="window.navToView('vehicles')">
-        <i class="fas fa-car"></i> Vehicle Masterfile
+      <div class="nav-item" data-view="vehicles"
+        onclick="window.navToView('vehicles'); if(typeof window.refreshVehiclesList==='function') window.refreshVehiclesList();">
+        <i class="fas fa-car"></i> <span class="nav-label">Vehicle Masterfile</span>
       </div>
       <div class="nav-item" data-view="payments" onclick="window.navToView('payments')">
-        <i class="fas fa-money-bill-wave"></i> Payment Processing
+        <i class="fas fa-money-bill-wave"></i> <span class="nav-label">Payment Processing</span>
       </div>
+      <?php if ($role === 'CASHIER'): ?>
+      <div class="nav-item" data-view="settled_jobs" onclick="window.navToView('settled_jobs')">
+        <i class="fas fa-history"></i> <span class="nav-label">Settled Jobs History</span>
+      </div>
+      <?php endif; ?>
       <?php elseif ($role === 'MECHANIC'): ?>
       <div class="nav-group-title">My Station</div>
+      <div class="nav-item" data-view="mechanic_appointments" onclick="window.navToView('mechanic_appointments')"
+        onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
+        onmouseleave="this.style.background='transparent'">
+        <i class="fas fa-calendar-check"></i> <span class="nav-label">Upcoming Appointments</span>
+      </div>
       <div class="nav-item" data-view="mechanic_history" onclick="window.navToView('mechanic_history')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-history"></i> My Work History
+        <i class="fas fa-history"></i> <span class="nav-label">My Work History</span>
       </div>
       <div class="nav-item" data-view="inventory_lookup" onclick="window.navToView('inventory_lookup')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-boxes"></i> Parts Catalog
+        <i class="fas fa-boxes"></i> <span class="nav-label">Parts Catalog</span>
       </div>
       <?php endif; ?>
 
@@ -4567,17 +7050,18 @@ try {
       <div class="nav-item" data-view="customers" onclick="window.navToView('customers')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-users"></i> Customers
+        <i class="fas fa-users"></i> <span class="nav-label">Customers</span>
       </div>
-      <div class="nav-item" data-view="vehicles" onclick="window.navToView('vehicles')"
+      <div class="nav-item" data-view="vehicles"
+        onclick="window.navToView('vehicles'); if(typeof window.refreshVehiclesList==='function') window.refreshVehiclesList();"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-car"></i> Vehicles
+        <i class="fas fa-car"></i> <span class="nav-label">Vehicles</span>
       </div>
       <div class="nav-item" data-view="payments" onclick="window.navToView('payments')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-money-check-alt"></i> Payments
+        <i class="fas fa-money-check-alt"></i> <span class="nav-label">Payments</span>
       </div>
       <?php endif; ?>
 
@@ -4586,7 +7070,17 @@ try {
       <div class="nav-item" data-view="inventory" onclick="window.navToView('inventory')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-boxes"></i> Parts Inventory
+        <div style="display:flex; justify-content:space-between; align-items:center; width:100%;">
+          <span><i class="fas fa-boxes"></i> <span class="nav-label">Parts Inventory</span></span>
+          <?php if ($low_stock_count > 0): ?>
+          <span
+            style="background:linear-gradient(135deg, #ef4444 0%, #b91c1c 100%); color:white; font-size:0.6rem; padding:2px 8px; border-radius:8px; font-weight:900; box-shadow:0 0 12px rgba(239, 68, 68, 0.5); animation: pulse 1.5s infinite; display:flex; align-items:center; gap:5px; border:1px solid rgba(255,255,255,0.1);"
+            title="<?php echo $low_stock_count; ?> items low on stock">
+            <i class="fas fa-exclamation-triangle" style="font-size:0.7rem;"></i>
+            <?php echo $low_stock_count; ?>
+          </span>
+          <?php endif; ?>
+        </div>
       </div>
       <?php endif; ?>
 
@@ -4595,12 +7089,22 @@ try {
       <div class="nav-item" data-view="staff" onclick="window.navToView('staff')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-user-shield"></i> Staff Accounts
+        <div style="display:flex; justify-content:space-between; align-items:center; width:100%;">
+          <span><i class="fas fa-user-shield"></i> <span class="nav-label">Staff Accounts</span></span>
+          <?php if ($pending_shift_requests_count > 0): ?>
+          <span
+            style="background:linear-gradient(135deg, var(--accent) 0%, #8b5cf6 100%); color:white; font-size:0.6rem; padding:2px 8px; border-radius:8px; font-weight:900; box-shadow:0 0 12px rgba(99, 102, 241, 0.4); display:flex; align-items:center; gap:5px; border:1px solid rgba(255,255,255,0.1);"
+            title="<?php echo $pending_shift_requests_count; ?> pending shift requests">
+            <i class="fas fa-clock" style="font-size:0.7rem;"></i>
+            <?php echo $pending_shift_requests_count; ?>
+          </span>
+          <?php endif; ?>
+        </div>
       </div>
       <div class="nav-item" data-view="reports" onclick="window.navToView('reports')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-chart-pie"></i> Reports & Analytics
+        <i class="fas fa-chart-pie"></i> <span class="nav-label">Reports & Analytics</span>
       </div>
       <?php endif; ?>
 
@@ -4609,17 +7113,17 @@ try {
       <div class="nav-item" data-view="customization" onclick="window.navToView('customization')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-paint-brush"></i> Shop Settings
+        <i class="fas fa-paint-brush"></i> <span class="nav-label">Shop Settings</span>
       </div>
       <div class="nav-item" data-view="customer_logs" onclick="window.navToView('customer_logs')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-history"></i> Audit Trail
+        <i class="fas fa-history"></i> <span class="nav-label">Audit Trail</span>
       </div>
       <div class="nav-item" data-view="subscription" onclick="window.navToView('subscription')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-credit-card"></i> My Subscription
+        <i class="fas fa-credit-card"></i> <span class="nav-label">My Subscription</span>
       </div>
       <?php endif; ?>
 
@@ -4627,16 +7131,30 @@ try {
       <div class="nav-item" data-view="my_profile" onclick="window.navToView('my_profile')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-user-circle"></i> My Profile
+        <i class="fas fa-user-circle"></i> <span class="nav-label">My Profile</span>
       </div>
+      <?php if ($role === 'OWNER' || $role === 'MANAGER'): ?>
+      <div class="nav-item" onclick="toggleChat()" onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
+        onmouseleave="this.style.background='transparent'">
+        <div style="display:flex; justify-content:space-between; align-items:center; width:100%;">
+          <span><i class="fas fa-headset"></i> <span class="nav-label">Chat Support</span></span>
+          <span id="sidebarChatBadge"
+            style="display:none; background:#ff4757; color:white; font-size:0.6rem; padding:2px 7px; border-radius:10px; font-weight:900; box-shadow:0 0 10px rgba(255,71,87,0.4); animation:pulse 2s infinite;">0</span>
+        </div>
+      </div>
+      <?php endif; ?>
     </div>
 
-    <div style="margin-top:auto; padding: 0 1.5rem 1.5rem;">
+    <div style="margin-top:auto; padding: 0 1.5rem 1.5rem; display:flex; flex-direction:column; gap:10px;">
+      <a onclick="window.toggleTheme()" class="nav-item" id="theme-toggle-btn"
+        style="border-radius: 12px; background:rgba(255,255,255,0.05); justify-content:center; cursor:pointer;">
+        <i class="fas fa-moon"></i> <span class="nav-label">Switch Mode</span>
+      </a>
       <a href="?logout=1" class="nav-item"
         style="color:var(--danger); border-radius: 12px; background:rgba(239,68,68,0.05); justify-content:center; cursor:pointer;"
         onmouseenter="this.style.background='rgba(239,68,68,0.1)'"
         onmouseleave="this.style.background='rgba(239,68,68,0.05)'">
-        <i class="fas fa-sign-out-alt"></i> Logout
+        <i class="fas fa-sign-out-alt"></i> <span class="nav-label">Logout</span>
       </a>
     </div>
   </nav>
@@ -4734,6 +7252,13 @@ try {
       </div>
       <form id="confirmApptForm">
         <input type="hidden" name="appointment_id" id="confirm_appt_id">
+        <div id="requested_mechanic_display"
+          style="margin-bottom:1.5rem; padding:12px; background:rgba(99,102,241,0.1); border:1px solid rgba(99,102,241,0.2); border-radius:12px; display:none;">
+          <div
+            style="font-size:0.7rem; color:var(--accent); font-weight:800; text-transform:uppercase; margin-bottom:4px;">
+            Customer Requested:</div>
+          <div id="requested_mechanic_name_text" style="font-weight:700; color:white; font-size:0.95rem;"></div>
+        </div>
         <div style="margin-bottom:1rem;">
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Assign
             Mechanic</label>
@@ -4793,8 +7318,8 @@ try {
     </style>
     <!-- Removed header-bg for cleaner layout -->
     <header>
-      <div>
-        <h1 id="pageTitle" style="font-size: 2rem; font-weight: 800; letter-spacing: -1px;">
+      <div style="display:flex; align-items:center; gap:20px;">
+        <h1 id="pageTitle" style="font-size: 2rem; font-weight: 800; letter-spacing: -1px; margin:0;">
           <?php
           switch ($role) {
             case 'OWNER':
@@ -4814,16 +7339,17 @@ try {
           }
           ?>
         </h1>
-        <p style="color:var(--text-dim); margin-top:0.3rem;" id="pageSubtitle">
-          <?php
-          if ($role === 'MECHANIC')
-            echo 'Track your assigned repair jobs and updates.';
-          elseif ($role === 'OWNER' || $role === 'MANAGER')
-            echo 'Overview of shop operations and business performance.';
-          else
-            echo 'Quick access to your daily shop operations.';
-          ?>
-        </p>
+      </div>
+      <p style="color:var(--text-dim); margin-top:0.3rem;" id="pageSubtitle">
+        <?php
+        if ($role === 'MECHANIC')
+          echo 'Track your assigned repair jobs and updates.';
+        elseif ($role === 'OWNER' || $role === 'MANAGER')
+          echo 'Overview of shop operations and business performance.';
+        else
+          echo 'Quick access to your daily shop operations.';
+        ?>
+      </p>
       </div>
       <div style="display:flex; align-items:center; gap:20px;">
         <?php if (in_array(strtoupper($role), ['OWNER', 'MANAGER'])): ?>
@@ -4833,8 +7359,13 @@ try {
         </div>
         <?php endif; ?>
         <div class="user-profile">
-          <div class="avatar">
+          <div class="avatar" style="overflow:hidden; display:flex; align-items:center; justify-content:center;">
+            <?php if (!empty($current_user_pic)): ?>
+            <img src="<?php echo htmlspecialchars($current_user_pic); ?>"
+              style="width:100%; height:100%; object-fit:cover;">
+            <?php else: ?>
             <?php echo strtoupper(substr($owner_name, 0, 1)); ?>
+            <?php endif; ?>
           </div>
           <div>
             <div style="font-weight:700; font-size:0.95rem;">
@@ -4850,9 +7381,7 @@ try {
 
     <!-- SEC 1: Dashboard -->
     <div id="dashboard" class="view-section active">
-      <h1 style="margin-bottom: 2rem; font-weight: 800;">
-        <?php echo ucwords(strtolower($role)); ?> Dashboard
-      </h1>
+      <!-- Removed redundant H1 title to fix the "double header" issue -->
       <div class="stats-grid">
         <?php if ($role === 'CASHIER'): ?>
         <div class="stat-card">
@@ -4870,7 +7399,9 @@ try {
         </div>
         <?php else: ?>
         <div class="stat-card">
-          <p class="stat-label">Pending Repair Jobs</p>
+          <p class="stat-label">
+            <?php echo ($role === 'MECHANIC') ? 'My Assigned Jobs' : 'Pending Repair Jobs'; ?>
+          </p>
           <div class="stat-value" id="stat-pending-jobs">
             <?php echo number_format($pending_jobs_count); ?> <i class="fas fa-car-crash"
               style="color:var(--warning); font-size:1.4rem;"></i>
@@ -4909,6 +7440,84 @@ try {
         <?php endif; ?>
       </div>
 
+      <?php if ($role === 'OWNER' || $role === 'MANAGER'): ?>
+      <!-- SHIFT CHANGE REQUESTS (OWNER/MANAGER ONLY) -->
+      <div id="shiftRequestsSection"
+        style="margin-top: 3rem; <?php echo ($pending_shift_requests_count > 0) ? '' : 'display: none;'; ?>">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
+          <h3 style="margin:0; font-weight:800; display:flex; align-items:center; gap:10px;">
+            <i class="fas fa-clock-rotate-left" style="color:var(--accent);"></i> Pending Shift Requests
+            <span id="shiftRequestBadge"
+              style="background:var(--danger); color:white; font-size:0.7rem; padding:2px 8px; border-radius:10px; display:none;">0</span>
+          </h3>
+        </div>
+        <div class="glass-panel" style="padding:0; overflow:hidden;">
+          <table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
+            <thead style="background:rgba(255,255,255,0.02); border-bottom:1px solid rgba(255,255,255,0.05);">
+              <tr>
+                <th
+                  style="padding:15px 20px; text-align:left; color:var(--text-dim); font-weight:600; text-transform:uppercase; letter-spacing:1px; font-size:0.7rem;">
+                  Mechanic</th>
+                <th
+                  style="padding:15px 20px; text-align:left; color:var(--text-dim); font-weight:600; text-transform:uppercase; letter-spacing:1px; font-size:0.7rem;">
+                  Requested Shift</th>
+                <th
+                  style="padding:15px 20px; text-align:left; color:var(--text-dim); font-weight:600; text-transform:uppercase; letter-spacing:1px; font-size:0.7rem;">
+                  Reason</th>
+                <th
+                  style="padding:15px 20px; text-align:right; color:var(--text-dim); font-weight:600; text-transform:uppercase; letter-spacing:1px; font-size:0.7rem;">
+                  Actions</th>
+              </tr>
+            </thead>
+            <tbody id="shiftRequestsBody">
+              <?php foreach ($pending_shift_requests_list as $req): ?>
+              <tr style="border-bottom:1px solid rgba(255,255,255,0.03);">
+                <td style="padding:15px 20px;">
+                  <div style="font-weight:700; color:#fff;">
+                    <?php echo htmlspecialchars($req['full_name']); ?>
+                  </div>
+                  <div style="font-size:0.75rem; color:var(--text-dim);">Mechanic ID:
+                    #
+                    <?php echo $req['mechanic_id']; ?>
+                  </div>
+                </td>
+                <td style="padding:15px 20px;">
+                  <div style="color:var(--accent); font-weight:700; font-size:0.9rem;"><i class="far fa-clock"
+                      style="margin-right:4px;"></i>
+                    <?php echo date('h:i A', strtotime($req['requested_start'])); ?>
+                    &ndash;
+                    <?php echo date('h:i A', strtotime($req['requested_end'])); ?>
+                  </div>
+                  <?php if (!empty($req['requested_days'])): ?>
+                  <div style="font-size:0.72rem; color:var(--text-dim); margin-top:3px;"><i class="fas fa-calendar-week"
+                      style="color:var(--accent); margin-right:4px;"></i>
+                    <?php echo implode(' &middot; ', array_map('trim', explode(',', $req['requested_days']))); ?>
+                  </div>
+                  <?php endif; ?>
+                </td>
+                <td style="padding:15px 20px;">
+                  <div style="font-size:0.85rem; color:var(--text-dim); max-width:250px;">
+                    <?php echo htmlspecialchars($req['reason']); ?>
+                  </div>
+                </td>
+                <td style="padding:15px 20px; text-align:right;">
+                  <div style="display:flex; gap:10px; justify-content:flex-end;">
+                    <button onclick="window.processShiftRequest(<?php echo $req['request_id']; ?>, 'APPROVED')"
+                      class="btn-action"
+                      style="padding:8px 16px; font-size:0.8rem; background:var(--success); border:none; color:white; font-weight:800; border-radius:12px; cursor:pointer;">Approve</button>
+                    <button onclick="window.processShiftRequest(<?php echo $req['request_id']; ?>, 'REJECTED')"
+                      class="btn-action"
+                      style="padding:8px 16px; font-size:0.8rem; background:var(--danger); border:none; color:white; font-weight:800; border-radius:12px; cursor:pointer;">Reject</button>
+                  </div>
+                </td>
+              </tr>
+              <?php endforeach; ?>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <?php endif; ?>
+
       <!-- REMOVAL OF MANUAL PENDING VERIFICATION BLOCK COMPLETED -->
       <!-- Dashboard Main Section -->
       <div class="glass-panel">
@@ -4930,7 +7539,7 @@ try {
           </button>
           <?php else: ?>
           <button class="btn-action" style="padding: 0.5rem 1rem; font-size: 0.85rem;"
-            onclick="<?php echo ($role === 'MECHANIC') ? 'openWorkLog()' : 'alert(\'Queue feature coming soon!\')'; ?>">
+            onclick="<?php echo ($role === 'MECHANIC') ? 'navToView(\'mechanic_history\')' : 'alert(\'Queue feature coming soon!\')'; ?>">
             <?php echo ($role === 'MECHANIC') ? 'View Work Log' : 'View Queue'; ?>
           </button>
           <?php endif; ?>
@@ -4949,7 +7558,8 @@ try {
                 <?php else: ?>
                 <th>Plate No.</th>
                 <th>Vehicle</th>
-                <th>Status/Assigned</th>
+                <th>Service</th>
+                <th>Assigned Mechanic</th>
                 <th>Current Progress</th>
                 <?php if ($role === 'MECHANIC'): ?>
                 <th>Action</th>
@@ -4969,17 +7579,113 @@ try {
       </div>
     </div>
 
-    <!-- Appointments View -->
+    <?php if ($role === 'CASHIER'): ?>
+    <!-- Settled Jobs History View -->
+    <div id="settled_jobs" class="view-section">
+      <div class="glass-panel" style="padding:2rem;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem;">
+          <h3><i class="fas fa-history" style="color:var(--accent); margin-right:10px;"></i> Settled Jobs History</h3>
+          <div style="display:flex; gap:10px;">
+            <button class="btn-action" onclick="window.printSettledHistory()"
+              style="background:#10b981; border:none; padding: 0.5rem 1rem; font-size: 0.85rem;">
+              <i class="fas fa-print"></i> Print Report
+            </button>
+            <button class="btn-outline" style="padding: 0.5rem 1rem; font-size: 0.85rem;"
+              onclick="window.refreshSettledJobs()">
+              <i class="fas fa-sync"></i> Refresh List
+            </button>
+          </div>
+        </div>
+
+        <div class="table-container">
+          <table id="settledJobsTable" style="width: 100%;">
+            <thead>
+              <tr>
+                <th>PLATE NO.</th>
+                <th>VEHICLE / OWNER</th>
+                <th>SERVICE DONE</th>
+                <th>DATE COMPLETED</th>
+                <th>TOTAL BILL</th>
+                <th>STATUS</th>
+                <th>ACTION</th>
+              </tr>
+            </thead>
+            <tbody id="settledJobsBody">
+              <tr>
+                <td colspan="6" style="text-align:center; padding:2rem; color:var(--text-dim);">
+                  <i class="fas fa-spinner fa-spin"></i> Loading settled jobs...
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Mechanic Upcoming Appointments View -->
+    <div id="mechanic_appointments" class="view-section">
+      <div class="glass-panel">
+        <div style="display:flex; justify-content:space-between; margin-bottom: 1.5rem;">
+          <h3><i class="fas fa-calendar-alt" style="color:var(--accent); margin-right:10px;"></i> My Upcoming
+            Appointments</h3>
+          <button class="btn-action" style="padding: 0.5rem 1rem; font-size: 0.85rem;"
+            onclick="window.refreshMyUpcomingAppointments()">
+            <i class="fas fa-sync"></i> Refresh
+          </button>
+        </div>
+        <div style="overflow-x:auto;">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Date & Time</th>
+                <th>Customer</th>
+                <th>Vehicle</th>
+                <th>Service Requested</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="myUpcomingAppointmentsBody">
+              <tr>
+                <td colspan="5" style="text-align:center; padding:2rem; color:var(--text-dim);">
+                  <i class="fas fa-spinner fa-spin"></i> Loading appointments...
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
     <div id="appointments" class="view-section">
       <div class="glass-panel">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
           <div>
             <h3>Appointment Calendar</h3>
-            <p style="color:var(--text-dim); font-size: 0.9rem;">Review and manage upcoming maintenance
-              bookings from the mobile app.</p>
+            <p style="color:var(--text-dim); font-size: 0.9rem;">Review and manage upcoming maintenance bookings from
+              the mobile app.</p>
           </div>
-          <button class="btn-action" onclick="refreshAppointmentsList()"><i class="fas fa-sync"></i> Refresh
-            List</button>
+          <div style="display:flex; align-items:center; gap:15px;">
+            <select id="appointmentSortFilter" onchange="refreshAppointmentsList()"
+              style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem 1rem; border-radius:12px; font-weight:700; outline:none; cursor:pointer;">
+              <option value="latest">Sort: Latest Bookings</option>
+              <option value="date">Sort: By Appointment Date</option>
+            </select>
+            <button class="btn-action" onclick="refreshAppointmentsList()"><i class="fas fa-sync"></i> Refresh
+              List</button>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 2rem; display: flex; align-items: center; gap: 15px;">
+          <div style="position:relative; width: 350px;">
+            <i class="fas fa-search"
+              style="position:absolute; left: 15px; top: 50%; transform: translateY(-50%); color: var(--text-dim);"></i>
+            <input type="text" id="appointmentSearchInput" placeholder="Search customer, plate..."
+              onkeyup="refreshAppointmentsList()"
+              style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem 1rem 0.8rem 2.5rem; border-radius:12px; font-weight:500; outline:none; width: 100%;">
+          </div>
+          <div style="color:var(--text-dim); font-size: 0.8rem; font-style: italic;">
+            <i class="fas fa-info-circle"></i> Filter by customer name, plate number, or service.
+          </div>
         </div>
 
         <div style="overflow-x:auto;">
@@ -4990,7 +7696,7 @@ try {
                 <th>Customer</th>
                 <th>Vehicle</th>
                 <th>Service</th>
-                <th>Estimate</th>
+                <th>Requested Mech</th>
                 <th>Status</th>
                 <th>
                   <?php echo ($role === 'CASHIER' ? 'Booking Note' : 'Action'); ?>
@@ -5052,8 +7758,6 @@ try {
               style="font-size:0.9rem; background:rgba(255,255,255,0.1); padding:4px 12px; border-radius:20px; color:var(--accent); border:1px solid rgba(255,255,255,0.05);">0
               Total</span>
           </h3>
-          <button class="btn-action" onclick="openModal('customerModal')"><i class="fas fa-user-plus"></i> New
-            Customer</button>
         </div>
         <input type="text" class="search-input" placeholder="Search by name or email..."
           oninput="window.searchTable(this, 'customersBody')">
@@ -5082,8 +7786,12 @@ try {
       <div class="glass-panel">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem;">
           <h3><i class="fas fa-car" style="color:var(--accent)"></i> Fleet Management</h3>
-          <button class="btn-action" onclick="openModal('vehicleModal')"><i class="fas fa-plus"></i> Register
-            New Vehicle</button>
+          <div style="display:flex; gap:10px;">
+            <button class="btn-outline" onclick="window.refreshVehiclesList()"><i class="fas fa-sync"></i> Sync
+              Registry</button>
+            <button class="btn-action" onclick="openModal('vehicleModal')"><i class="fas fa-plus"></i> Register New
+              Vehicle</button>
+          </div>
         </div>
         <table class="data-table">
           <thead>
@@ -5096,8 +7804,9 @@ try {
           </thead>
           <tbody id="vehiclesBody">
             <tr>
-              <td colspan="3" style="text-align:center; padding:2rem; color:var(--text-dim);">
-                <i class="fas fa-spinner fa-spin"></i> Initializing vehicle directory...
+              <td colspan="4" style="text-align:center; padding:5rem; color:var(--text-dim);">
+                <i class="fas fa-spinner fa-spin" style="font-size:2rem; margin-bottom:1rem;"></i><br>
+                Initializing vehicle directory...
               </td>
             </tr>
           </tbody>
@@ -5106,8 +7815,8 @@ try {
     </div>
 
     <!-- Payments View -->
-    <div id="payments" class="view-section">
-      <div class="glass-panel">
+    <div id="payments" class="view-section" style="display:none; min-height: 600px; opacity: 1 !important;">
+      <div class="glass-panel" style="display: block !important;">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem;">
           <h3><i class="fas fa-coins" style="color:var(--accent)"></i> Payment Monitoring</h3>
           <div style="display:flex; gap:10px;">
@@ -5115,8 +7824,10 @@ try {
               End of Day Summary</button>
             <button class="btn-outline" onclick="refreshPaymentsList()"><i class="fas fa-sync"></i> Sync
               Logs</button>
+            <?php if (in_array($role, ['MANAGER', 'CASHIER'])): ?>
             <button class="btn-action" onclick="openModal('paymentModal')"><i class="fas fa-money-bill-wave"></i> Add
               Payment</button>
+            <?php endif; ?>
           </div>
         </div>
         <input type="text" class="search-input" placeholder="Search by payment ID, customer, or reference..."
@@ -5157,31 +7868,68 @@ try {
                 style="display:inline-block; margin-left:10px; background:rgba(255,255,255,0.05); padding:2px 10px; border-radius:10px; font-size:0.75rem; color:var(--accent);">Plan:
                 <?php echo $plan_tier; ?> (Max
                 <?php echo $bay_limit; ?> Bays)
+                <?php if (count($bays_list) >= $bay_limit): ?>
+                <span onclick="window.openUpgradeModal(event)"
+                  style="margin-left:12px; color:#111827; cursor:pointer; font-weight:900; font-size:0.65rem; background:linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%); padding:4px 12px; border-radius:8px; box-shadow:0 0 15px rgba(251, 191, 36, 0.5); animation: pulse 1.5s infinite; text-transform:uppercase; letter-spacing:1px; display:inline-flex; align-items:center; gap:5px; border:none;">
+                  <i class="fas fa-crown" style="font-size:0.7rem;"></i> Upgrade?
+                </span>
+                <?php endif; ?>
               </span></p>
           </div>
-          <button class="btn-action" onclick="openModal('bayModal')"><i class="fas fa-plus"></i> Register
-            Bay</button>
+          <button class="btn-action" <?php echo (count($bays_list) >= $bay_limit) ? 'disabled style="opacity:0.5; cursor:not-allowed; filter:grayscale(1);" title="Subscription Limit Reached"' : ''; ?>
+            onclick="openModal('bayModal')">
+            <i class="fas fa-plus"></i> Register Bay
+          </button>
         </div>
         <div id="baysGrid"
           style="display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1.5rem;">
           <?php if (empty($bays_list)): ?>
           <p style="color:var(--text-dim);">No service bays registered.</p>
           <?php else: ?>
-          <?php foreach ($bays_list as $bay): ?>
-          <div
-            style="border:1px solid <?php echo $bay['status'] === 'AVAILABLE' ? 'rgba(16,185,129,0.3)' : 'rgba(239,68,68,0.3)'; ?>; background:<?php echo $bay['status'] === 'AVAILABLE' ? 'rgba(16,185,129,0.05)' : 'rgba(239,68,68,0.05)'; ?>; padding:1.5rem; border-radius:12px;">
-            <span class="badge <?php echo $bay['status'] === 'AVAILABLE' ? 'badge-active' : ''; ?>"
-              style="<?php echo $bay['status'] !== 'AVAILABLE' ? 'background:#ef4444; color:white;' : ''; ?>">
-              <?php echo $bay['status']; ?>
-            </span>
-            <h2 style="margin:1rem 0;">
-              <?php echo htmlspecialchars($bay['bay_name']); ?>
-            </h2>
-            <button
-              style="width:100%; background:var(--glass); border:1px solid var(--glass-border); color:white; padding:10px; border-radius:8px;"
-              onclick="openAssignBayModal(<?php echo $bay['bay_id']; ?>, '<?php echo addslashes($bay['bay_name']); ?>')">
-              <?php echo $bay['status'] === 'AVAILABLE' ? 'Assign Vehicle' : 'View Details'; ?>
+          <?php foreach ($bays_list as $bay):
+            // Safety: If status is OCCUPIED but no active job exists, treat as AVAILABLE
+            $is_avail = ($bay['status'] === 'AVAILABLE' || empty($bay['active_job_id']));
+            $display_status = $is_avail ? 'AVAILABLE' : strtoupper($bay['status']);
+            $action = $is_avail ? "openBayProfile(" . (int) $bay['bay_id'] . ")" : "window.handleJobClick(" . ($bay['active_job_id'] ?? 0) . ", '" . ($bay['job_status'] ?? 'PENDING') . "', " . ($bay['active_mechanic_id'] ?? 'null') . ", " . (int) $bay['bay_id'] . ", true, false)";
+            ?>
+          <div class="bay-card <?php echo !$is_avail ? 'clickable' : ''; ?>"
+            onclick="<?php echo !$is_avail ? $action : ''; ?>"
+            style="border:1px solid rgba(255,255,255,0.08); background:rgba(255,255,255,0.02); padding:2rem; border-radius:28px; position:relative; overflow:hidden; display:flex; flex-direction:column; justify-content:space-between; min-height:280px; cursor:<?php echo !$is_avail ? 'pointer' : 'default'; ?>; transition:all 0.3s;">
+            <div
+              style="position:absolute; top:-30px; right:-30px; width:120px; height:120px; background:<?php echo $is_avail ? 'var(--accent)' : '#ef4444'; ?>; opacity:0.05; filter:blur(40px);">
+            </div>
+            <div>
+              <span class="badge <?php echo $is_avail ? 'badge-active' : 'badge-danger'; ?>" style="font-weight:800;">
+                <?php echo $display_status; ?>
+              </span>
+              <h2 style="margin:1.2rem 0 0.5rem; font-size:1.8rem; font-weight:900; letter-spacing:-1px;">
+                <?php echo htmlspecialchars($bay['bay_name']); ?>
+              </h2>
+
+              <?php if (!$is_avail): ?>
+              <div
+                style="margin-top:1rem; padding:12px; background:rgba(255,255,255,0.03); border-radius:15px; border:1px solid rgba(255,255,255,0.05);">
+                <div
+                  style="font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase; margin-bottom:4px;">
+                  In Service</div>
+                <div style="font-weight:800; color:var(--accent); font-size:1.1rem;">
+                  <?php echo htmlspecialchars($bay['plate_no'] ?? 'N/A'); ?>
+                </div>
+                <div style="font-size:0.8rem; color:var(--text-dim); margin-top:5px;"><i class="fas fa-wrench"
+                    style="font-size:0.7rem;"></i>
+                  <?php echo htmlspecialchars($bay['mechanic_name'] ?? 'Unassigned'); ?>
+                </div>
+              </div>
+              <?php endif; ?>
+            </div>
+
+            <?php if ($is_avail): ?>
+            <button class="btn-action"
+              style="width:100%; margin-top:1.5rem; background:var(--accent); color:white; border:none; padding:1rem; border-radius:15px; font-weight:800; cursor:pointer;"
+              onclick="event.stopPropagation(); <?php echo $action; ?>">
+              <i class="fas fa-eye"></i> View Bay
             </button>
+            <?php endif; ?>
           </div>
           <?php endforeach; ?>
           <?php endif; ?>
@@ -5198,7 +7946,6 @@ try {
             <p style="color:var(--text-dim); margin-top:5px;">Maintain mechanic info & specialization.
             </p>
           </div>
-          <button class="btn-action" onclick="openModal('mechanicModal')">+ Register Mechanic</button>
         </div>
         <input type="text" class="search-input" placeholder="Search mechanics by name or spec..."
           oninput="window.searchTable(this, 'mechanicsBody')">
@@ -5207,6 +7954,7 @@ try {
             <tr>
               <th>Name</th>
               <th>Specialization</th>
+              <th>Shift Hours</th>
               <th>Status</th>
               <th>Actions</th>
             </tr>
@@ -5226,14 +7974,35 @@ try {
               <td>
                 <?php echo htmlspecialchars($m['specialization']); ?>
               </td>
+              <td>
+                <div style="line-height:1.6;">
+                  <span style="font-size:0.8rem; font-weight:700; color:white;">
+                    <i class="far fa-clock" style="color:var(--accent); margin-right:4px;"></i>
+                    <?php echo date('h:i A', strtotime($m['shift_start'] ?? '08:00:00')); ?> –
+                    <?php echo date('h:i A', strtotime($m['shift_end'] ?? '17:00:00')); ?>
+                  </span><br>
+                  <span style="font-size:0.7rem; color:var(--text-dim);">
+                    <?php echo implode(' · ', array_map('trim', explode(',', $m['shift_days'] ?? 'Mon,Tue,Wed,Thu,Fri,Sat'))); ?>
+                  </span>
+                </div>
+              </td>
               <td><span class="badge <?php echo $m['status'] === 'AVAILABLE' ? 'badge-active' : ''; ?>">
                   <?php echo $m['status']; ?>
                 </span>
               </td>
-              <td><button type="button" class="btn-outline"
-                  style="padding:6px 12px; font-size:0.75rem; border-color:var(--accent); color:var(--text-main); position:relative; z-index:999; pointer-events: auto !important; cursor: pointer;"
-                  onclick="window.openMechanicProfile(<?php echo (int) $m['mechanic_id']; ?>)">View
-                  Profile</button></td>
+              <td>
+                <div style="display:flex; gap:6px;">
+                  <button type="button" class="btn-outline"
+                    style="padding:6px 12px; font-size:0.75rem; border-color:var(--accent); color:var(--text-main); position:relative; z-index:999; pointer-events: auto !important; cursor: pointer;"
+                    onclick="window.openMechanicProfile(<?php echo (int) $m['mechanic_id']; ?>)">View Profile</button>
+                  <?php if (strtoupper($role) === 'OWNER' || strtoupper($role) === 'MANAGER'): ?>
+                  <button type="button" class="btn-outline"
+                    style="padding:6px 12px; font-size:0.75rem; border-color:var(--accent); color:var(--text-main); position:relative; z-index:999; pointer-events: auto !important; cursor: pointer;"
+                    onclick="window.openEditShiftModal(<?php echo (int) $m['mechanic_id']; ?>, '<?php echo $m['shift_start']; ?>', '<?php echo $m['shift_end']; ?>', '<?php echo htmlspecialchars($m['full_name']); ?>', '<?php echo $m['shift_days'] ?? 'Mon,Tue,Wed,Thu,Fri,Sat'; ?>')">Edit
+                    Shift</button>
+                  <?php endif; ?>
+                </div>
+              </td>
             </tr>
             <?php endforeach; ?>
             <?php endif; ?>
@@ -5253,7 +8022,7 @@ try {
               set
               prices.</p>
           </div>
-          <button class="btn-action" onclick="openModal('serviceModal')">+ Add Service</button>
+          <button class="btn-action" onclick="window.prepareAddServiceModal()">+ Add Service</button>
         </div>
         <input type="text" class="search-input" placeholder="Search services by name or description..."
           oninput="window.searchTable(this, 'servicesBody')">
@@ -5291,7 +8060,7 @@ try {
                 </span></td>
               <td>
                 <button class="btn-outline"
-                  onclick="editService(<?php echo $s['service_id']; ?>, '<?php echo addslashes($s['service_name']); ?>', '<?php echo addslashes($s['description']); ?>', <?php echo $s['price']; ?>)">Edit</button>
+                  onclick="editService(<?php echo $s['service_id']; ?>, '<?php echo addslashes($s['service_name']); ?>', '<?php echo addslashes($s['description']); ?>', <?php echo $s['price']; ?>, <?php echo $s['master_id'] ?? 'null'; ?>)">Edit</button>
                 <button class="btn-outline"
                   style="color:var(--danger); border-color:rgba(239,68,68,0.3); margin-left: 5px;"
                   onclick="deleteService(<?php echo $s['service_id']; ?>)">Delete</button>
@@ -5365,6 +8134,59 @@ try {
     <!-- SEC 6: Staff Accounts -->
     <div id="staff" class="view-section">
       <div class="glass-panel">
+        <!-- SHIFT CHANGE REQUESTS (INTEGRATED FOR VISIBILITY) -->
+        <div id="staffShiftRequestsSection"
+          style="margin-bottom: 2.5rem; <?php echo ($pending_shift_requests_count > 0) ? '' : 'display: none;'; ?> padding: 1.5rem; border-radius: 20px; border: 2px solid var(--accent); background: rgba(var(--accent-rgb), 0.05);">
+          <h3
+            style="margin: 0 0 1.5rem 0; font-weight: 800; display: flex; align-items: center; gap: 10px; color: #fff; font-size: 1.1rem;">
+            <i class="fas fa-clock-rotate-left" style="color: var(--accent);"></i> Pending Shift Requests
+          </h3>
+          <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+              <thead style="background: rgba(255,255,255,0.02); border-bottom: 1px solid rgba(255,255,255,0.05);">
+                <tr>
+                  <th
+                    style="padding: 10px 15px; text-align: left; color: var(--text-dim); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 1px;">
+                    Mechanic</th>
+                  <th
+                    style="padding: 10px 15px; text-align: left; color: var(--text-dim); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 1px;">
+                    Requested Shift</th>
+                  <th
+                    style="padding: 10px 15px; text-align: right; color: var(--text-dim); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 1px;">
+                    Actions</th>
+                </tr>
+              </thead>
+              <tbody id="staffShiftRequestsBody">
+                <?php foreach ($pending_shift_requests_list as $req): ?>
+                <tr style="border-bottom:1px solid rgba(255,255,255,0.03);">
+                  <td style="padding:10px 15px;">
+                    <div style="font-weight:700; color:#fff;">
+                      <?php echo htmlspecialchars($req['full_name']); ?>
+                    </div>
+                  </td>
+                  <td style="padding:10px 15px;">
+                    <div style="color:var(--accent); font-weight:700; font-size:0.85rem;">
+                      <?php echo date('h:i A', strtotime($req['requested_start'])); ?> -
+                      <?php echo date('h:i A', strtotime($req['requested_end'])); ?>
+                    </div>
+                  </td>
+                  <td style="padding:10px 15px; text-align:right;">
+                    <div style="display:flex; gap:8px; justify-content:flex-end;">
+                      <button onclick="window.processShiftRequest(<?php echo $req['request_id']; ?>, 'APPROVED')"
+                        class="btn-action"
+                        style="padding:6px 14px; font-size:0.75rem; background:var(--success); border:none; color:white; font-weight:800; border-radius:10px; cursor:pointer;">Approve</button>
+                      <button onclick="window.processShiftRequest(<?php echo $req['request_id']; ?>, 'REJECTED')"
+                        class="btn-action"
+                        style="padding:6px 14px; font-size:0.75rem; background:var(--danger); border:none; color:white; font-weight:800; border-radius:10px; cursor:pointer;">Reject</button>
+                    </div>
+                  </td>
+                </tr>
+                <?php endforeach; ?>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         <div style="display:flex; justify-content:space-between; margin-bottom: 2rem;">
           <div>
             <h3>Staff Accounts</h3>
@@ -5406,9 +8228,24 @@ try {
               $cannotManage = $isSelf || ($currentUserRole === 'MANAGER' && $isTargetOwner);
               ?>
             <tr>
-              <td><strong>
-                  <?php echo htmlspecialchars($staff['name']); ?>
-                </strong></td>
+              <td>
+                <div style="display:flex; align-items:center; gap:12px; padding:0.5rem 0;">
+                  <div
+                    style="width:36px; height:36px; border-radius:10px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); overflow:hidden; display:flex; align-items:center; justify-content:center; flex-shrink:0; box-shadow:0 4px 10px rgba(0,0,0,0.2);">
+                    <?php if (!empty($staff['profile_pic'])): ?>
+                    <img src="<?php echo htmlspecialchars($staff['profile_pic']); ?>"
+                      style="width:100%; height:100%; object-fit:cover;">
+                    <?php else: ?>
+                    <span style="font-size:0.85rem; font-weight:800; color:var(--accent);">
+                      <?php echo strtoupper(substr($staff['name'] ?? 'U', 0, 1)); ?>
+                    </span>
+                    <?php endif; ?>
+                  </div>
+                  <strong style="color:#fff;">
+                    <?php echo htmlspecialchars($staff['name']); ?>
+                  </strong>
+                </div>
+              </td>
               <td>
                 <?php echo htmlspecialchars($staff['email']); ?>
               </td>
@@ -5460,23 +8297,68 @@ try {
               const s = res.data;
               if (content) {
                 content.innerHTML = `
-                  <div style="text-align:center; margin-bottom:2.5rem; padding: 1.5rem; background:rgba(255,255,255,0.03); border-radius:24px; border:1px solid rgba(255,255,255,0.05);">
-                    <div style="width:80px; height:80px; border-radius:24px; background:var(--accent); color:#000; display:flex; align-items:center; justify-content:center; font-size:2.2rem; font-weight:900; margin:0 auto 1.5rem; box-shadow:0 15px 35px rgba(0,0,0,0.3);">
-                      ${(s.name || 'S').charAt(0).toUpperCase()}
+                  <!-- Header: Compact Profile Header -->
+                  <div style="display:flex; align-items:center; gap:15px; margin-bottom:1.5rem; padding:1.2rem; background:rgba(255,255,255,0.03); border-radius:18px; border:1px solid rgba(255,255,255,0.05);">
+                    <div style="width:55px; height:55px; border-radius:15px; background:var(--accent); color:#000; display:flex; align-items:center; justify-content:center; font-size:1.6rem; font-weight:900; flex-shrink:0; box-shadow:0 8px 20px var(--accent-glow); overflow:hidden;">
+                      ${s.profile_pic ? `<img src="${s.profile_pic}" style="width:100%; height:100%; object-fit:cover;">` : (s.name || 'S').charAt(0).toUpperCase()}
                     </div>
-                    <h4 style="margin:0; font-size:1.6rem; color:#fff; letter-spacing:-0.5px;">${s.name}</h4>
-                    <div style="font-size:0.9rem; color:rgba(255,255,255,0.6); margin-top:5px; font-weight:500;">${s.email}</div>
+                    <div style="flex:1; min-width:0;">
+                      <h4 style="margin:0; font-size:1.2rem; color:#fff; letter-spacing:-0.4px; font-weight:800; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${s.name}</h4>
+                      <div style="font-size:0.75rem; color:rgba(255,255,255,0.45); margin-bottom:4px;">${s.email}</div>
+                      <span style="background:rgba(99,102,241,0.12); color:var(--accent); font-size:0.6rem; font-weight:800; padding:3px 10px; border-radius:12px; letter-spacing:0.8px; text-transform:uppercase; border:1px solid rgba(99,102,241,0.25);">
+                        <i class="fas fa-id-badge" style="margin-right:4px;"></i>${s.role || 'STAFF'}
+                      </span>
+                    </div>
                   </div>
-                  
-                  <div style="background:rgba(0,0,0,0.3); padding:2rem; border-radius:28px; border:1px solid rgba(255,255,255,0.08); box-shadow:inset 0 0 20px rgba(0,0,0,0.2);">
-                    <label style="display:block; font-size:0.75rem; font-weight:800; color:rgba(255,255,255,0.5); margin-bottom:15px; text-transform:uppercase; letter-spacing:1.5px;">Operational Access</label>
-                    <select id="staff_manage_status">
+
+                  <!-- Info Row: Compact 2-column stats -->
+                  <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:1rem;">
+                    <div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:12px; padding:0.8rem; text-align:center;">
+                      <div style="font-size:0.6rem; color:rgba(255,255,255,0.4); text-transform:uppercase; letter-spacing:0.8px; margin-bottom:4px; font-weight:700;">Account Status</div>
+                      <span style="display:inline-flex; align-items:center; gap:5px; font-size:0.75rem; font-weight:800; color:${s.status === 'ACTIVE' ? '#10b981' : '#ef4444'};">
+                        <span style="width:6px; height:6px; border-radius:50%; background:${s.status === 'ACTIVE' ? '#10b981' : '#ef4444'}; display:inline-block;"></span>
+                        ${s.status || 'UNKNOWN'}
+                      </span>
+                    </div>
+                    <div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:12px; padding:0.8rem; text-align:center;">
+                      <div style="font-size:0.6rem; color:rgba(255,255,255,0.4); text-transform:uppercase; letter-spacing:0.8px; margin-bottom:4px; font-weight:700;">Date Added</div>
+                      <span style="font-size:0.75rem; font-weight:700; color:white;">${s.created_at ? new Date(s.created_at).toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' }) : 'N/A'}</span>
+                    </div>
+                  </div>
+
+                  <!-- Contact Details: Compact single-row or narrow cards -->
+                  <div style="margin-bottom:1rem; display:flex; flex-direction:column; gap:8px;">
+                    <div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:12px; padding:0.8rem; display:flex; align-items:center; gap:12px;">
+                      <i class="fas fa-phone-alt" style="color:#10b981; font-size:0.9rem; width:15px; text-align:center;"></i>
+                      <div style="flex:1;">
+                        <span style="font-size:0.6rem; color:rgba(255,255,255,0.35); text-transform:uppercase; font-weight:700; display:block; margin-bottom:1px;">Contact</span>
+                        <div style="color:white; font-weight:700; font-size:0.85rem;">${s.phone || '<span style="color:rgba(255,255,255,0.15); font-weight:400;">Not Provided</span>'}</div>
+                      </div>
+                    </div>
+
+                    <div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:12px; padding:0.8rem; display:flex; align-items:center; gap:12px;">
+                      <i class="fas fa-map-marker-alt" style="color:var(--accent); font-size:0.9rem; width:15px; text-align:center;"></i>
+                      <div style="flex:1;">
+                        <span style="font-size:0.6rem; color:rgba(255,255,255,0.35); text-transform:uppercase; font-weight:700; display:block; margin-bottom:1px;">Address</span>
+                        <div style="color:white; font-weight:700; font-size:0.8rem; line-height:1.3; overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;">${s.address || '<span style="color:rgba(255,255,255,0.15); font-weight:400;">No address on file</span>'}</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- Operational Access Panel -->
+                  <div style="background:rgba(0,0,0,0.2); padding:1.2rem; border-radius:18px; border:1px solid rgba(255,255,255,0.06);">
+                    <label style="display:block; font-size:0.65rem; font-weight:800; color:rgba(255,255,255,0.4); margin-bottom:10px; text-transform:uppercase; letter-spacing:1.2px;">
+                      <i class="fas fa-shield-alt" style="margin-right:4px; color:var(--accent);"></i>Permissions
+                    </label>
+                    <select id="staff_manage_status" style="margin-bottom:0.8rem; padding:0.6rem; font-size:0.85rem; border-radius:10px;">
                       <option value="ACTIVE" ${s.status === 'ACTIVE' ? 'selected' : ''}>ACTIVE (Full Access)</option>
                       <option value="INACTIVE" ${s.status === 'INACTIVE' ? 'selected' : ''}>INACTIVE (Restricted)</option>
                     </select>
-                    
-                    <button onclick="window.updateStaffStatus(${s.user_id})" style="width:100%; background:var(--accent); color:#000; border:none; padding:1.2rem; border-radius:20px; font-weight:900; cursor:pointer; font-size:1.05rem; box-shadow:0 10px 25px var(--accent-glow); transition:0.3s; text-transform:uppercase; letter-spacing:1px;" onmouseover="this.style.transform='translateY(-2px)'; this.style.boxShadow='0 15px 30px var(--accent-glow)'" onmouseout="this.style.transform='translateY(0)'; this.style.boxShadow='0 10px 25px var(--accent-glow)'">
-                      Sync Permissions
+                    <button onclick="window.updateStaffStatus(${s.user_id})"
+                      style="width:100%; background:var(--accent); color:#000; border:none; padding:0.8rem; border-radius:12px; font-weight:900; cursor:pointer; font-size:0.85rem; box-shadow:0 6px 15px var(--accent-glow); transition:0.3s; text-transform:uppercase; letter-spacing:0.8px;"
+                      onmouseover="this.style.transform='translateY(-1px)'"
+                      onmouseout="this.style.transform='translateY(0)'">
+                      <i class="fas fa-sync" style="margin-right:5px;"></i>Sync Status
                     </button>
                   </div>`;
               }
@@ -5560,8 +8442,10 @@ try {
         </div>
 
         <div style="margin-top:2rem; display:flex; gap:10px;">
-          <button class="btn-action" style="flex:1; background:#111827;" onclick="executeThermalPrint()">
-            <i class="fas fa-print"></i> Print Thermal
+          <button class="btn-action"
+            style="flex:1; background:var(--accent); color:white; border:none; border-radius:12px; font-weight:700;"
+            onclick="window.executeThermalPrint()">
+            <i class="fas fa-print"></i> Print Receipt
           </button>
           <button class="btn-outline" style="flex:1; border-color:#cbd5e1; color:#64748b;"
             onclick="closeModal('receiptModal')">
@@ -5854,7 +8738,8 @@ try {
                 </div>
                 <div
                   style="margin-left: 20px; background: rgba(255,255,255,0.05); border-radius: 6px; padding: 4px 15px; flex: 1; text-align: center; font-size: 0.7rem; color: var(--text-dim); border: 1px solid rgba(255,255,255,0.05); font-family: monospace;">
-                  your-shop.com/<?php echo htmlspecialchars($tenant_slug); ?>
+                  your-shop.com/
+                  <?php echo htmlspecialchars($tenant_slug); ?>
                 </div>
               </div>
 
@@ -5889,57 +8774,57 @@ try {
             window.showPayMongoSimulation = function (amount, method, planName, onComplete) {
               const modalId = 'paymongo_' + Date.now();
               const modalHTML = `
-                  <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:#f4f7f9; z-index:2147483649; display:flex; flex-direction:column; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
-                    <!-- Header -->
-                    <div style="background:white; padding:1.5rem 2rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #e2e8f0;">
-                      <div style="display:flex; align-items:center; gap:10px;">
-                        <div style="background:#6366f1; width:32px; height:32px; border-radius:8px; display:flex; align-items:center; justify-content:center; color:white; font-weight:bold;">P</div>
-                        <span style="font-weight:800; font-size:1.2rem; color:#1e293b; letter-spacing:-0.5px;">paymongo</span>
-                      </div>
-                      <div style="color:#64748b; font-size:0.9rem;">Test Mode</div>
-                    </div>
+                                                                                                      <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:#f4f7f9; z-index:2147483649; display:flex; flex-direction:column; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+                                                                                                        <!-- Header -->
+                                                                                                        <div style="background:white; padding:1.5rem 2rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #e2e8f0;">
+                                                                                                          <div style="display:flex; align-items:center; gap:10px;">
+                                                                                                            <div style="background:#6366f1; width:32px; height:32px; border-radius:8px; display:flex; align-items:center; justify-content:center; color:white; font-weight:bold;">P</div>
+                                                                                                            <span style="font-weight:800; font-size:1.2rem; color:#1e293b; letter-spacing:-0.5px;">paymongo</span>
+                                                                                                          </div>
+                                                                                                          <div style="color:#64748b; font-size:0.9rem;">Test Mode</div>
+                                                                                                        </div>
 
-                    <div style="flex:1; display:flex; align-items:center; justify-content:center; padding:2rem;">
-                      <div style="background:white; width:100%; max-width:400px; border-radius:20px; box-shadow:0 20px 25px -5px rgba(0,0,0,0.1); overflow:hidden; border:1px solid #e2e8f0;">
-                        <div style="padding:2rem; text-align:center; border-bottom:1px solid #f1f5f9; background:#f8fafc;">
-                          <div style="color:#64748b; font-size:0.85rem; text-transform:uppercase; font-weight:700; letter-spacing:1px; margin-bottom:0.5rem;">Amount to Pay</div>
-                          <div style="font-size:2.5rem; font-weight:900; color:#1e293b;">₱${parseFloat(amount).toLocaleString()}</div>
-                          <div style="font-size:0.9rem; color:#64748b; margin-top:0.5rem;">${planName}</div>
-                        </div>
+                                                                                                        <div style="flex:1; display:flex; align-items:center; justify-content:center; padding:2rem;">
+                                                                                                          <div style="background:white; width:100%; max-width:400px; border-radius:20px; box-shadow:0 20px 25px -5px rgba(0,0,0,0.1); overflow:hidden; border:1px solid #e2e8f0;">
+                                                                                                            <div style="padding:2rem; text-align:center; border-bottom:1px solid #f1f5f9; background:#f8fafc;">
+                                                                                                              <div style="color:#64748b; font-size:0.85rem; text-transform:uppercase; font-weight:700; letter-spacing:1px; margin-bottom:0.5rem;">Amount to Pay</div>
+                                                                                                              <div style="font-size:2.5rem; font-weight:900; color:#1e293b;">₱${parseFloat(amount).toLocaleString()}</div>
+                                                                                                              <div style="font-size:0.9rem; color:#64748b; margin-top:0.5rem;">${planName}</div>
+                                                                                                            </div>
 
-                        <div style="padding:2rem;">
-                          <div style="margin-bottom:2rem;">
-                            <div style="display:flex; justify-content:space-between; margin-bottom:0.8rem; font-size:0.9rem;">
-                              <span style="color:#64748b;">Payment Method</span>
-                              <span style="font-weight:700; color:#1e293b;">${method}</span>
-                            </div>
-                            <div style="display:flex; justify-content:space-between; font-size:0.9rem;">
-                              <span style="color:#64748b;">Reference</span>
-                              <span style="font-weight:700; color:#1e293b;">PM-${Math.random().toString(36).substr(2, 9).toUpperCase()}</span>
-                            </div>
-                          </div>
+                                                                                                            <div style="padding:2rem;">
+                                                                                                              <div style="margin-bottom:2rem;">
+                                                                                                                <div style="display:flex; justify-content:space-between; margin-bottom:0.8rem; font-size:0.9rem;">
+                                                                                                                  <span style="color:#64748b;">Payment Method</span>
+                                                                                                                  <span style="font-weight:700; color:#1e293b;">${method}</span>
+                                                                                                                </div>
+                                                                                                                <div style="display:flex; justify-content:space-between; font-size:0.9rem;">
+                                                                                                                  <span style="color:#64748b;">Reference</span>
+                                                                                                                  <span style="font-weight:700; color:#1e293b;">PM-${Math.random().toString(36).substr(2, 9).toUpperCase()}</span>
+                                                                                                                </div>
+                                                                                                              </div>
 
-                          <button id="payNow_${modalId}" style="width:100%; padding:1rem; background:#6366f1; color:white; border:none; border-radius:12px; font-weight:700; font-size:1.1rem; cursor:pointer; transition:0.3s; margin-bottom:1rem;">
-                            Pay Now with ${method}
-                          </button>
+                                                                                                              <button id="payNow_${modalId}" style="width:100%; padding:1rem; background:#6366f1; color:white; border:none; border-radius:12px; font-weight:700; font-size:1.1rem; cursor:pointer; transition:0.3s; margin-bottom:1rem;">
+                                                                                                                Pay Now with ${method}
+                                                                                                              </button>
                       
-                          <button id="cancelPay_${modalId}" style="width:100%; background:none; border:none; color:#94a3b8; font-size:0.9rem; cursor:pointer;">
-                            Cancel Transaction
-                          </button>
-                        </div>
-                      </div>
-                    </div>
+                                                                                                              <button id="cancelPay_${modalId}" style="width:100%; background:none; border:none; color:#94a3b8; font-size:0.9rem; cursor:pointer;">
+                                                                                                                Cancel Transaction
+                                                                                                              </button>
+                                                                                                            </div>
+                                                                                                          </div>
+                                                                                                        </div>
 
-                    <div id="loading_${modalId}" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(255,255,255,0.95); z-index:10; flex-direction:column; align-items:center; justify-content:center;">
-                      <div style="width:50px; height:50px; border:4px solid #f3f3f3; border-top:4px solid #6366f1; border-radius:50%; animation: spin 1s linear infinite; margin-bottom:1.5rem;"></div>
-                      <div style="font-weight:700; color:#1e293b; font-size:1.2rem;">Authorizing Payment...</div>
-                      <div style="color:#64748b; margin-top:0.5rem;">Please do not close this window</div>
-                    </div>
+                                                                                                        <div id="loading_${modalId}" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(255,255,255,0.95); z-index:10; flex-direction:column; align-items:center; justify-content:center;">
+                                                                                                          <div style="width:50px; height:50px; border:4px solid #f3f3f3; border-top:4px solid #6366f1; border-radius:50%; animation: spin 1s linear infinite; margin-bottom:1.5rem;"></div>
+                                                                                                          <div style="font-weight:700; color:#1e293b; font-size:1.2rem;">Authorizing Payment...</div>
+                                                                                                          <div style="color:#64748b; margin-top:0.5rem;">Please do not close this window</div>
+                                                                                                        </div>
 
-                    <style>
-                      @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-                    </style>
-                  </div>`;
+                                                                                                        <style>
+                                                                                                          @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+                                                                                                        </style>
+                                                                                                      </div>`;
                   document.body.insertAdjacentHTML('beforeend', modalHTML);
 
                   document.getElementById('payNow_' + modalId).onclick = function () {
@@ -5964,77 +8849,77 @@ try {
                   const originalHtml = btn ? btn.innerHTML : '<i class="fas fa-bolt"></i> Renew Subscription';
 
                   const proceedWithRenewal = (method) => {
-                    <?php
-                    $r_cycle = strtolower($active_subscription['billing_cycle'] ?? 'monthly');
-                    $r_amount = ($r_cycle === 'yearly') ? ($active_subscription['price_yearly'] > 0 ? $active_subscription['price_yearly'] : ($active_subscription['price'] * 12 * 0.8)) : $active_subscription['price'];
-                    ?>
-                    const amount = "<?php echo $r_amount; ?>";
+                                                                                                        <?php
+                                                                                                        $r_cycle = strtolower($active_subscription['billing_cycle'] ?? 'monthly');
+                                                                                                        $r_amount = ($r_cycle === 'yearly') ? ($active_subscription['price_yearly'] > 0 ? $active_subscription['price_yearly'] : ($active_subscription['price'] * 12 * 0.8)) : $active_subscription['price'];
+                                                                                                        ?>
+                                                                                                        const amount = "<?php echo $r_amount; ?>";
 
-                    showPayMongoSimulation(amount, method, "Subscription Renewal", () => {
-                      if (btn) {
-                        btn.disabled = true;
-                        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
-                      }
+                  showPayMongoSimulation(amount, method, "Subscription Renewal", () => {
+                    if (btn) {
+                      btn.disabled = true;
+                      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
+                    }
 
-                      const fd = new FormData();
-                      fd.append('method', method);
+                    const fd = new FormData();
+                    fd.append('method', method);
 
-                      fetch('tenant-dashboard.php?action=renew_subscription', { method: 'POST', body: fd })
-                        .then(res => res.json())
-                        .then(data => {
-                          if (data.status === 'success') {
-                            alert("\u2705 Success! Subscription renewed via " + method);
-                            location.reload();
-                          } else {
-                            alert("\u274C Error: " + data.message);
-                            if (btn) { btn.disabled = false; btn.innerHTML = originalHtml; }
-                          }
-                        })
-                        .catch(err => {
-                          alert("\u274C System Error: " + err.message);
+                    fetch('tenant-dashboard.php?action=renew_subscription', { method: 'POST', body: fd })
+                      .then(res => res.json())
+                      .then(data => {
+                        if (data.status === 'success') {
+                          alert("\u2705 Success! Subscription renewed via " + method);
+                          location.reload();
+                        } else {
+                          alert("\u274C Error: " + data.message);
                           if (btn) { btn.disabled = false; btn.innerHTML = originalHtml; }
-                        });
-                    });
-                  };
-
-                  // DYNAMIC MODAL (With Payment Selection)
-                  const modalId = 'dynamicRenewModal_' + Date.now();
-                  const modalHTML = `
-                  <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.9); backdrop-filter:blur(15px); z-index:9999999; display:flex; align-items:center; justify-content:center; padding:20px;">
-                    <div style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:32px; padding:3rem; width:100%; max-width:480px; text-align:center; box-shadow:0 30px 60px rgba(0,0,0,0.8);">
-                      <div style="width:80px; height:80px; background:linear-gradient(135deg, #6366f1 0%, #a855f7 100%); border-radius:50%; display:flex; align-items:center; justify-content:center; margin:0 auto 2rem; color:white; font-size:2.5rem; box-shadow:0 10px 25px rgba(99, 102, 241, 0.4);">
-                        <i class="fas fa-credit-card"></i>
-                      </div>
-                      <h2 style="color:white; margin-bottom:0.8rem; font-size:1.8rem; font-weight:800;">Renew Subscription</h2>
-                      <p style="color:#94a3b8; margin-bottom:2rem; line-height:1.6;">${confirmMsg}</p>
-                  
-                      <div style="text-align:left; margin-bottom:2.5rem;">
-                        <label style="color:white; font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; display:block; opacity:0.7;">Payment Method</label>
-                        <select id="payMethod_${modalId}">
-                          <option value="GCASH" style="background:#111827;">GCash</option>
-                          <option value="MAYA" style="background:#111827;">Maya</option>
-                          <option value="BANK_TRANSFER" style="background:#111827;">Bank Transfer (BDO/BPI)</option>
-                          <option value="CARD" style="background:#111827;">Credit/Debit Card</option>
-                        </select>
-                      </div>
-
-                      <div style="display:flex; gap:15px; justify-content:center;">
-                        <button id="btnConfirm_${modalId}" style="flex:2; padding:16px; background:#6366f1; color:white; border:none; border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem; transition:0.3s; box-shadow:0 10px 20px rgba(99, 102, 241, 0.3);">Go to Payment</button>
-                        <button id="btnCancel_${modalId}" style="flex:1; padding:16px; background:rgba(255,255,255,0.05); color:white; border:1px solid rgba(255,255,255,0.1); border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem;">Cancel</button>
-                      </div>
-                    </div>
-                  </div>`;
-                  document.body.insertAdjacentHTML('beforeend', modalHTML);
-
-                  document.getElementById('btnConfirm_' + modalId).onclick = function () {
-                    const selectedMethod = document.getElementById('payMethod_' + modalId).value;
-                    document.getElementById(modalId).remove();
-                    proceedWithRenewal(selectedMethod);
-                  };
-                  document.getElementById('btnCancel_' + modalId).onclick = function () {
-                    document.getElementById(modalId).remove();
-                  };
+                        }
+                      })
+                      .catch(err => {
+                        alert("\u274C System Error: " + err.message);
+                        if (btn) { btn.disabled = false; btn.innerHTML = originalHtml; }
+                      });
+                  });
                 };
+
+                // DYNAMIC MODAL (With Payment Selection)
+                const modalId = 'dynamicRenewModal_' + Date.now();
+                const modalHTML = `
+                                                                                                      <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.9); backdrop-filter:blur(15px); z-index:9999999; display:flex; align-items:center; justify-content:center; padding:20px;">
+                                                                                                        <div style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:32px; padding:3rem; width:100%; max-width:480px; text-align:center; box-shadow:0 30px 60px rgba(0,0,0,0.8);">
+                                                                                                          <div style="width:80px; height:80px; background:linear-gradient(135deg, #6366f1 0%, #a855f7 100%); border-radius:50%; display:flex; align-items:center; justify-content:center; margin:0 auto 2rem; color:white; font-size:2.5rem; box-shadow:0 10px 25px rgba(99, 102, 241, 0.4);">
+                                                                                                            <i class="fas fa-credit-card"></i>
+                                                                                                          </div>
+                                                                                                          <h2 style="color:white; margin-bottom:0.8rem; font-size:1.8rem; font-weight:800;">Renew Subscription</h2>
+                                                                                                          <p style="color:#94a3b8; margin-bottom:2rem; line-height:1.6;">${confirmMsg}</p>
+                  
+                                                                                                          <div style="text-align:left; margin-bottom:2.5rem;">
+                                                                                                            <label style="color:white; font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; display:block; opacity:0.7;">Payment Method</label>
+                                                                                                            <select id="payMethod_${modalId}">
+                                                                                                              <option value="GCASH" style="background:#111827;">GCash</option>
+                                                                                                              <option value="MAYA" style="background:#111827;">Maya</option>
+                                                                                                              <option value="BANK_TRANSFER" style="background:#111827;">Bank Transfer (BDO/BPI)</option>
+                                                                                                              <option value="CARD" style="background:#111827;">Credit/Debit Card</option>
+                                                                                                            </select>
+                                                                                                          </div>
+
+                                                                                                          <div style="display:flex; gap:15px; justify-content:center;">
+                                                                                                            <button id="btnConfirm_${modalId}" style="flex:2; padding:16px; background:#6366f1; color:white; border:none; border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem; transition:0.3s; box-shadow:0 10px 20px rgba(99, 102, 241, 0.3);">Go to Payment</button>
+                                                                                                            <button id="btnCancel_${modalId}" style="flex:1; padding:16px; background:rgba(255,255,255,0.05); color:white; border:1px solid rgba(255,255,255,0.1); border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem;">Cancel</button>
+                                                                                                          </div>
+                                                                                                        </div>
+                                                                                                      </div>`;
+                document.body.insertAdjacentHTML('beforeend', modalHTML);
+
+                document.getElementById('btnConfirm_' + modalId).onclick = function () {
+                  const selectedMethod = document.getElementById('payMethod_' + modalId).value;
+                  document.getElementById(modalId).remove();
+                  proceedWithRenewal(selectedMethod);
+                };
+                document.getElementById('btnCancel_' + modalId).onclick = function () {
+                  document.getElementById(modalId).remove();
+                };
+                    };
               </script>
             <?php endif; ?>
           </div>
@@ -6315,15 +9200,34 @@ try {
           <input type="hidden" name="bay_id" id="assign_bay_id">
 
           <div style="margin-bottom:1.5rem;">
-            <label
-              style="display:block; margin-bottom:10px; font-size:0.85rem; font-weight:700; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px;">1.
-              Client Machine</label>
-            <div
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+              <label
+                style="font-size:0.85rem; font-weight:700; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px;">1.
+                Client Machine</label>
+              <button type="button" onclick="window.toggleQuickRegister()" id="quickRegBtn"
+                style="background:none; border:none; color:var(--accent); font-size:0.75rem; font-weight:700; cursor:pointer; text-decoration:underline;">
+                + Register New
+              </button>
+            </div>
+
+            <div id="existingVehicleGroup"
               style="position:relative; background:#0f172a !important; border-radius:15px; border:1px solid rgba(255,255,255,0.1); min-height:55px; transition:0.3s; display:flex; align-items:center;">
               <i class="fas fa-car" style="position:absolute; left:1.2rem; color:var(--accent); z-index:10;"></i>
-              <select name="vehicle_id" id="assign_vehicle_id" required></select>
+              <select name="vehicle_id" id="assign_vehicle_id"></select>
               <i class="fas fa-chevron-down"
                 style="position:absolute; right:1.2rem; color:rgba(255,255,255,0.5); font-size:0.8rem; pointer-events:none; z-index:10;"></i>
+            </div>
+
+            <div id="quickRegisterGroup"
+              style="display:none; flex-direction:column; gap:0.8rem; background:rgba(255,255,255,0.03); padding:1.2rem; border-radius:15px; border:1px solid rgba(var(--accent-rgb), 0.2);">
+              <input type="text" name="new_customer_name" placeholder="Full Customer Name"
+                style="width:100%; background:rgba(0,0,0,0.2); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; outline:none;">
+              <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.8rem;">
+                <input type="text" name="new_plate_no" placeholder="Plate Number"
+                  style="width:100%; background:rgba(0,0,0,0.2); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; outline:none;">
+                <input type="text" name="new_model" placeholder="Model (e.g. Vios)"
+                  style="width:100%; background:rgba(0,0,0,0.2); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; outline:none;">
+              </div>
             </div>
           </div>
 
@@ -6354,10 +9258,8 @@ try {
           </div>
 
           <button type="button" onclick="processBayAssignment()"
-            style="width:100%; background:var(--accent); color:white; border:none; padding:1.2rem; border-radius:18px; font-weight:800; font-size:1.1rem; cursor:pointer; box-shadow:0 20px 40px var(--accent-glow); transition:0.3s; display:flex; align-items:center; justify-content:center; gap:12px;"
-            onmouseover="this.style.transform='translateY(-3px)'; this.style.boxShadow='0 25px 50px var(--accent-glow)';"
-            onmouseout="this.style.transform='translateY(0)'; this.style.boxShadow='0 20px 40px var(--accent-glow)';">
-            <i class="fas fa-bolt"></i> Establish Operational Flow
+            style="width:100%; background:linear-gradient(135deg, var(--accent), #059669); color:white; border:none; padding:1.2rem; border-radius:15px; font-weight:800; font-size:1rem; cursor:pointer; box-shadow:0 15px 35px var(--accent-glow); display:flex; align-items:center; justify-content:center; gap:12px; transition:0.3s;">
+            <i class="fas fa-play-circle"></i> Start Walk-in Repair
           </button>
         </form>
       </div>
@@ -6379,10 +9281,10 @@ try {
     </style>
 
     <!-- Management-Style Profile View -->
-    <div id="my_profile" class="view-section" style="display: none; width: 100%; padding-top: 2rem;">
-      <div class="glass-panel" style="padding: 3rem; width: 100%;">
+    <div id="my_profile" class="view-section" style="display: none; width: 100%; padding-top: 1rem;">
+      <div class="glass-panel" style="padding: 2.5rem 3rem 3rem; width: 100%;">
         <!-- Header Area (Matching Staff Management) -->
-        <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 3.5rem;">
+        <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 2rem;">
           <div>
             <h2 style="margin: 0; font-size: 1.5rem; font-weight: 800; color: #fff;">Account Profile</h2>
             <p style="margin: 5px 0 0; color: var(--text-dim); font-size: 0.9rem;">Management of your personal presence
@@ -6397,7 +9299,7 @@ try {
         </div>
 
         <!-- Content Area -->
-        <div style="display: grid; grid-template-columns: 280px 1fr; gap: 4rem; align-items: center;">
+        <div style="display: grid; grid-template-columns: 280px 1fr; gap: 4rem; align-items: start;">
           <!-- Left: Avatar Focus -->
           <div style="text-align: center; border-right: 1px solid rgba(255,255,255,0.05); padding-right: 4rem;">
             <div style="position: relative; width: 180px; height: 180px; margin: 0 auto 1.5rem;">
@@ -6417,9 +9319,15 @@ try {
                 style="position: absolute; bottom: -10px; right: -10px; width: 50px; height: 50px; border-radius: 15px; background: #fff; color: #000; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 1.3rem; box-shadow: 0 10px 20px rgba(0,0,0,0.2); transition: 0.3s;">
                 <i class="fas fa-camera"></i>
               </button>
+              <form id="updateProfileFormView" style="display:none;">
+                <input type="file" id="profile_pic_input_view" name="profile_pic" accept="image/*"
+                  onchange="document.getElementById('updateProfileBtn_view').click()">
+                <button type="submit" id="updateProfileBtn_view"></button>
+              </form>
             </div>
             <h3 style="margin: 0; font-size: 1.4rem; font-weight: 700; color: #fff;">
-              <?php echo htmlspecialchars($_SESSION['name'] ?? 'User'); ?></h3>
+              <?php echo htmlspecialchars($_SESSION['name'] ?? 'User'); ?>
+            </h3>
             <p
               style="margin: 5px 0 0; color: var(--text-dim); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 2px; font-weight: 800;">
               Member since 2024</p>
@@ -6431,8 +9339,9 @@ try {
               <span
                 style="color: var(--text-dim); font-size: 0.8rem; text-transform: uppercase; font-weight: 800; letter-spacing: 1.5px;">Display
                 Name</span>
-              <span
-                style="font-size: 1.2rem; font-weight: 600; color: #fff;"><?php echo htmlspecialchars($_SESSION['name'] ?? 'N/A'); ?></span>
+              <span style="font-size: 1.2rem; font-weight: 600; color: #fff;">
+                <?php echo htmlspecialchars($_SESSION['name'] ?? 'N/A'); ?>
+              </span>
             </div>
 
             <div style="display: grid; grid-template-columns: 200px 1fr; align-items: center;">
@@ -6440,7 +9349,9 @@ try {
                 style="color: var(--text-dim); font-size: 0.8rem; text-transform: uppercase; font-weight: 800; letter-spacing: 1.5px;">Security
                 Role</span>
               <div style="display: flex; align-items: center; gap: 12px;">
-                <span style="font-size: 1.2rem; font-weight: 600; color: #fff;"><?php echo $role; ?></span>
+                <span style="font-size: 1.2rem; font-weight: 600; color: #fff;">
+                  <?php echo $role; ?>
+                </span>
                 <i class="fas fa-shield-check" style="color: var(--accent); font-size: 1.1rem;"></i>
               </div>
             </div>
@@ -6450,7 +9361,9 @@ try {
                 style="color: var(--text-dim); font-size: 0.8rem; text-transform: uppercase; font-weight: 800; letter-spacing: 1.5px;">Workshop
                 ID</span>
               <span
-                style="font-size: 1.1rem; font-weight: 600; color: var(--text-dim); font-family: monospace; letter-spacing: 1px;">#<?php echo str_pad($_SESSION['user_id'] ?? '0', 6, '0', STR_PAD_LEFT); ?></span>
+                style="font-size: 1.1rem; font-weight: 600; color: var(--text-dim); font-family: monospace; letter-spacing: 1px;">#
+                <?php echo str_pad($_SESSION['user_id'] ?? '0', 6, '0', STR_PAD_LEFT); ?>
+              </span>
             </div>
 
             <div
@@ -6458,6 +9371,131 @@ try {
               <i class="fas fa-info-circle" style="color: var(--accent);"></i>
               To modify these details, please contact your System Administrator.
             </div>
+
+            <?php if (strtoupper($role) === 'MECHANIC' && $my_shift): ?>
+              <div style="margin-top: 2rem; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 2rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+                  <div style="display:flex; align-items:center; gap:12px;">
+                    <h4 style="margin: 0; color: #fff; font-size: 1.1rem; font-weight: 700;">Working Hours</h4>
+                    <?php if ($my_pending_shift_request): ?>
+                      <?php
+                      $s = $my_pending_shift_request['status'];
+                      $color = '#64748b'; // default
+                      $bg = 'rgba(100,116,139,0.1)';
+                      $icon = 'clock';
+                      if ($s === 'PENDING') {
+                        $color = '#fbbf24';
+                        $bg = 'rgba(251,191,36,0.1)';
+                        $icon = 'hourglass-half';
+                      }
+                      if ($s === 'APPROVED') {
+                        $color = '#10b981';
+                        $bg = 'rgba(16,185,129,0.1)';
+                        $icon = 'check-circle';
+                      }
+                      if ($s === 'REJECTED') {
+                        $color = '#ef4444';
+                        $bg = 'rgba(239,68,68,0.1)';
+                        $icon = 'times-circle';
+                      }
+                      ?>
+                      <span class="badge"
+                        style="background: <?php echo $bg; ?>; color: <?php echo $color; ?>; border: 1px solid <?php echo str_replace('0.1', '0.2', $bg); ?>; font-size:0.7rem; padding:4px 10px; display:inline-flex; align-items:center; gap:5px;">
+                        <i class="fas fa-<?php echo $icon; ?>"></i>
+                        <?php echo $s; ?>
+                      </span>
+                    <?php endif; ?>
+                  </div>
+                  <button onclick="openModal('shiftRequestModal')" class="btn-action"
+                    style="padding: 10px 20px; font-size: 0.85rem; border-radius:15px; background:var(--accent); color:white; border:none; font-weight:700; cursor:pointer; transition:all 0.3s; box-shadow: 0 4px 15px rgba(var(--accent-rgb), 0.2);"
+                    onmouseover="this.style.transform='translateY(-2px)';"
+                    onmouseout="this.style.transform='translateY(0)';">Request Change</button>
+                </div>
+
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                  <div
+                    style="background: linear-gradient(135deg, rgba(var(--accent-rgb), 0.1), rgba(var(--accent-rgb), 0.02)); padding: 2rem; border-radius: 28px; border: 1px solid rgba(var(--accent-rgb), 0.1); position:relative; overflow:hidden;">
+                    <div
+                      style="position:absolute; top:-20px; left:-20px; width:80px; height:80px; background:var(--accent); opacity:0.05; filter:blur(30px); border-radius:50%;">
+                    </div>
+                    <div
+                      style="font-size: 0.75rem; color: var(--text-dim); text-transform: uppercase; font-weight:800; letter-spacing:1px; margin-bottom: 12px;">
+                      Shift Start</div>
+                    <div style="font-size: 1.5rem; font-weight: 800; color: #fff; letter-spacing:-0.5px;">
+                      <?php echo date('h:i A', strtotime($my_shift['shift_start'])); ?>
+                    </div>
+                    <i class="fas fa-sun"
+                      style="position:absolute; bottom:15px; right:15px; font-size:1.2rem; opacity:0.1; color:var(--accent);"></i>
+                  </div>
+                  <div
+                    style="background: linear-gradient(135deg, rgba(var(--accent-rgb), 0.1), rgba(var(--accent-rgb), 0.02)); padding: 2rem; border-radius: 28px; border: 1px solid rgba(var(--accent-rgb), 0.1); position:relative; overflow:hidden;">
+                    <div
+                      style="position:absolute; top:-20px; left:-20px; width:80px; height:80px; background:var(--accent); opacity:0.05; filter:blur(30px); border-radius:50%;">
+                    </div>
+                    <div
+                      style="font-size: 0.75rem; color: var(--text-dim); text-transform: uppercase; font-weight:800; letter-spacing:1px; margin-bottom: 12px;">
+                      Shift End</div>
+                    <div style="font-size: 1.5rem; font-weight: 800; color: #fff; letter-spacing:-0.5px;">
+                      <?php echo date('h:i A', strtotime($my_shift['shift_end'])); ?>
+                    </div>
+                    <i class="fas fa-moon"
+                      style="position:absolute; bottom:15px; right:15px; font-size:1.2rem; opacity:0.1; color:var(--accent);"></i>
+                  </div>
+                </div>
+
+                <div
+                  style="margin-top: 20px; background: linear-gradient(135deg, rgba(var(--accent-rgb), 0.1), rgba(var(--accent-rgb), 0.02)); padding: 1.5rem 2rem; border-radius: 28px; border: 1px solid rgba(var(--accent-rgb), 0.1); position:relative; overflow:hidden; display:flex; align-items:center; gap:20px;">
+                  <div
+                    style="position:absolute; top:-20px; left:-20px; width:80px; height:80px; background:var(--accent); opacity:0.05; filter:blur(30px); border-radius:50%;">
+                  </div>
+                  <div
+                    style="width:45px; height:45px; border-radius:12px; background:rgba(var(--accent-rgb), 0.1); display:flex; align-items:center; justify-content:center; color:var(--accent); font-size:1.2rem;">
+                    <i class="fas fa-calendar-week"></i>
+                  </div>
+                  <div>
+                    <div
+                      style="font-size: 0.7rem; color: var(--text-dim); text-transform: uppercase; font-weight:800; letter-spacing:1px; margin-bottom: 4px;">
+                      Scheduled Work Days</div>
+                    <div style="font-size: 0.95rem; font-weight: 700; color: #fff;">
+                      <?php echo implode(' · ', array_map('trim', explode(',', $my_shift['shift_days'] ?? 'Mon,Tue,Wed,Thu,Fri,Sat'))); ?>
+                    </div>
+                  </div>
+                </div>
+
+                <?php if ($my_pending_shift_request && $my_pending_shift_request['status'] === 'PENDING'): ?>
+                  <div
+                    style="margin-top: 1.5rem; padding: 1.2rem; background: rgba(251,191,36,0.05); border: 1px solid rgba(251,191,36,0.1); border-radius: 18px; font-size: 0.85rem; color: #fbbf24; display: flex; align-items: flex-start; gap: 12px;">
+                    <i class="fas fa-history" style="margin-top: 3px;"></i>
+                    <div>
+                      <div style="font-weight: 700; margin-bottom: 4px;">Pending Change Request</div>
+                      Requested New Hours:
+                      <strong>
+                        <?php echo date('h:i A', strtotime($my_pending_shift_request['requested_start'])); ?> -
+                        <?php echo date('h:i A', strtotime($my_pending_shift_request['requested_end'])); ?>
+                      </strong>
+                    </div>
+                  </div>
+                <?php elseif ($my_pending_shift_request && $my_pending_shift_request['status'] === 'APPROVED'): ?>
+                  <div
+                    style="margin-top: 1.5rem; padding: 1.2rem; background: rgba(16,185,129,0.05); border: 1px solid rgba(16,185,129,0.1); border-radius: 18px; font-size: 0.85rem; color: #10b981; display: flex; align-items: flex-start; gap: 12px;">
+                    <i class="fas fa-check-circle" style="margin-top: 3px;"></i>
+                    <div>
+                      <div style="font-weight: 700; margin-bottom: 4px;">Request Approved</div>
+                      Your schedule has been updated to the new requested hours.
+                    </div>
+                  </div>
+                <?php elseif ($my_pending_shift_request && $my_pending_shift_request['status'] === 'REJECTED'): ?>
+                  <div
+                    style="margin-top: 1.5rem; padding: 1.2rem; background: rgba(239,68,68,0.05); border: 1px solid rgba(239,68,68,0.1); border-radius: 18px; font-size: 0.85rem; color: #ef4444; display: flex; align-items: flex-start; gap: 12px;">
+                    <i class="fas fa-times-circle" style="margin-top: 3px;"></i>
+                    <div>
+                      <div style="font-weight: 700; margin-bottom: 4px;">Request Rejected</div>
+                      Your shift change request was declined. Please coordinate with management.
+                    </div>
+                  </div>
+                <?php endif; ?>
+              </div>
+            <?php endif; ?>
           </div>
         </div>
       </div>
@@ -6510,47 +9548,48 @@ try {
       }
     }
 
-    window.refreshStaffList = function () {
+    window.renderStaffTable = function () {
+      const body = document.getElementById('staffBody');
+      if (!body) return;
+
       fetch(getUrl('fetch_staff'))
-        .then(res => res.text())
-        .then(text => {
-          try {
-            const jsonMatch = text.match(/\[.*\]/s);
-            if (!jsonMatch) throw new Error("No JSON found");
-            const data = JSON.parse(jsonMatch[0]);
-            const body = document.getElementById('staffBody');
-            if (!body) return;
+        .then(res => res.json())
+        .then(data => {
+          if (!Array.isArray(data) || data.length === 0) {
+            body.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--text-dim); padding:2rem;">No staff accounts found.</td></tr>`;
+            return;
+          }
 
-            if (data.length === 0) {
-              body.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--text-dim);">No staff accounts found.</td></tr>`;
-              return;
-            }
+          body.innerHTML = data.map(s => {
+            const isSelf = (s.user_id == currentUserId);
+            const isTargetOwner = (s.role_name && s.role_name.toUpperCase() === 'OWNER');
+            const cannotManage = isSelf || (userRole.toUpperCase() === 'MANAGER' && isTargetOwner);
 
-            body.innerHTML = data.map(s => {
-              const isSelf = (s.user_id == currentUserId);
-              const isTargetOwner = (s.role_name && s.role_name.toUpperCase() === 'OWNER');
-              // Managers cannot manage Owners
-              const cannotManage = isSelf || (userRole.toUpperCase() === 'MANAGER' && isTargetOwner);
-
-              return `
-              <tr>
-                <td><strong>${s.name}</strong></td>
-                <td>${s.email}</td>
-                <td><span class="badge badge-active" style="font-size:0.75rem; letter-spacing:1px;">${s.role_name || 'STAFF'}</span></td>
+            return `
+              <tr style="transition:0.3s;">
+                <td style="padding:1rem 0.5rem;">
+                  <div style="display:flex; align-items:center; gap:12px;">
+                    <div style="width:36px; height:36px; border-radius:10px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); overflow:hidden; display:flex; align-items:center; justify-content:center; flex-shrink:0; box-shadow:0 4px 10px rgba(0,0,0,0.2);">
+                      ${s.profile_pic ? `<img src="${s.profile_pic}" style="width:100%; height:100%; object-fit:cover;">` : `<span style="font-size:0.85rem; font-weight:800; color:var(--accent);">${(s.name || 'U').charAt(0).toUpperCase()}</span>`}
+                    </div>
+                    <strong style="font-size:0.95rem; color:#fff;">${s.name}</strong>
+                  </div>
+                </td>
+                <td style="color:var(--text-dim); font-size:0.9rem;">${s.email}</td>
+                <td><span class="badge" style="background:rgba(255,255,255,0.05); color:var(--accent); font-size:0.75rem; border:1px solid rgba(255,255,255,0.1);">${s.role_name || 'STAFF'}</span></td>
                 <td><span class="badge ${s.status === 'ACTIVE' ? 'badge-active' : 'badge-danger'}">${s.status || 'ACTIVE'}</span></td>
                 <td>
                   <button class="btn-outline staff-manage-btn" 
-                    style="display:inline-block; padding:8px 16px; font-size:0.75rem; border-radius:10px; border:2px solid var(--accent) !important; color:#000 !important; background:var(--accent) !important; position:relative; z-index:9999 !important; pointer-events:auto !important; cursor:pointer !important; font-weight:800; box-shadow:0 0 15px var(--accent-glow); ${cannotManage ? 'opacity:0.4; filter:grayscale(1); pointer-events:none !important;' : ''}"
+                    style="display:inline-block; padding:8px 16px; font-size:0.75rem; border-radius:10px; border:2px solid var(--accent) !important; color:#000 !important; background:var(--accent) !important; font-weight:800; box-shadow:0 0 15px var(--accent-glow); ${cannotManage ? 'opacity:0.4; filter:grayscale(1); pointer-events:none !important;' : ''}"
                     onclick="event.stopPropagation(); window.openStaffManageModal(${s.user_id});">
                     ${isSelf ? 'You' : (isTargetOwner ? 'Owner' : 'Manage')}
                   </button>
                 </td>
               </tr>`;
-            }).join('');
-          } catch (e) {
-            console.error("Staff Refresh Scrub Failed:", text);
-            body.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--danger);">Error rendering staff list.</td></tr>`;
-          }
+          }).join('');
+        }).catch(err => {
+          console.error("Staff Refresh Failed:", err);
+          body.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--danger); padding:2rem;">Error loading staff list.</td></tr>`;
         });
     }
 
@@ -6569,49 +9608,15 @@ try {
         if (res.status === 'success') {
           showAlert('Success', 'Staff access updated successfully.', 'success');
           closeModal('staffManageModal');
-          refreshStaffList();
+          renderStaffTable();
         } else {
           showAlert('Error', res.message, 'error');
         }
       });
     };
 
-    function refreshBaysList() {
-      fetch(getUrl('fetch_bays'))
-        .then(res => res.json()).then(data => {
-          const grid = document.getElementById('baysGrid');
-          if (!grid) return;
-          if (data.length === 0) { grid.innerHTML = '<p style="color:var(--text-dim);">No service bays registered.</p>'; return; }
-          grid.innerHTML = data.map(bay => {
-            const isAvail = bay.status === 'AVAILABLE';
-            const action = isAvail ? `openBayProfile(${bay.bay_id})` : `viewJobInBay(${bay.active_job_id}, '${bay.job_status}', ${bay.active_mechanic_id || 'null'}, ${bay.bay_id})`;
-            return `
-            <div class="bay-card" style="border:1px solid rgba(255,255,255,0.08); background:rgba(255,255,255,0.02); padding:2.2rem 2rem; border-radius:28px; position:relative; overflow:hidden;">
-              <div style="position:absolute; top:-30px; right:-30px; width:120px; height:120px; background:${isAvail ? 'var(--accent)' : '#ef4444'}; opacity:0.05; filter:blur(40px);"></div>
-              <span class="badge ${isAvail ? 'badge-active' : ''}" style="${!isAvail ? 'background:rgba(239,68,68,0.1); color:#ef4444; border:1px solid rgba(239,68,68,0.2);' : ''} font-weight:800;">
-                <i class="fas fa-${isAvail ? 'check-circle' : 'tools'}"></i> ${bay.status}
-              </span>
-              <h2 style="margin:1.2rem 0 0.5rem; font-size:1.8rem; font-weight:900; letter-spacing:-1px;">${bay.bay_name}</h2>
-              <button class="btn-action" style="width:100%; margin-top:1.5rem; background:${isAvail ? 'var(--accent)' : 'rgba(239,68,68,0.1)'}; color:${isAvail ? 'white' : '#ef4444'}; border:1px solid ${isAvail ? 'transparent' : 'rgba(239,68,68,0.3)'}; padding:1rem; border-radius:15px; font-weight:800; cursor:pointer; transition:all 0.4s; box-shadow:${isAvail ? '0 8px 20px rgba(var(--accent-rgb), 0.2)' : 'none'}; display:flex; align-items:center; justify-content:center; gap:10px;" 
-                  onmouseover="this.style.transform='translateY(-3px)'; ${isAvail ? '' : "this.style.background='#ef4444'; this.style.color='white';"}"
-    onmouseout = "this.style.transform='translateY(0)'; ${isAvail ? '' : "this.style.background = 'rgba(239,68,68,0.1)'; this.style.color = '#ef4444'; "}"
-    onclick = "${action}" >
-      ${isAvail ? '<i class="fas fa-eye"></i> View Bay Profile' : '<i class="fas fa-tools"></i> Repair Details'}
-              </button >
-            </div>`;
-          }).join('');
-        });
-    }
+    // Redundant Bay logic removed (Moved to top engine)
 
-    function viewJobInBay(jobId, status, mechId, bayId) {
-      if (!jobId) {
-        alert("Could not locate active job for this bay. Please refresh.");
-        return;
-      }
-      if (window.openJobStatusModal) {
-        window.openJobStatusModal(jobId, status, mechId, bayId);
-      }
-    }
     console.log("SYNC: Refreshing overview metrics...");
     fetch(`tenant-dashboard.php?action=fetch_overview_stats&_=${Date.now()} `)
       .then(res => res.text())
@@ -6644,125 +9649,18 @@ try {
         }
       })
       .catch(err => console.error("Stats fetch network error:", err));
-      };
     // Auto-refresh stats every 30 seconds for a truly "live" feel
     setInterval(window.dashboardOverviewRefresh, 30000);
 
-    let currentReceiptData = null;
-    function printReceipt(id) {
-      fetch('tenant-dashboard.php?action=fetch_receipt_details&payment_id=' + id)
-        .then(res => res.json()).then(p => {
-          if (p.error) { showAlert("Error", "Error fetching receipt details.", "error"); return; }
-          currentReceiptData = p;
-          const body = document.getElementById('receiptPreviewContent');
-          body.innerHTML = `
-        <div style="text-align:center; margin-bottom:1.5rem;">
-        <div
-          style="width:60px; height:60px; background:#f3f4f6; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; margin-bottom:1rem;">
-          <i class="fas fa-car-burst" style="font-size:1.8rem; color:#6366f1;"></i>
-        </div>
-        <h2 style="margin:0; letter-spacing:-1px; color:#111827;"><?php echo strtoupper($shop_name); ?></h2>
-        <p style="color:#64748b; font-size:0.85rem; margin:5px 0;">Official Payment Receipt</p>
-      </div>
+    // Add to initial dash refresh
+    const oldRefresh = window.dashboardOverviewRefresh;
+    window.dashboardOverviewRefresh = function () {
+      if (typeof oldRefresh === 'function') oldRefresh();
+      window.refreshShiftRequests();
+    };
 
-      <div
-        style="border-top:2px dashed #e2e8f0; border-bottom:2px dashed #e2e8f0; padding:1.5rem 0; margin-bottom:1.5rem;">
-        <div style="display:flex; justify-content:space-between; margin-bottom:10px; font-size:0.9rem;">
-          <span style="color:#64748b;">Transaction ID</span>
-          <span style="font-weight:700; color:#111827;">#PY-${id}</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; margin-bottom:10px; font-size:0.9rem;">
-          <span style="color:#64748b;">Customer</span>
-          <span style="font-weight:600; color:#111827;">${p.full_name}</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; margin-bottom:10px; font-size:0.9rem;">
-          <span style="color:#64748b;">Method</span>
-          <span style="font-weight:600; color:#111827;">${p.payment_method}</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; margin-bottom:10px; font-size:0.9rem;">
-          <span style="color:#64748b;">Reference</span>
-          <span style="font-weight:600; color:#111827;">${p.reference_no || '---'}</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; font-size:0.9rem;">
-          <span style="color:#64748b;">Date</span>
-          <span style="font-weight:600; color:#111827;">${new Date(p.payment_date).toLocaleString()}</span>
-        </div>
-      </div>
+    // Receipt and Thermal Print logic moved to global utilities (hoisted)
 
-      <div
-        style="background:#f8fafc; border-radius:8px; padding:1.2rem; display:flex; justify-content:space-between; align-items:center;">
-        <span style="font-weight:700; color:#64748b; font-size:0.85rem;">TOTAL PAID</span>
-        <span
-          style="font-size:1.5rem; font-weight:800; color:#6366f1;">₱${parseFloat(p.amount).toLocaleString(undefined,
-            { minimumFractionDigits: 2 })}</span>
-      </div>
-
-      <p style="text-align:center; color:#94a3b8; font-size:0.75rem; margin-top:1.5rem;">
-        This document serves as your official proof of payment. <br> Thank you for your business!
-      </p>
-    `;
-          openModal('receiptModal');
-        });
-    }
-
-    function executeThermalPrint() {
-      if (!currentReceiptData) return;
-      const p = currentReceiptData;
-      const id = p.payment_id;
-      const printWindow = window.open('', '_blank', 'width=400,height=600');
-      printWindow.document.write(`
-      < html >
-
-      <head>
-        <title>Receipt #PY-${id}</title>
-        <style>
-          body {
-            font-family: 'Courier New', Courier, monospace;
-            padding: 20px;
-            color: #000;
-            font-size: 13px;
-            line-height: 1.2;
-            width: 300px;
-          }
-
-          .text-center {
-            text-align: center;
-          }
-
-          .separator {
-            border-top: 1px dashed #000;
-            margin: 10px 0;
-          }
-
-          h2 {
-            margin: 5px 0;
-          }
-        </style>
-      </head>
-
-      <body onload="window.print(); window.close();">
-        <div class="text-center">
-          <h2><?php echo strtoupper($shop_name); ?></h2>
-          <p><?php echo date('Y-m-d H:i'); ?></p>
-        </div>
-        <div class="separator"></div>
-        <p>RECEIPT NO: PY-${id}</p>
-        <p>CUSTOMER : ${p.full_name}</p>
-        <p>METHOD : ${p.payment_method}</p>
-        <p>REFERENCE : ${p.reference_no || '---'}</p>
-        <div class="separator"></div>
-        <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:16px;">
-          <span>TOTAL:</span>
-          <span>PHP ${parseFloat(p.amount).toFixed(2)}</span>
-        </div>
-        <div class="separator"></div>
-        <p class="text-center" style="margin-top:20px;">Safe travels with AutoFix!</p>
-      </body>
-
-      </html >
-      `);
-      printWindow.document.close();
-    }
 
     function approvePayment(id) {
       showConfirm("Approve Payment", "Confirm this transaction? This will officially record the payment and update the workshop backlog.", () => {
@@ -6778,15 +9676,7 @@ try {
       });
     }
 
-    function toggleVehicleGroup(ownerId) {
-      const rows = document.querySelectorAll(`.v-group-${ownerId}`);
-      const header = document.querySelector(`.v-header-${ownerId}`);
-      const isHidden = rows[0].style.display === 'none' || rows[0].style.display === '';
-
-      rows.forEach(r => r.style.display = isHidden ? 'table-row' : 'none');
-      if (isHidden) header.classList.add('expanded');
-      else header.classList.remove('expanded');
-    }
+    // Consolidated toggleVehicleGroup moved to window scope above (line 5335)
 
 
 
@@ -6798,15 +9688,19 @@ try {
             body.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-dim); padding: 2rem;">No inventory records found.</td></tr>';
             return;
           }
-          body.innerHTML = data.map(i => `
-      <tr>
-        <td><strong>${i.item_code}</strong></td>
-        <td>${i.item_name} ${i.brand ? '(' + i.brand + ')' : ''}</td>
-        <td>${i.quantity}</td>
-        <td><span class="badge badge-active">${i.status}</span></td>
-        <td><button class="btn-outline">Manage</button></td>
-      </tr>
-      `).join('');
+          body.innerHTML = data.map(i => {
+            const isLow = parseInt(i.quantity) <= parseInt(i.stock_threshold || 0);
+            const statusClass = isLow ? 'badge-danger' : 'badge-active';
+            const statusText = isLow ? 'LOW STOCK' : 'IN STOCK';
+            return `
+              <tr>
+                <td><strong>${i.item_code}</strong></td>
+                <td>${i.item_name} ${i.brand ? '(' + i.brand + ')' : ''}</td>
+                <td>${i.quantity}</td>
+                <td><span class="badge ${statusClass}">${statusText}</span></td>
+                <td><button class="btn-outline" onclick="window.openStockAdjustmentModal(${i.item_id})">Manage</button></td>
+              </tr>`;
+          }).join('');
         });
     }
 
@@ -6834,7 +9728,7 @@ try {
 
       // Staggered loading for InfinityFree / Shared Hosting stability
       setTimeout(() => runSafe('refreshServicesList'), 50);
-      setTimeout(() => runSafe('refreshStaffList'), 400);
+      setTimeout(() => runSafe('renderStaffTable'), 400);
       setTimeout(() => runSafe('refreshBaysList'), 800);
       setTimeout(() => runSafe('refreshMechanicsList'), 1200);
       setTimeout(() => runSafe('refreshAppointmentsList'), 1600);
@@ -6855,57 +9749,7 @@ try {
       // Form binding loop moved to bottom
     });
 
-    function openAssignBayModal(bayId, bayName) {
-      document.getElementById('assign_bay_id').value = bayId;
-      document.getElementById('assignBayTitle').innerText = `Assign Vehicle to ${bayName} `;
 
-      // Show loading states
-      const vS = document.getElementById('assign_vehicle_id');
-      const sS = document.getElementById('assign_service_id');
-      const mS = document.getElementById('assign_mechanic_id');
-
-      vS.innerHTML = '<option>Loading vehicles...</option>';
-      sS.innerHTML = '<option>Loading services...</option>';
-      mS.innerHTML = '<option>Loading staff...</option>';
-
-      openModal('assignBayModal');
-
-      // Fetch Vehicles
-      fetch('tenant-dashboard.php?action=fetch_vehicles')
-        .then(res => res.json()).then(data => {
-          vS.innerHTML = '<option value="">-- Select Vehicle --</option>';
-          data.forEach(v => {
-            vS.innerHTML += `<option value="${v.vehicle_id}">${v.plate_no} (${v.make} ${v.model}) - ${v.owner_name}</option>`;
-          });
-        });
-
-      // Fetch Services
-      fetch('tenant-dashboard.php?action=fetch_services')
-        .then(res => res.json()).then(data => {
-          sS.innerHTML = '<option value="">-- Select Service --</option>';
-          data.forEach(s => {
-            sS.innerHTML += `<option value="${s.service_id}">${s.service_name} (₱${parseFloat(s.price).toLocaleString()})</option>`;
-          });
-        });
-
-      // Fetch Mechanics
-      fetch('tenant-dashboard.php?action=fetch_available_resources')
-        .then(res => res.json())
-        .then(data => {
-          mS.innerHTML = '<option value="">-- Assign Mechanic --</option>';
-          if (!data.mechanics || data.mechanics.length === 0) {
-            mS.innerHTML = '<option value="">No mechanics registered</option>';
-            return;
-          }
-          data.mechanics.forEach(m => {
-            mS.innerHTML += `<option value="${m.mechanic_id}">${m.full_name} (${m.specialization || 'General'})</option>`;
-          });
-        })
-        .catch(err => {
-          console.error("Mechanic fetch failed:", err);
-          mS.innerHTML = '<option value="">Error loading staff</option>';
-        });
-    }
 
     function processBayAssignment() {
       const form = document.getElementById('assignBayForm');
@@ -7034,48 +9878,55 @@ try {
         });
       };
 
-      customizationForm.addEventListener('input', (e) => {
-        syncPreview();
+      if (customizationForm) {
+        customizationForm.addEventListener('input', (e) => {
+          syncPreview();
 
-        // If style or major setting changes, cache-bust the iframe
-        if (e.target.name === 'ui_style') {
-          const frame = document.getElementById('livePreviewFrame');
-          if (frame) {
-            const url = new URL(frame.src, window.location.href);
-            url.searchParams.set('_v', Date.now());
-            frame.src = url.toString();
+          // If style or major setting changes, cache-bust the iframe
+          if (e.target.name === 'ui_style') {
+            const frame = document.getElementById('livePreviewFrame');
+            if (frame) {
+              const url = new URL(frame.src, window.location.href);
+              url.searchParams.set('_v', Date.now());
+              frame.src = url.toString();
+            }
           }
-        }
-      });
+        });
+      }
 
-      // Handle Local Image Preview in Iframe
-      document.getElementById('prev_logo_file').addEventListener('change', function (e) {
-        if (this.files && this.files[0]) {
-          const reader = new FileReader();
-          reader.onload = (ex) => {
-            const doc = frame.contentDocument || frame.contentWindow.document;
-            const img = doc.querySelector('.logo img');
-            if (img) img.src = ex.target.result;
-          };
-          reader.readAsDataURL(this.files[0]);
-        }
-      });
+      const logoFile = document.getElementById('prev_logo_file');
+      if (logoFile) {
+        logoFile.addEventListener('change', function (e) {
+          if (this.files && this.files[0]) {
+            const reader = new FileReader();
+            reader.onload = (ex) => {
+              const doc = frame.contentDocument || frame.contentWindow.document;
+              const img = doc.querySelector('.logo img');
+              if (img) img.src = ex.target.result;
+            };
+            reader.readAsDataURL(this.files[0]);
+          }
+        });
+      }
 
-      document.getElementById('prev_banner_file').addEventListener('change', function (e) {
-        if (this.files && this.files[0]) {
-          const reader = new FileReader();
-          reader.onload = (ex) => {
-            const doc = frame.contentDocument || frame.contentWindow.document;
-            const hero = doc.querySelector('.hero');
-            if (hero) hero.style.backgroundImage = `linear-gradient(to bottom, rgba(0, 0, 0, 0.5), transparent),
-      url(${ex.target.result})`;
-          };
-          reader.readAsDataURL(this.files[0]);
-        }
-      });
+      const bannerFile = document.getElementById('prev_banner_file');
+      if (bannerFile) {
+        bannerFile.addEventListener('change', function (e) {
+          if (this.files && this.files[0]) {
+            const reader = new FileReader();
+            reader.onload = (ex) => {
+              const doc = frame.contentDocument || frame.contentWindow.document;
+              const hero = doc.querySelector('.hero');
+              if (hero) hero.style.backgroundImage = `linear-gradient(to bottom, rgba(0, 0, 0, 0.5), transparent),
+                url(${ex.target.result})`;
+            };
+            reader.readAsDataURL(this.files[0]);
+          }
+        });
+      }
 
       // Re-sync after iframe loads
-      frame.onload = syncPreview;
+      if (frame) frame.onload = syncPreview;
     });
   </script>
 
@@ -7113,7 +9964,9 @@ try {
       <form id="addServiceForm" method="POST" action="tenant-dashboard.php?action=add_service">
         <input type="hidden" name="service_action" value="add_service">
         <div style="margin-bottom:1.2rem;">
-          <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:var(--accent); font-weight:700;">Standard Service (Admin Regulated)</label>
+          <label
+            style="display:block; margin-bottom:6px; font-size:0.85rem; color:var(--accent); font-weight:700;">Standard
+            Service (Admin Regulated)</label>
           <select name="master_id" onchange="window.syncMasterService(this, 'addServiceForm')"
             style="width:100%; background:rgba(255,255,255,0.05); border:1px solid var(--accent); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
             <option value="">-- Custom / Not in List --</option>
@@ -7121,10 +9974,12 @@ try {
             try {
               $m_stmt = $db->query("SELECT * FROM master_services ORDER BY service_name ASC");
               while ($ms = $m_stmt->fetch(PDO::FETCH_ASSOC)) {
-                $json = htmlspecialchars(json_encode($ms));
-                echo "<option value='{$ms['master_id']}' data-info='{$json}'>{$ms['service_name']}</option>";
+                $min = $ms['min_price'] ?? 0;
+                $max = $ms['max_price'] ?? 0;
+                echo "<option value='{$ms['master_id']}' data-min='{$min}' data-max='{$max}'>{$ms['service_name']}</option>";
               }
-            } catch(Exception $e) {}
+            } catch (Exception $e) {
+            }
             ?>
           </select>
         </div>
@@ -7163,22 +10018,7 @@ try {
       </div>
       <form id="editServiceForm">
         <input type="hidden" name="service_id" id="edit_service_id">
-        <div style="margin-bottom:1.2rem;">
-          <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:var(--accent); font-weight:700;">Standard Service (Admin Regulated)</label>
-          <select name="master_id" onchange="window.syncMasterService(this, 'editServiceForm')"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid var(--accent); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-            <option value="">-- Custom / Not in List --</option>
-            <?php
-            try {
-              $m_stmt = $db->query("SELECT * FROM master_services ORDER BY service_name ASC");
-              while ($ms = $m_stmt->fetch(PDO::FETCH_ASSOC)) {
-                $json = htmlspecialchars(json_encode($ms));
-                echo "<option value='{$ms['master_id']}' data-info='{$json}'>{$ms['service_name']}</option>";
-              }
-            } catch(Exception $e) {}
-            ?>
-          </select>
-        </div>
+        <input type="hidden" name="master_id" id="edit_service_master_id">
         <div style="margin-bottom:1rem;">
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Service
             Name</label>
@@ -7401,13 +10241,29 @@ try {
 
   <!-- Mechanic Modal -->
   <div id="mechanicModal"
-    style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
+    style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center; color-scheme: dark;">
     <div
-      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:450px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
-        <h3 style="margin:0; font-size:1.3rem;">Register Mechanic</h3>
+      style="background:rgba(17, 24, 39, 0.8); border:1px solid rgba(255,255,255,0.15); border-radius:32px; padding:2.5rem; width:100%; max-width:480px; margin:1rem; box-shadow:0 50px 100px rgba(0,0,0,0.8); position:relative; overflow:hidden;">
+      <div
+        style="position:absolute; top:-50px; right:-50px; width:150px; height:150px; background:var(--accent); filter:blur(100px); opacity:0.15; pointer-events:none;">
+      </div>
+      <div
+        style="position:absolute; bottom:-50px; left:-50px; width:150px; height:150px; background:#8b5cf6; filter:blur(100px); opacity:0.15; pointer-events:none;">
+      </div>
+
+      <div
+        style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem; position:relative; z-index:1;">
+        <div style="display:flex; align-items:center; gap:12px;">
+          <div
+            style="width:45px; height:45px; border-radius:14px; background:rgba(99,102,241,0.1); border:1px solid rgba(99,102,241,0.2); display:flex; align-items:center; justify-content:center; color:var(--accent); font-size:1.2rem;">
+            <i class="fas fa-user-gear"></i>
+          </div>
+          <h3 style="margin:0; font-size:1.5rem; font-weight:800; letter-spacing:-0.5px;">Register Mechanic</h3>
+        </div>
         <button onclick="closeModal('mechanicModal')"
-          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+          style="width:36px; height:36px; border-radius:50%; background:rgba(255,255,255,0.05); border:none; color:#94a3b8; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:0.3s;"
+          onmouseover="this.style.background='rgba(255,255,255,0.1)'; this.style.color='white'"
+          onmouseout="this.style.background='rgba(255,255,255,0.05)'; this.style.color='#94a3b8'">&times;</button>
       </div>
       <form id="addMechanicForm" onsubmit="window.submitMechanicForm(event)"
         style="display:flex; flex-direction:column; gap:15px;">
@@ -7422,6 +10278,37 @@ try {
             <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Specialization</label>
             <input type="text" name="specialization" required placeholder="Engine / Paint"
               style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+          </div>
+        </div>
+
+        <div
+          style="padding:15px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); border-radius:15px; margin:5px 0;">
+          <h4
+            style="margin:0 0 12px; font-size:0.8rem; color:var(--accent); text-transform:uppercase; letter-spacing:1px;">
+            Work Shift Schedule</h4>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+            <div>
+              <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Shift Start</label>
+              <input type="time" name="shift_start" required value="08:00"
+                style="width:100%; background:rgba(0,0,0,0.2); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.85rem; outline:none; box-sizing:border-box;">
+            </div>
+            <div>
+              <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Shift End</label>
+              <input type="time" name="shift_end" required value="17:00"
+                style="width:100%; background:rgba(0,0,0,0.2); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.85rem; outline:none; box-sizing:border-box;">
+            </div>
+          </div>
+          <div style="margin-top:12px;">
+            <label style="display:block; margin-bottom:8px; font-size:0.8rem; color:#94a3b8;">Work Days</label>
+            <div style="display:flex; flex-wrap:wrap; gap:8px;">
+              <?php foreach (['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as $d): ?>
+                <label
+                  style="display:flex; align-items:center; gap:4px; font-size:0.8rem; background:rgba(255,255,255,0.05); padding:4px 8px; border-radius:6px; cursor:pointer;">
+                  <input type="checkbox" name="shift_days[]" value="<?php echo $d; ?>" <?php echo $d !== 'Sun' ? 'checked' : ''; ?> style="accent-color:var(--accent);">
+                  <?php echo $d; ?>
+                </label>
+              <?php endforeach; ?>
+            </div>
           </div>
         </div>
 
@@ -7446,8 +10333,8 @@ try {
         </div>
 
         <button type="submit" id="mechanicSubmitBtn"
-          style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1rem; border-radius:12px; font-size:1rem; font-weight:700; cursor:pointer; margin-top:10px;">
-          <i class="fas fa-save" style="margin-right:8px;"></i> Save & Create Account
+          style="width:100%; background:linear-gradient(135deg, var(--accent), #8b5cf6); color:white; border:none; padding:1.1rem; border-radius:16px; font-size:1.1rem; font-weight:800; cursor:pointer; margin-top:10px; box-shadow: 0 10px 20px rgba(99,102,241,0.2); transition: 0.3s; display:flex; align-items:center; justify-content:center; gap:10px;">
+          <i class="fas fa-user-plus"></i> Save & Create Account
         </button>
       </form>
       <script>
@@ -7471,6 +10358,7 @@ try {
                   closeModal('mechanicModal');
                   form.reset();
                   if (typeof refreshMechanicsList === 'function') refreshMechanicsList();
+                  if (typeof renderStaffTable === 'function') renderStaffTable();
                 } else {
                   showToast("Error: " + data.message, 'error');
                 }
@@ -7488,6 +10376,245 @@ try {
       </script>
     </div>
   </div>
+
+  <!-- Edit Mechanic Shift Modal -->
+  <div id="editShiftModal"
+    style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center; color-scheme: dark;">
+    <div
+      style="background:rgba(17, 24, 39, 0.85); border:1px solid rgba(255,255,255,0.15); border-radius:32px; padding:2.5rem; width:100%; max-width:420px; margin:1rem; box-shadow:0 50px 100px rgba(0,0,0,0.8); position:relative; overflow:hidden;">
+      <div
+        style="position:absolute; top:-30px; left:-30px; width:100px; height:100px; background:var(--accent); filter:blur(80px); opacity:0.1; pointer-events:none;">
+      </div>
+
+      <div
+        style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem; position:relative; z-index:1;">
+        <div style="display:flex; align-items:center; gap:12px;">
+          <div
+            style="width:45px; height:45px; border-radius:14px; background:rgba(99,102,241,0.1); border:1px solid rgba(99,102,241,0.2); display:flex; align-items:center; justify-content:center; color:var(--accent); font-size:1.2rem;">
+            <i class="far fa-clock"></i>
+          </div>
+          <h3 style="margin:0; font-size:1.4rem; font-weight:800; letter-spacing:-0.5px;">Edit Shift</h3>
+        </div>
+        <button onclick="closeModal('editShiftModal')"
+          style="width:36px; height:36px; border-radius:50%; background:rgba(255,255,255,0.05); border:none; color:#94a3b8; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:0.3s;"
+          onmouseover="this.style.background='rgba(255,255,255,0.1)'; this.style.color='white'"
+          onmouseout="this.style.background='rgba(255,255,255,0.05)'; this.style.color='#94a3b8'">&times;</button>
+      </div>
+
+      <div
+        style="margin-bottom:1.5rem; padding:12px; background:rgba(99,102,241,0.05); border-radius:16px; border:1px solid rgba(99,102,241,0.1);">
+        <p style="margin:0; font-size:0.85rem; color:#94a3b8; text-align:center;">
+          Updating schedule for <strong id="editShiftName" style="color:white; font-weight:800;"></strong>
+        </p>
+      </div>
+
+      <form id="editShiftForm" onsubmit="window.submitEditShift(event)"
+        style="display:flex; flex-direction:column; gap:20px; position:relative; z-index:1;">
+        <input type="hidden" name="mechanic_id" id="editShiftId">
+
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px;">
+          <div class="input-group">
+            <label
+              style="display:flex; align-items:center; gap:6px; margin-bottom:10px; font-size:0.85rem; font-weight:600; color:#94a3b8;">
+              <i class="fas fa-sun" style="font-size:0.75rem; color:var(--accent);"></i> Shift Start
+            </label>
+            <div style="position:relative;">
+              <input type="time" name="shift_start" id="editShiftStart" required
+                style="width:100%; background:rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.1); color:white; padding:1rem 2.5rem 1rem 1rem; border-radius:16px; font-size:1rem; font-weight:600; outline:none; transition:0.3s; box-sizing:border-box;"
+                onfocus="this.style.borderColor='var(--accent)'; this.style.background='rgba(0,0,0,0.5)'"
+                onblur="this.style.borderColor='rgba(255,255,255,0.1)'; this.style.background='rgba(0,0,0,0.3)'">
+              <i class="fas fa-chevron-down"
+                style="position:absolute; right:15px; top:50%; transform:translateY(-50%); color:var(--text-dim); cursor:pointer; font-size:0.8rem;"
+                onclick="try { this.previousElementSibling.showPicker(); } catch(e) { this.previousElementSibling.focus(); }"></i>
+            </div>
+          </div>
+          <div class="input-group">
+            <label
+              style="display:flex; align-items:center; gap:6px; margin-bottom:10px; font-size:0.85rem; font-weight:600; color:#94a3b8;">
+              <i class="fas fa-moon" style="font-size:0.75rem; color:#818cf8;"></i> Shift End
+            </label>
+            <div style="position:relative;">
+              <input type="time" name="shift_end" id="editShiftEnd" required
+                style="width:100%; background:rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.1); color:white; padding:1rem 2.5rem 1rem 1rem; border-radius:16px; font-size:1rem; font-weight:600; outline:none; transition:0.3s; box-sizing:border-box;"
+                onfocus="this.style.borderColor='var(--accent)'; this.style.background='rgba(0,0,0,0.5)'"
+                onblur="this.style.borderColor='rgba(255,255,255,0.1)'; this.style.background='rgba(0,0,0,0.3)'">
+              <i class="fas fa-chevron-down"
+                style="position:absolute; right:15px; top:50%; transform:translateY(-50%); color:var(--text-dim); cursor:pointer; font-size:0.8rem;"
+                onclick="try { this.previousElementSibling.showPicker(); } catch(e) { this.previousElementSibling.focus(); }"></i>
+            </div>
+          </div>
+        </div>
+
+        <div class="input-group">
+          <label
+            style="display:flex; align-items:center; gap:6px; margin-bottom:10px; font-size:0.85rem; font-weight:600; color:#94a3b8;">
+            <i class="fas fa-calendar-week" style="font-size:0.75rem; color:var(--accent);"></i> Work Days
+          </label>
+          <div style="display:flex; flex-wrap:wrap; gap:8px;">
+            <?php foreach (['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as $d): ?>
+              <label
+                style="display:flex; align-items:center; gap:6px; font-size:0.85rem; font-weight:600; background:rgba(255,255,255,0.05); padding:8px 12px; border-radius:10px; cursor:pointer; border:1px solid rgba(255,255,255,0.05); transition:0.2s;"
+                onmouseover="this.style.background='rgba(255,255,255,0.1)'"
+                onmouseout="this.style.background='rgba(255,255,255,0.05)'">
+                <input type="checkbox" name="shift_days[]" value="<?php echo $d; ?>" class="edit-shift-day-cb"
+                  style="accent-color:var(--accent); transform:scale(1.1);">
+                <?php echo $d; ?>
+              </label>
+            <?php endforeach; ?>
+          </div>
+        </div>
+
+        <button type="submit" id="editShiftBtn"
+          style="width:100%; background:linear-gradient(135deg, var(--accent), #8b5cf6); color:white; border:none; padding:1.1rem; border-radius:18px; font-size:1.1rem; font-weight:800; cursor:pointer; box-shadow:0 10px 20px rgba(99,102,241,0.2); transition:0.3s; display:flex; align-items:center; justify-content:center; gap:10px;">
+          <i class="fas fa-save"></i> Update Schedule
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Mechanic Shift Change Request Modal -->
+  <div id="shiftRequestModal"
+    style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center; color-scheme: dark;">
+    <div
+      style="background:rgba(17, 24, 39, 0.85); border:1px solid rgba(255,255,255,0.15); border-radius:32px; padding:2.5rem; width:100%; max-width:420px; margin:1rem; box-shadow:0 50px 100px rgba(0,0,0,0.8); position:relative; overflow:hidden;">
+      <div
+        style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem; position:relative; z-index:1;">
+        <div style="display:flex; align-items:center; gap:12px;">
+          <div
+            style="width:45px; height:45px; border-radius:14px; background:rgba(99,102,241,0.1); border:1px solid rgba(99,102,241,0.2); display:flex; align-items:center; justify-content:center; color:var(--accent); font-size:1.2rem;">
+            <i class="fas fa-file-signature"></i>
+          </div>
+          <h3 style="margin:0; font-size:1.4rem; font-weight:800; letter-spacing:-0.5px;">Request Shift Change</h3>
+        </div>
+        <button onclick="closeModal('shiftRequestModal')"
+          style="width:36px; height:36px; border-radius:50%; background:rgba(255,255,255,0.05); border:none; color:#94a3b8; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:0.3s;"
+          onmouseover="this.style.background='rgba(255,255,255,0.1)'; this.style.color='white'"
+          onmouseout="this.style.background='rgba(255,255,255,0.05)'; this.style.color='#94a3b8'">&times;</button>
+      </div>
+
+      <form id="shiftRequestForm" onsubmit="window.submitShiftRequest(event)"
+        style="display:flex; flex-direction:column; gap:20px; position:relative; z-index:1;">
+
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px;">
+          <div class="input-group">
+            <label
+              style="display:block; margin-bottom:10px; font-size:0.85rem; font-weight:600; color:#94a3b8;">Requested
+              Start</label>
+            <input type="time" name="shift_start" required value="08:00"
+              style="width:100%; background:rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.1); color:white; padding:1rem; border-radius:16px; font-size:1rem; font-weight:600; outline:none; box-sizing:border-box;">
+          </div>
+          <div class="input-group">
+            <label
+              style="display:block; margin-bottom:10px; font-size:0.85rem; font-weight:600; color:#94a3b8;">Requested
+              End</label>
+            <input type="time" name="shift_end" required value="17:00"
+              style="width:100%; background:rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.1); color:white; padding:1rem; border-radius:16px; font-size:1rem; font-weight:600; outline:none; box-sizing:border-box;">
+          </div>
+        </div>
+
+        <div>
+          <label
+            style="display:flex; align-items:center; gap:6px; margin-bottom:10px; font-size:0.85rem; font-weight:600; color:#94a3b8;">
+            <i class="fas fa-calendar-week" style="color:var(--accent); font-size:0.75rem;"></i> Requested Days
+          </label>
+          <div style="display:flex; flex-wrap:wrap; gap:8px;">
+            <?php foreach (['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as $d): ?>
+              <label
+                style="display:flex; align-items:center; gap:6px; font-size:0.85rem; font-weight:600; background:rgba(255,255,255,0.05); padding:8px 12px; border-radius:10px; cursor:pointer; border:1px solid rgba(255,255,255,0.05); transition:0.2s;"
+                onmouseover="this.style.background='rgba(255,255,255,0.1)'"
+                onmouseout="this.style.background='rgba(255,255,255,0.05)'">
+                <input type="checkbox" name="shift_days[]" value="<?php echo $d; ?>" <?php echo $d !== 'Sun' ? 'checked' : ''; ?> style="accent-color:var(--accent); transform:scale(1.1);">
+                <?php echo $d; ?>
+              </label>
+            <?php endforeach; ?>
+          </div>
+        </div>
+
+        <div>
+          <label style="display:block; margin-bottom:10px; font-size:0.85rem; font-weight:600; color:#94a3b8;">Reason
+            for Change</label>
+          <textarea name="reason" placeholder="Explain why you need to change your shift..." required
+            style="width:100%; background:rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.1); color:white; padding:1rem; border-radius:16px; font-size:0.95rem; outline:none; min-height:100px; resize:none; box-sizing:border-box;"></textarea>
+        </div>
+
+        <button type="submit" id="shiftRequestBtn"
+          style="width:100%; background:linear-gradient(135deg, var(--accent), #8b5cf6); color:white; border:none; padding:1.1rem; border-radius:18px; font-size:1.1rem; font-weight:800; cursor:pointer; box-shadow:0 10px 20px rgba(99,102,241,0.2); transition:0.3s; display:flex; align-items:center; justify-content:center; gap:10px;">
+          <i class="fas fa-paper-plane"></i> Submit Request
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    window.submitShiftRequest = function (e) {
+      e.preventDefault();
+      const btn = document.getElementById('shiftRequestBtn');
+      const originalText = btn.innerHTML;
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Submitting...';
+      btn.disabled = true;
+
+      const fd = new FormData(document.getElementById('shiftRequestForm'));
+      fetch('tenant-dashboard.php?action=request_shift_change', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(data => {
+          if (data.status === 'success') {
+            showToast(data.message, 'success');
+            closeModal('shiftRequestModal');
+            document.getElementById('shiftRequestForm').reset();
+          } else {
+            showToast(data.message, 'error');
+          }
+        })
+        .catch(() => showToast("Network error", 'error'))
+        .finally(() => {
+          btn.innerHTML = originalText;
+          btn.disabled = false;
+        });
+    };
+  </script>
+
+
+  <script>
+    window.openEditShiftModal = function (id, start, end, name, daysStr) {
+      document.getElementById('editShiftId').value = id;
+      document.getElementById('editShiftStart').value = start;
+      document.getElementById('editShiftEnd').value = end;
+      document.getElementById('editShiftName').innerText = name;
+
+      const selectedDays = (daysStr || 'Mon,Tue,Wed,Thu,Fri,Sat').split(',');
+      document.querySelectorAll('.edit-shift-day-cb').forEach(cb => {
+        cb.checked = selectedDays.includes(cb.value);
+      });
+
+      window.openModal('editShiftModal');
+    };
+
+    window.submitEditShift = function (e) {
+      e.preventDefault();
+      const btn = document.getElementById('editShiftBtn');
+      const originalText = btn.innerHTML;
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Updating...';
+      btn.disabled = true;
+
+      const fd = new FormData(document.getElementById('editShiftForm'));
+      fetch('tenant-dashboard.php?action=update_mechanic_shift', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(data => {
+          if (data.status === 'success') {
+            showToast(data.message, 'success');
+            closeModal('editShiftModal');
+            setTimeout(() => location.reload(), 1000);
+          } else {
+            showToast(data.message, 'error');
+          }
+        })
+        .catch(() => showToast('Network error', 'error'))
+        .finally(() => {
+          btn.innerHTML = originalText;
+          btn.disabled = false;
+        });
+    };
+  </script>
 
   <!-- Mechanic Profile Modal (New) -->
   <div id="mechanicProfileModal"
@@ -7545,7 +10672,8 @@ try {
           onmouseover="this.style.background='rgba(255,0,0,0.1)'"
           onmouseout="this.style.background='rgba(255,255,255,0.05)'">&times;</button>
       </div>
-      <div id="staffManageContent" style="position:relative; z-index:2;">
+      <div id="staffManageContent"
+        style="position:relative; z-index:2; max-height:70vh; overflow-y:auto; padding-right:5px;">
         <!-- Result from Fetch -->
       </div>
     </div>
@@ -7559,12 +10687,14 @@ try {
       <div
         style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 1rem;">
         <div>
-            <h3 style="margin:0; font-size:1.4rem; font-weight:800; color:white;">End of Day Summary</h3>
-            <p id="eodDateText" style="margin:0; color:var(--text-dim); font-size:0.85rem;"></p>
+          <h3 style="margin:0; font-size:1.4rem; font-weight:800; color:white;">End of Day Summary</h3>
+          <p id="eodDateText" style="margin:0; color:var(--text-dim); font-size:0.85rem;"></p>
         </div>
         <div style="display:flex; gap:10px;">
-            <button onclick="window.printEOD()" style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:8px 15px; border-radius:10px; cursor:pointer; font-size:0.85rem;"><i class="fas fa-print"></i> Print</button>
-            <button onclick="closeModal('eodModal')"
+          <button onclick="window.printEOD()"
+            style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:8px 15px; border-radius:10px; cursor:pointer; font-size:0.85rem;"><i
+              class="fas fa-print"></i> Print</button>
+          <button onclick="closeModal('eodModal')"
             style="width:35px; height:35px; border-radius:50%; background:rgba(255,0,0,0.1); border:none; color:#ef4444; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">&times;</button>
         </div>
       </div>
@@ -7578,50 +10708,141 @@ try {
   <div id="inventoryModal"
     style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
     <div
-      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:500px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
+      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:520px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
-        <h3 style="margin:0; font-size:1.3rem;">Receive Inventory</h3>
+        <h3 style="margin:0; font-size:1.3rem;">Receive Inventory Delivery</h3>
         <button onclick="closeModal('inventoryModal')"
           style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
       </div>
-      <form id="addInventoryForm">
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; margin-bottom:1rem;">
+      <form id="addInventoryForm" style="display:flex; flex-direction:column; gap:12px;">
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
           <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Item
-              Code</label>
-            <input type="text" name="item_code" required placeholder="OIL-01"
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; box-sizing:border-box; outline:none;">
+            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Item Code</label>
+            <input type="text" name="item_code" placeholder="SKU-123" required
+              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
           <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Item
-              Name</label>
-            <input type="text" name="item_name" required placeholder="Synthetic Oil"
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; box-sizing:border-box; outline:none;">
+            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Brand</label>
+            <input type="text" name="brand" placeholder="e.g. Bosch" required
+              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
         </div>
-        <div style="margin-bottom:1rem;">
-          <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Brand</label>
-          <input type="text" name="brand" placeholder="e.g. Shell"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; box-sizing:border-box; outline:none;">
+        <div>
+          <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Item Name</label>
+          <input type="text" name="item_name" required placeholder="e.g. 5W-40 Synthetic Oil"
+            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
         </div>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; margin-bottom:1.5rem;">
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
           <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Quantity</label>
-            <input type="number" name="quantity" required value="1"
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; box-sizing:border-box; outline:none;">
+            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Cost Price (₱)</label>
+            <input type="number" step="0.01" name="price" placeholder="0.00" required
+              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
           <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price</label>
-            <input type="number" step="0.01" name="price" required placeholder="0.00"
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; box-sizing:border-box; outline:none;">
+            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Initial Qty</label>
+            <input type="number" name="quantity" value="1" required
+              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
+        </div>
+        <div style="margin-bottom:10px;">
+          <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Low Stock Alert @</label>
+          <input type="number" name="stock_threshold" value="5" required
+            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
         </div>
         <button type="submit"
-          style="width:100%; background:linear-gradient(135deg,#f59e0b,#d97706); color:white; border:none; padding:1rem; border-radius:12px; font-size:1rem; font-weight:700; cursor:pointer;">Add
-          stock</button>
+          style="width:100%; background:var(--accent); color:white; border:none; padding:1.2rem; border-radius:12px; font-size:1.1rem; font-weight:800; cursor:pointer; margin-top:10px; box-shadow:0 10px 25px var(--accent-glow); transition:0.3s;">
+          Add to Stock
+        </button>
       </form>
     </div>
   </div>
+
+  <!-- Stock Adjustment Modal -->
+  <div id="stockAdjustmentModal"
+    style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
+    <div
+      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:450px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
+        <h3 id="adjItemName" style="margin:0; font-size:1.2rem; color:var(--accent);">Adjust Stock</h3>
+        <button onclick="closeModal('stockAdjustmentModal')"
+          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+      </div>
+      <form id="stockAdjustmentForm" style="display:flex; flex-direction:column; gap:15px;">
+        <input type="hidden" name="item_id" id="adj_item_id">
+
+        <div>
+          <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Physical Qty on Hand</label>
+          <input type="number" name="quantity" id="adj_quantity" required
+            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem; border-radius:12px; font-size:1.1rem; font-weight:800; outline:none; box-sizing:border-box;">
+          <p style="font-size:0.7rem; color:var(--text-dim); margin-top:5px;">Update this if the actual count in your
+            shelf is different.</p>
+        </div>
+
+        <div>
+          <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Selling Price (₱)</label>
+          <input type="number" step="0.01" name="price" id="adj_price" required
+            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem; border-radius:12px; font-size:1rem; outline:none; box-sizing:border-box;">
+        </div>
+
+        <div>
+          <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Stock Alert
+            Threshold</label>
+          <input type="number" name="stock_threshold" id="adj_threshold" required
+            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem; border-radius:12px; font-size:1rem; outline:none; box-sizing:border-box;">
+        </div>
+
+        <button type="submit"
+          style="width:100%; background:var(--accent); color:white; border:none; padding:1.1rem; border-radius:15px; font-size:1rem; font-weight:800; cursor:pointer; margin-top:10px; box-shadow:0 15px 30px var(--accent-glow);">
+          Apply Adjustments
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    window.openStockAdjustmentModal = function (itemId) {
+      fetch(`tenant-dashboard.php?action=fetch_item_details&item_id=${itemId}`)
+        .then(r => r.json()).then(item => {
+          if (!item) return;
+          document.getElementById('adjItemName').innerText = `Adjust: ${item.item_name}`;
+          document.getElementById('adj_item_id').value = item.item_id;
+          document.getElementById('adj_quantity').value = item.quantity;
+          document.getElementById('adj_price').value = item.price;
+          document.getElementById('adj_threshold').value = item.stock_threshold;
+          openModal('stockAdjustmentModal');
+        });
+    };
+
+    // Standard binding for the new form
+    document.addEventListener('DOMContentLoaded', () => {
+      const adjForm = document.getElementById('stockAdjustmentForm');
+      if (adjForm) {
+        adjForm.addEventListener('submit', function (e) {
+          e.preventDefault();
+          const fd = new FormData(this);
+          const btn = this.querySelector('button[type="submit"]');
+          const orig = btn.innerText;
+          btn.innerText = "Applying...";
+          btn.disabled = true;
+
+          fetch('tenant-dashboard.php?action=adjust_stock', { method: 'POST', body: fd })
+            .then(r => r.json()).then(data => {
+              if (data.status === 'success') {
+                showToast(data.message, 'success');
+                closeModal('stockAdjustmentModal');
+                window.refreshInventoryList();
+              } else {
+                showAlert("Error", data.message, 'error');
+              }
+            })
+            .finally(() => {
+              btn.innerText = orig;
+              btn.disabled = false;
+            });
+        });
+      }
+    });
+  </script>
 
   <!-- Vehicle Modal -->
   <div id="vehicleModal"
@@ -7641,7 +10862,7 @@ try {
           <select name="customer_id" required>
             <option value="">-- Choose Owner --</option>
             <?php
-            $stmt = $db->prepare("SELECT customer_id, full_name FROM customers WHERE tenant_id = ? ORDER BY full_name ASC");
+            $stmt = $db->prepare("SELECT customer_id, full_name FROM customers WHERE tenant_id = ? AND status = 'ACTIVE' ORDER BY full_name ASC");
             $stmt->execute([$tenant_id]);
             while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
               echo "<option value='{$row['customer_id']}'>{$row['full_name']}</option>";
@@ -7715,23 +10936,26 @@ try {
   <div id="paymentModal"
     style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
     <div
-      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:480px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
-        <h3 style="margin:0; font-size:1.3rem;">Process Payment</h3>
+      style="background:#111827; border:1px solid rgba(255,255,255,0.12); border-radius:24px; padding:1.5rem; width:100%; max-width:440px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6); max-height:90vh; overflow-y:auto;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.2rem;">
+        <h3 style="margin:0; font-size:1.2rem; font-weight:800; letter-spacing:-0.5px;">Process Payment</h3>
         <button onclick="closeModal('paymentModal')"
-          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+          style="background:rgba(255,255,255,0.05); border:none; color:white; width:32px; height:32px; border-radius:8px; font-size:1.5rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">&times;</button>
       </div>
       <form id="addPaymentForm">
         <input type="hidden" name="job_id" id="pay_job_id">
         <input type="hidden" name="appointment_id" id="pay_appointment_id">
-        <div style="margin-bottom:1rem;">
-          <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Select
+
+        <div style="margin-bottom:0.8rem;">
+          <label
+            style="display:block; margin-bottom:5px; font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;">Select
             Customer</label>
-          <select name="customer_id" required onchange="window.toggleWalkInField(this.value)">
+          <select name="customer_id" required onchange="window.toggleWalkInField(this.value)"
+            style="padding:0.7rem; font-size:0.9rem;">
             <option value="">-- Choose Customer --</option>
             <option value="WALKIN" style="color:var(--accent); font-weight:700;">+ Walk-in / New Customer</option>
             <?php
-            $stmt = $db->prepare("SELECT customer_id, full_name FROM customers WHERE tenant_id = ? ORDER BY full_name ASC");
+            $stmt = $db->prepare("SELECT customer_id, full_name FROM customers WHERE tenant_id = ? AND mobile != 'WALKIN' AND status = 'ACTIVE' ORDER BY full_name ASC");
             $stmt->execute([$tenant_id]);
             while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
               echo "<option value='{$row['customer_id']}'>{$row['full_name']}</option>";
@@ -7739,254 +10963,661 @@ try {
             ?>
           </select>
         </div>
-        <div id="walkinField" style="display:none; margin-bottom:1.5rem; background:rgba(var(--accent-rgb), 0.05); padding:1rem; border-radius:12px; border:1px solid rgba(var(--accent-rgb), 0.2);">
-          <label style="display:block; margin-bottom:8px; font-size:0.85rem; color:var(--accent); font-weight:700;">Customer Name (Walk-in)</label>
-          <input type="text" name="walkin_name" placeholder="Enter full name of customer"
-            style="width:100%; background:rgba(0,0,0,0.3); border:1px solid var(--accent); color:white; padding:0.8rem 1rem; border-radius:10px; font-size:1rem; outline:none; box-sizing:border-box;">
+
+        <div id="walkinField"
+          style="display:none; margin-bottom:0.8rem; background:rgba(var(--accent-rgb), 0.05); padding:0.8rem; border-radius:12px; border:1px solid rgba(var(--accent-rgb), 0.15);">
+          <label
+            style="display:block; margin-bottom:6px; font-size:0.75rem; color:var(--accent); font-weight:800;">CUSTOMER
+            NAME (WALK-IN)</label>
+          <input type="text" name="walkin_name" placeholder="Enter full name"
+            style="width:100%; background:rgba(0,0,0,0.3); border:1px solid var(--accent); color:white; padding:0.7rem; border-radius:10px; font-size:0.95rem; outline:none;">
         </div>
-        <div style="margin-bottom:1.5rem;">
-          <label style="display:block; margin-bottom:8px; font-size:0.85rem; color:#94a3b8;">Amount
-            (PHP)</label>
-          <input type="number" name="amount" id="pay_amount" required step="0.01" placeholder="0.00"
-            style="width:100%; background:rgba(0,0,0,0.2); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:1.1rem; font-weight:700; outline:none;">
+
+        <div
+          style="margin-bottom:0.8rem; background:rgba(255,255,255,0.02); padding:0.8rem; border-radius:14px; border:1px solid rgba(255,255,255,0.05);">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <label style="font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase;">Items /
+              Parts / Services</label>
+            <div style="display:flex; gap:5px;">
+              <button type="button" onclick="window.addCustomServiceRow()"
+                style="background:rgba(255,255,255,0.1); color:#fff; border:none; border-radius:6px; padding:3px 8px; font-size:0.65rem; font-weight:800; cursor:pointer;">+
+                SERVICE</button>
+              <button type="button" onclick="window.showPaymentPartsSelector()"
+                style="background:var(--accent); color:#000; border:none; border-radius:6px; padding:3px 8px; font-size:0.65rem; font-weight:800; cursor:pointer;">+
+                PART</button>
+            </div>
+          </div>
+          <div id="paymentPartsList"
+            style="display:flex; flex-direction:column; gap:6px; max-height:100px; overflow-y:auto;"></div>
+          <input type="hidden" name="parts_json" id="pay_parts_json" value="[]">
         </div>
-        <div style="margin-bottom:1.5rem;">
-          <label style="display:block; margin-bottom:8px; font-size:0.85rem; color:#94a3b8;">Apply
-            Discount</label>
-          <select id="pay_discount" onchange="calculateFinalAmount()">
-            <option value="0">No Discount</option>
-            <option value="20">Senior Citizen / PWD (20%)</option>
-            <option value="10">Loyalty Discount (10%)</option>
-          </select>
-          <small id="discountLabel"
-            style="color:var(--warning); display:none; margin-top:5px; font-weight:600;"></small>
-        </div>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; margin-bottom:1.5rem;">
+
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:0.8rem;">
           <div>
-            <label style="display:block; margin-bottom:8px; font-size:0.85rem; color:#94a3b8;">Payment
-              Method</label>
-            <select name="payment_method">
+            <label
+              style="display:block; margin-bottom:5px; font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase;">Amount
+              (PHP)</label>
+            <input type="number" id="pay_amount" required step="0.01" placeholder="0.00"
+              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:var(--accent); padding:0.7rem; border-radius:10px; font-size:1rem; font-weight:800; outline:none; pointer-events:none;"
+              tabindex="-1">
+            <input type="hidden" name="amount" id="pay_amount_hidden">
+          </div>
+          <div>
+            <label
+              style="display:block; margin-bottom:5px; font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase;">Discount</label>
+            <select id="pay_discount" onchange="calculateFinalAmount()" style="padding:0.7rem; font-size:0.85rem;">
+              <option value="0">None</option>
+              <option value="20">Senior/PWD (20%)</option>
+              <option value="10">Loyalty (10%)</option>
+            </select>
+          </div>
+        </div>
+
+        <div style="display:grid; grid-template-columns:1fr 1.2fr; gap:12px; margin-bottom:1.2rem;">
+          <div>
+            <label
+              style="display:block; margin-bottom:5px; font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase;">Method</label>
+            <select name="payment_method" style="padding:0.7rem; font-size:0.85rem;">
               <option value="CASH">CASH</option>
               <option value="GCASH">GCASH</option>
-              <option value="BANK">BANK TRANSFER</option>
+              <option value="BANK">BANK</option>
             </select>
           </div>
           <div>
-            <label style="display:block; margin-bottom:8px; font-size:0.85rem; color:#94a3b8;">Ref
+            <label
+              style="display:block; margin-bottom:5px; font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase;">Ref
               No.</label>
             <input type="text" name="reference_no" placeholder="Optional"
-              style="width:100%; background:rgba(0,0,0,0.2); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none;">
+              style="width:100%; background:rgba(0,0,0,0.2); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.7rem; border-radius:10px; font-size:0.85rem; outline:none;">
           </div>
         </div>
+
         <button type="submit"
-          style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1.2rem; border-radius:15px; font-weight:700; cursor:pointer; font-size:1rem; box-shadow:0 10px 20px rgba(99,102,241,0.2); transition:0.3s;">
-          Complete Payment & Close Job
+          style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1rem; border-radius:14px; font-weight:800; cursor:pointer; font-size:0.95rem; box-shadow:0 8px 16px rgba(99,102,241,0.25); transition:0.3s; text-transform:uppercase; letter-spacing:0.5px;">
+          Complete Payment
         </button>
       </form>
     </div>
   </div>
 
 
-  <!-- Job Status Modal -->
-  <div id="jobStatusModal"
+  <!-- Job Status Modal (Renamed to Avoid Conflicts) -->
+  <div id="repairJobStatusModal_Final"
     style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
     <div
-      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2rem; width:100%; max-width:450px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
-        <h3 id="jobModalTitle" style="margin:0; font-size:1.3rem;">
-          <?php echo ($role === 'MECHANIC') ? 'Work Progress Update' : 'Job Assignment'; ?>
-        </h3>
-        <button onclick="closeModal('jobStatusModal')"
-          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:28px; padding:2.5rem; width:100%; max-width:850px; max-height:90vh; overflow-y:auto; margin:1rem; box-shadow:0 40px 100px rgba(0,0,0,0.7); position:relative;">
+      <div
+        style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem; border-bottom:1px solid rgba(255,255,255,0.05); padding-bottom:1.5rem;">
+        <div>
+          <h3 id="jobModalTitle" style="margin:0; font-size:1.5rem; letter-spacing:-0.5px;">
+            <?php echo ($role === 'MECHANIC') ? 'Work Progress' : 'Service Management'; ?>
+          </h3>
+          <p style="color:var(--text-dim); font-size:0.85rem; margin-top:4px;">Manage repair lifecycle and inventory
+            consumption.</p>
+        </div>
+        <button onclick="closeModal('repairJobStatusModal_Final')"
+          style="background:rgba(255,255,255,0.05); border:none; color:white; width:40px; height:40px; border-radius:50%; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:0.3s;"
+          onmouseover="this.style.background='rgba(255,255,255,0.1)'"
+          onmouseout="this.style.background='rgba(255,255,255,0.05)'">
+          <i class="fas fa-times"></i>
+        </button>
       </div>
+
       <form id="jobStatusForm">
         <input type="hidden" name="job_id" id="status_job_id">
 
-        <!-- Job Summary Header -->
-        <div id="jobDetailsSummary"
-          style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); padding:1.2rem; border-radius:18px; margin-bottom:1.5rem; display:none; border-left: 4px solid var(--accent);">
-          <div
-            style="font-size:0.7rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:1.5px; font-weight:700; margin-bottom:8px;">
-            Repair Overview</div>
-          <div style="font-weight:800; color:white; font-size:1.1rem; letter-spacing:-0.3px;" id="summary_vehicle">
-            Loading...</div>
-          <div style="font-size:0.85rem; color:var(--accent); font-weight:600; margin-top:2px;" id="summary_service">
-            Please wait</div>
-        </div>
-        <div style="margin-bottom:1rem;">
-          <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Current
-            Status</label>
-          <select name="status" id="job_current_status" required>
-            <option value="PENDING">PENDING (Awaiting Bay)</option>
-            <option value="IN_PROGRESS">IN PROGRESS (Work Started)</option>
-            <option value="COMPLETED">COMPLETED (Finished)</option>
-            <option value="CANCELLED">CANCELLED (Stop Work)</option>
-          </select>
-        </div>
-        <div
-          style="gap:10px; margin-bottom:1rem; <?php echo ($role === 'MECHANIC') ? 'display:none;' : 'display:grid; grid-template-columns:1fr 1fr;'; ?>">
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Assign
-              Mechanic</label>
-            <select <?php echo ($role !== 'MECHANIC') ? 'name="mechanic_id"' : ''; ?> id="status_mechanic_id"></select>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:2.5rem;">
+          <!-- LEFT COLUMN: Status & Assignment -->
+          <div style="display:flex; flex-direction:column; gap:1.5rem;">
+            <!-- Job Summary Header -->
+            <div id="jobDetailsSummary"
+              style="background:linear-gradient(135deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02)); border:1px solid rgba(255,255,255,0.1); padding:1.5rem; border-radius:20px; border-left: 5px solid var(--accent);">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <span
+                  style="font-size:0.7rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:1.5px; font-weight:800;">Repair
+                  Target</span>
+                <span id="summary_origin"
+                  style="font-size:0.6rem; font-weight:900; padding:2px 6px; border-radius:4px; display:none;"></span>
+              </div>
+              <div style="font-weight:800; color:white; font-size:1.2rem; letter-spacing:-0.5px;" id="summary_vehicle">
+                Loading...</div>
+              <div style="font-size:0.9rem; color:var(--accent); font-weight:700; margin-top:4px;" id="summary_service">
+                Please wait</div>
+            </div>
+
+            <div>
+              <label
+                style="display:block; margin-bottom:8px; font-size:0.85rem; color:#94a3b8; font-weight:600;">Operational
+                Status</label>
+              <select name="status" id="job_current_status" required
+                onchange="if(window.toggleJobStatusEdit) window.toggleJobStatusEdit(document.getElementById('saveJobBtn').style.display === 'flex')"
+                style="width:100%; padding:1rem; border-radius:12px; background:rgba(0,0,0,0.2); border:1px solid rgba(255,255,255,0.1); color:white; font-weight:600;">
+                <option value="PENDING">PENDING (Awaiting Bay)</option>
+                <option value="IN_PROGRESS">IN PROGRESS (Work Started)</option>
+                <option value="COMPLETED">COMPLETED (Finished)</option>
+                <option value="CANCELLED">CANCELLED (Stop Work)</option>
+              </select>
+            </div>
+
+            <div
+              style="display:grid; grid-template-columns:1fr 1fr; gap:1rem; <?php echo ($role === 'MECHANIC') ? 'display:none;' : ''; ?>">
+              <div>
+                <label style="display:block; margin-bottom:8px; font-size:0.85rem; color:#94a3b8;">Mechanic</label>
+                <select <?php echo ($role !== 'MECHANIC') ? 'name="mechanic_id"' : ''; ?> id="status_mechanic_id"
+                  style="width:100%;"></select>
+              </div>
+              <div>
+                <label style="display:block; margin-bottom:8px; font-size:0.85rem; color:#94a3b8;">Service Bay</label>
+                <select <?php echo ($role !== 'MECHANIC') ? 'name="bay_id"' : ''; ?> id="status_bay_id"
+                  style="width:100%;"></select>
+              </div>
+            </div>
+
+            <?php if ($role === 'MECHANIC'): ?>
+              <input type="hidden" name="mechanic_id" id="status_mechanic_id_hidden">
+              <input type="hidden" name="bay_id" id="status_bay_id_hidden">
+            <?php endif; ?>
+
+            <div>
+              <label style="display:block; margin-bottom:8px; font-size:0.85rem; color:#94a3b8;">Work Remarks</label>
+              <textarea name="remarks" id="status_remarks" placeholder="Update on findings..."
+                style="width:100%; background:rgba(0,0,0,0.2); border:1px solid rgba(255,255,255,0.1); color:white; border-radius:12px; padding:1rem; min-height:100px; outline:none; box-sizing:border-box; font-size:0.9rem;"></textarea>
+            </div>
           </div>
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Assign
-              Bay</label>
-            <select <?php echo ($role !== 'MECHANIC') ? 'name="bay_id"' : ''; ?> id="status_bay_id"></select>
+
+          <!-- RIGHT COLUMN: Inspection & Parts -->
+          <div style="display:flex; flex-direction:column; gap:1.5rem;">
+            <div style="<?php echo ($role !== 'MECHANIC') ? 'display:none;' : ''; ?>">
+              <label
+                style="display:block; margin-bottom:12px; font-size:0.8rem; color:var(--accent); font-weight:800; text-transform:uppercase; letter-spacing:1px;">Inspection
+                Checklist</label>
+              <div
+                style="display:grid; grid-template-columns:1fr 1fr; gap:12px; background:rgba(255,255,255,0.02); padding:1.2rem; border-radius:18px; border:1px solid rgba(255,255,255,0.05);">
+                <label style="display:flex; align-items:center; gap:10px; font-size:0.85rem; cursor:pointer;"><input
+                    type="checkbox" class="ann-chk" value="Engine Fluid"> Engine</label>
+                <label style="display:flex; align-items:center; gap:10px; font-size:0.85rem; cursor:pointer;"><input
+                    type="checkbox" class="ann-chk" value="Tire Pressure"> Tires</label>
+                <label style="display:flex; align-items:center; gap:10px; font-size:0.85rem; cursor:pointer;"><input
+                    type="checkbox" class="ann-chk" value="Battery Level"> Battery</label>
+                <label style="display:flex; align-items:center; gap:10px; font-size:0.85rem; cursor:pointer;"><input
+                    type="checkbox" class="ann-chk" value="Brake System"> Brakes</label>
+                <label style="display:flex; align-items:center; gap:10px; font-size:0.85rem; cursor:pointer;"><input
+                    type="checkbox" class="ann-chk" value="Headlights"> Lighting</label>
+                <label style="display:flex; align-items:center; gap:10px; font-size:0.85rem; cursor:pointer;"><input
+                    type="checkbox" class="ann-chk" value="Suspension"> Suspension</label>
+              </div>
+            </div>
+
+            <!-- Parts Consumption Integration -->
+            <div
+              style="flex:1; display:flex; flex-direction:column; border-top:1px solid rgba(255,255,255,0.05); padding-top:1.5rem;">
+              <label
+                style="display:block; margin-bottom:12px; font-size:0.8rem; color:var(--accent); font-weight:800; text-transform:uppercase; letter-spacing:1px;">Parts
+                & Materials</label>
+
+              <div style="display:flex; flex-direction:column; gap:10px; margin-bottom:1rem;">
+                <div id="partComboboxWrapper" style="position:relative;">
+                  <div style="position:relative;">
+                    <i class="fas fa-search"
+                      style="position:absolute; left:12px; top:50%; transform:translateY(-50%); font-size:0.8rem; color:var(--text-dim);"></i>
+                    <input type="text" id="partComboboxInput" placeholder="Search or select part..." autocomplete="off"
+                      style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:1rem 2.5rem 1rem 2.5rem; border-radius:15px; font-size:0.95rem; outline:none; box-sizing:border-box; transition:0.3s; cursor:pointer;"
+                      onfocus="window.showPartResults()" oninput="window.filterPartCombobox(this.value)">
+                    <input type="hidden" id="selectedPartId" value="">
+                    <i class="fas fa-chevron-down" id="comboboxArrow"
+                      onclick="event.stopPropagation(); window.togglePartResults()"
+                      style="position:absolute; right:15px; top:50%; transform:translateY(-50%); font-size:0.8rem; color:var(--text-dim); cursor:pointer; transition:0.3s; padding:10px; margin-right:-10px;"></i>
+                  </div>
+                  <!-- Floating Results List -->
+                  <div id="partResultsList"
+                    style="display:none; position:absolute; top:110%; left:0; width:100%; background:#1f2937; border:1px solid rgba(255,255,255,0.1); border-radius:15px; max-height:250px; overflow-y:auto; z-index:10000; box-shadow:0 20px 40px rgba(0,0,0,0.5); padding:8px;">
+                    <!-- Items injected here -->
+                  </div>
+                </div>
+                <div style="display:flex; gap:10px;">
+                  <div
+                    style="flex:1; display:flex; align-items:center; gap:8px; background:rgba(0,0,0,0.2); border:1px solid rgba(255,255,255,0.1); padding:0 10px; border-radius:10px;">
+                    <span style="font-size:0.75rem; color:var(--text-dim);">Qty:</span>
+                    <input type="number" id="partQty" value="1" min="1"
+                      style="flex:1; background:none; border:none; color:white; padding:0.8rem 0; font-weight:800; outline:none; text-align:center;">
+                  </div>
+                  <button type="button" onclick="window.addPartToJob()"
+                    style="flex:1.5; background:var(--accent); color:white; border:none; border-radius:10px; padding:0.8rem; font-weight:800; cursor:pointer; box-shadow:0 5px 15px var(--accent-glow);">Add
+                    to Job</button>
+                </div>
+              </div>
+
+              <!-- Services & Labor Section (Moved Up) -->
+              <div style="margin-bottom:1.5rem;">
+                <label
+                  style="display:block; margin-bottom:12px; font-size:0.8rem; color:var(--accent); font-weight:800; text-transform:uppercase; letter-spacing:1px;">Services
+                  & Labor</label>
+                <div style="display:flex; gap:10px;">
+                  <div id="serviceComboboxWrapper" style="position:relative; flex:1;">
+                    <input type="text" id="serviceComboboxInput" placeholder="Add another service..." autocomplete="off"
+                      style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem 1rem; border-radius:12px; font-size:0.9rem; outline:none;"
+                      onfocus="document.getElementById('serviceResultsList').style.display='block'; window.loadServiceSelector();"
+                      oninput="window.filterServiceCombobox(this.value)">
+                    <input type="hidden" id="selectedServiceId" value="">
+                    <div id="serviceResultsList"
+                      style="display:none; position:absolute; top:110%; left:0; width:100%; background:#1f2937; border:1px solid rgba(255,255,255,0.1); border-radius:12px; max-height:200px; overflow-y:auto; z-index:10001; padding:5px;">
+                    </div>
+                  </div>
+                  <button type="button" onclick="window.addServiceToJob()"
+                    style="background:rgba(255,255,255,0.1); color:white; border:none; border-radius:12px; padding:0 15px; font-weight:700; cursor:pointer;">Add</button>
+                </div>
+              </div>
+
+              <div id="jobPartsList"
+                style="flex:1; display:flex; flex-direction:column; gap:8px; min-height:120px; max-height:220px; overflow-y:auto; background:rgba(0,0,0,0.15); border-radius:15px; padding:12px; border:1px solid rgba(255,255,255,0.03);">
+                <div style="text-align:center; color:var(--text-dim); font-size:0.8rem; padding:20px;">No parts
+                  recorded.</div>
+              </div>
+
+              <div
+                style="display:flex; justify-content:space-between; align-items:center; margin-top:12px; padding:12px; background:rgba(16,185,129,0.05); border-radius:12px; border:1px solid rgba(16,185,129,0.1);">
+                <span style="font-size:0.85rem; color:var(--text-dim); font-weight:600;">Total Parts Value:</span>
+                <span id="totalPartsBill" style="font-size:1.1rem; font-weight:900; color:var(--accent);">₱0.00</span>
+              </div>
+
+              <div
+                style="display:flex; justify-content:space-between; align-items:center; margin-top:8px; padding:12px; background:var(--accent); border-radius:12px; box-shadow:0 10px 20px rgba(var(--accent-rgb), 0.2);">
+                <div style="display:flex; flex-direction:column;">
+                  <span style="font-size:0.85rem; color:white; font-weight:700;">Overall Bill:</span>
+                  <span style="font-size:0.65rem; color:rgba(255,255,255,0.7);">Incl. Service & Parts</span>
+                </div>
+                <span id="totalOverallBill" style="font-size:1.2rem; font-weight:900; color:white;">₱0.00</span>
+              </div>
+
+
+            </div>
           </div>
         </div>
 
-        <!-- Hidden inputs for mechanic role so values don't get lost since selects are disabled -->
-        <?php if ($role === 'MECHANIC'): ?>
-        <input type="hidden" name="mechanic_id" id="status_mechanic_id_hidden">
-        <input type="hidden" name="bay_id" id="status_bay_id_hidden">
-        <?php endif; ?>
-
-        <div style="<?php echo ($role !== 'MECHANIC') ? 'display:none;' : ''; ?> margin-bottom:1.5rem;">
-          <label
-            style="display:block; margin-bottom:10px; font-size:0.85rem; color:#94a3b8; font-weight:700; text-transform:uppercase;">Vehicle
-            Inspection Checklist</label>
-          <div
-            style="display:grid; grid-template-columns:1fr 1fr; gap:10px; background:rgba(255,255,255,0.02); padding:1rem; border-radius:12px; border:1px solid rgba(255,255,255,0.05);">
-            <label style="display:flex; align-items:center; gap:8px; font-size:0.8rem; cursor:pointer;"><input
-                type="checkbox" class="ann-chk" value="Engine Fluid"> Engine
-              Fluid</label>
-            <label style="display:flex; align-items:center; gap:8px; font-size:0.8rem; cursor:pointer;"><input
-                type="checkbox" class="ann-chk" value="Tire Pressure"> Tire
-              Pressure</label>
-            <label style="display:flex; align-items:center; gap:8px; font-size:0.8rem; cursor:pointer;"><input
-                type="checkbox" class="ann-chk" value="Battery Level"> Battery
-              Level</label>
-            <label style="display:flex; align-items:center; gap:8px; font-size:0.8rem; cursor:pointer;"><input
-                type="checkbox" class="ann-chk" value="Brake System"> Brake
-              System</label>
-            <label style="display:flex; align-items:center; gap:8px; font-size:0.8rem; cursor:pointer;"><input
-                type="checkbox" class="ann-chk" value="Headlights"> Lighting
-              System</label>
-            <label style="display:flex; align-items:center; gap:8px; font-size:0.8rem; cursor:pointer;"><input
-                type="checkbox" class="ann-chk" value="Suspension"> Suspension</label>
-          </div>
-        </div>
-        <div style="margin-bottom:1.5rem;">
-          <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Work
-            Remarks /
-            Updates</label>
-          <textarea name="remarks" id="status_remarks" placeholder="e.g. Parts arrived, starting engine repair..."
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; border-radius:10px; padding:1rem; min-height:80px;"></textarea>
-        </div>
-        <div id="jobModalActions" style="margin-top:2rem;">
-          <button type="button" id="editJobBtn" onclick="toggleJobStatusEdit(true)"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:1rem; border-radius:12px; font-weight:700; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:10px;">
-            <i class="fas fa-edit"></i> Edit Job Assignment
+        <div id="jobModalActions" style="margin-top:2.5rem; display:flex; gap:1rem;">
+          <button type="button" id="editJobBtn" onclick="window.toggleJobStatusEdit(true)"
+            style="flex:1; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:1.2rem; border-radius:15px; font-weight:700; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:10px;">
+            <i class="fas fa-user-cog"></i> Update Assignment
           </button>
 
           <button type="submit" id="saveJobBtn"
-            style="width:100%; background:var(--accent); color:white; border:none; padding:1.2rem; border-radius:15px; font-weight:700; cursor:pointer; display:none; align-items:center; justify-content:center; gap:12px; box-shadow:0 10px 25px var(--accent-glow); transition:0.3s;">
-            <i class="fas fa-check-circle" style="font-size:1.1rem;"></i> <span>
-              <?php echo ($role === 'MECHANIC') ? 'Save Progress' : 'Save Updates'; ?>
-            </span>
+            style="flex:2; background:linear-gradient(135deg, var(--accent), #059669); color:white; border:none; padding:1.2rem; border-radius:15px; font-weight:800; font-size:1rem; cursor:pointer; display:none; align-items:center; justify-content:center; gap:12px; box-shadow:0 15px 35px var(--accent-glow); transition:0.3s;">
+            <i class="fas fa-save"></i> <span>Commit Progress</span>
           </button>
         </div>
       </form>
+    </div>
+  </div>
 
-      <script>
-        console.log('Main Dashboard Engine Initialized');
-        console.log('Job Script Initialized'); // Diagnostic check
-        function dashboardOverviewRefresh() {
-          fetch('tenant-dashboard.php?action=fetch_overview_stats')
-            .then(r => r.json()).then(data => {
-              if (document.getElementById('stat_avail_bays')) document.getElementById('stat_avail_bays').innerText = data.avail_bays;
-              if (document.getElementById('stat_pending_jobs')) document.getElementById('stat_pending_jobs').innerText = data.pending_jobs;
-              if (document.getElementById('stat_revenue')) document.getElementById('stat_revenue').innerText = '₱' + parseFloat(data.revenue).toLocaleString();
-              if (document.getElementById('stat_pending-payments')) {
-                document.getElementById('stat_pending-payments').innerText = '₱' + parseFloat(data.unpaid_balance).toLocaleString();
-              }
-            });
-          refreshDashboardJobs();
+  <script>
+    window.onerror = function (msg, url, line) {
+      alert("GLOBAL JS ERROR: " + msg + " at " + line);
+      return false;
+    };
+    console.log('Main Dashboard Engine Initialized');
+    console.log('FINAL_VER_ALPHA_ACTIVE'); // CACHE BUSTER
+
+    // Ultimate Job Status Engine logic moved to the top for immediate availability
+
+
+    window.openJobStatusModal = openRepairJobStatusModal_Final;
+    window.openRepairJobStatusModal_Final = openRepairJobStatusModal_Final;
+    window.toggleJobStatusEdit = toggleJobStatusEdit;
+    // ULTIMATE GLOBAL EXPORTS - ENSURE AVAILABILITY
+    // window.showAlert = showAlert; // Already global
+    // window.showToast = showToast; // Already global
+    // window.closeModal = closeModal; // Already global
+    window.dashboardOverviewRefresh = dashboardOverviewRefresh;
+    window.refreshDashboardJobs = refreshDashboardJobs;
+
+    // --- ULTIMATE GLOBAL DELEGATION ---
+    document.addEventListener('click', function (e) {
+      const btn = e.target.closest('.job-status-btn');
+      if (btn) {
+        console.log("[ULTIMATE-CLICK] Captured via delegation", btn.dataset);
+        const d = btn.dataset;
+        if (typeof window.handleJobClick === 'function') {
+          window.handleJobClick(d.jid, d.status, d.mid, d.bid, d.edit === 'true', d.focus === 'true');
+        } else {
+          window.openJobStatusModal(d.jid, d.status, d.mid, d.bid, d.edit === 'true', d.focus === 'true');
+        }
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }, true); // Capture phase to beat any other listeners
+
+    document.addEventListener('DOMContentLoaded', () => {
+      console.log("DOM Loaded - Triggering Refresh");
+      if (typeof dashboardOverviewRefresh === 'function') dashboardOverviewRefresh();
+    });
+    // Immediate fallback call
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
+      dashboardOverviewRefresh();
+      if (typeof refreshDashboardJobs === 'function') refreshDashboardJobs();
+    }
+
+    function dashboardOverviewRefresh() {
+      console.log("[DASH] Overview Refresh Triggered");
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+      fetch('tenant-dashboard.php?action=fetch_overview_stats&_t=' + Date.now(), { signal: controller.signal })
+        .then(r => r.json()).then(data => {
+          clearTimeout(timeoutId);
+          console.log("[DASH] Stats Received", data);
+          if (document.getElementById('stat_avail_bays')) document.getElementById('stat_avail_bays').innerText = data.avail_bays;
+          if (document.getElementById('stat_pending_jobs')) document.getElementById('stat_pending_jobs').innerText = data.pending_jobs;
+          if (document.getElementById('stat_revenue')) document.getElementById('stat_revenue').innerText = '₱' + parseFloat(data.revenue).toLocaleString();
+          if (document.getElementById('stat_pending-payments')) {
+            document.getElementById('stat_pending-payments').innerText = '₱' + parseFloat(data.unpaid_balance).toLocaleString();
+          }
+        }).catch(err => console.log("[DASH] Stats Timeout/Error"));
+      refreshDashboardJobs();
+    }
+
+    async function refreshDashboardJobs() {
+      if (window.isFetchingJobs) return;
+      window.isFetchingJobs = true;
+
+      const body = document.getElementById('dashboardRepairJobsBody');
+      const completedBody = document.getElementById('completedJobsBody');
+      if (!body) {
+        window.isFetchingJobs = false;
+        return;
+      }
+
+      console.log("[ULTRA-DASH] Syncing...");
+
+      try {
+        const url = window.location.origin + window.location.pathname + '?action=fetch_dashboard_jobs_diagnostic&_t=' + Date.now();
+        const response = await fetch(url);
+        const text = await response.text();
+
+        const jsonMatch = text.match(/\[[\s\S]*\]/) || text.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) throw new Error("Server response malformed.");
+        const data = JSON.parse(jsonMatch[0]);
+
+        if (data.error || data.status === 'error') throw new Error(data.error || data.message || "Unknown error");
+
+        let activeHtml = '';
+        let completedHtml = '';
+        const role = '<?php echo strtoupper($_SESSION['role'] ?? ''); ?>';
+        console.log("[DEBUG] Current Role:", role);
+
+        if (!Array.isArray(data) || data.length === 0) {
+          body.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:3rem; color:var(--text-dim);">No active assignments found.</td></tr>';
+          if (completedBody) completedBody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:3rem; color:var(--text-dim);">No history found.</td></tr>';
+          window.isFetchingJobs = false;
+          return;
         }
 
-        function refreshDashboardJobs() {
-          const body = document.getElementById('dashboardRepairJobsBody');
-          if (!body) return;
+        data.forEach(job => {
+          const status = (job.status || '').toUpperCase();
+          const isCashier = role === 'CASHIER' || role === 'STAFF'; // Add staff check just in case
 
-          fetch('tenant-dashboard.php?action=fetch_dashboard_repair_jobs')
-            .then(r => r.json())
-            .then(data => {
-              if (data.length === 0) {
-                body.innerHTML = `<tr><td colspan="6" style="text-align:center; color:var(--text-dim); padding:3rem;">No active repair sessions found.</td></tr>`;
-                return;
-              }
+          // FOR CASHIER/STAFF: Hide PENDING and REJECTED
+          if (isCashier && (status === 'PENDING' || status === 'REJECTED')) return;
 
-              let html = '';
-              const role = '<?php echo $role; ?>';
-              data.forEach(job => {
-                if (role === 'CASHIER') {
-                  const bill = parseFloat(job.total_amount || 0).toLocaleString();
-                  const pStatus = job.payment_status || 'UNPAID';
-                  const pBadgeClass = pStatus === 'PAID' ? 'badge-active' : 'badge-pending';
-                  
-                  const jStatus = job.status || 'PENDING';
-                  let jBadgeClass = 'badge-pending';
-                  if (jStatus === 'COMPLETED') jBadgeClass = 'badge-active';
-                  else if (jStatus === 'IN_PROGRESS' || jStatus === 'STARTED') jBadgeClass = 'badge-info';
-                  else if (jStatus === 'CANCELLED') jBadgeClass = 'badge-danger';
+          const statusClass = status === 'COMPLETED' || status === 'SETTLED' ? 'badge-active' : (status === 'IN_PROGRESS' ? 'badge-info' : 'badge-pending');
+          const isMech = role === 'MECHANIC';
 
-                  const actionBtn = pStatus === 'PAID' ? `<span style="color:var(--accent); font-weight:700;"><i class="fas fa-check-circle"></i> Settled</span>` : `<button class="btn-action" style="padding:4px 12px; font-size:0.75rem" onclick="window.openPaymentForJob(${job.job_id}, ${job.customer_id}, ${job.total_amount})">Collect</button>`;
-                  
-                  html += `<tr>
-                    <td><strong>${job.plate_no}</strong></td>
-                    <td>${job.make} ${job.model}<br><small style="color:var(--text-dim)">Owner: ${job.owner_name}</small></td>
-                    <td>${job.service_name}</td>
-                    <td>₱${bill}</td>
-                    <td>
-                        <div style="display:flex; flex-direction:column; gap:4px; align-items:flex-start;">
-                            <span class="badge ${pBadgeClass}" style="font-size:0.65rem;">Payment: ${pStatus}</span>
-                            <span class="badge ${jBadgeClass}" style="font-size:0.6rem; opacity:0.8;">Service: ${jStatus}</span>
-                        </div>
-                    </td>
-                    <td>${actionBtn}</td>
-                  </tr>`;
-                } else {
-                  const statusClass = job.status === 'COMPLETED' ? 'badge-active' : (job.status === 'IN_PROGRESS' ? 'badge-processing' : 'badge-pending');
-                  html += `<tr>
-                    <td><strong>${job.plate_no}</strong></td>
-                    <td>${job.make} ${job.model}</td>
-                    <td><i class="fas fa-user-cog" style="color:var(--accent)"></i> ${job.mechanic_name}</td>
-                    <td><span class="badge ${statusClass}">${job.status}</span></td>
-                    ${role === 'MECHANIC' ? `<td><button class="btn-action" style="padding:4px 12px; font-size:0.75rem" onclick="openJobStatusModal(${job.job_id}, '${job.status}', ${job.mechanic_id}, ${job.bay_id}, true)">Update</button></td>` : ''}
-                  </tr>`;
-                }
-              });
-              body.innerHTML = html;
-            });
+          const isApp = parseInt(job.appointment_id) > 0;
+          const originBadge = isApp
+            ? `<span style="font-size:0.65rem; background:rgba(59,130,246,0.1); color:#3b82f6; padding:2px 6px; border-radius:4px; border:1px solid rgba(59,130,246,0.2); margin-left:8px; vertical-align:middle;">APPOINTMENT</span>`
+            : `<span style="font-size:0.65rem; background:rgba(16,185,129,0.1); color:#10b981; padding:2px 6px; border-radius:4px; border:1px solid rgba(16,185,129,0.2); margin-left:8px; vertical-align:middle;">WALK-IN</span>`;
+
+          let row = `<tr>
+                <td>
+                  <div style="display:flex; align-items:center;">
+                    <strong>${job.plate_no || 'N/A'}</strong>
+                    ${originBadge}
+                  </div>
+                </td>`;
+
+          if (isCashier) {
+            row += `
+                <td>
+                  <div style="font-weight:600;">${job.customer_name || 'Walk-in'}</div>
+                  <div style="font-size:0.75rem; color:var(--text-dim);">${(job.make || '') + ' ' + (job.model || '---')}</div>
+                </td>
+                <td><span style="font-size:0.85rem; font-weight:700;">${job.service_name || 'General Repair'}</span></td>
+                <td style="font-weight:800; color:var(--accent);">₱${parseFloat(job.total_amount || 0).toLocaleString()}</td>
+                <td><span class="badge ${statusClass}">${status}</span></td>
+                <td>
+                   <button class="btn-action" style="padding:6px 12px; font-size:0.75rem; background:#10b981; border:none;" 
+                           onclick="window.openPaymentForJob('${job.job_id}', '${job.customer_id || ''}', '${job.total_amount || 0}', '${job.customer_name || ''}')">
+                     <i class="fas fa-cash-register"></i> Collect
+                   </button>
+                </td>`;
+          } else {
+            row += `
+                <td>${(job.make || '') + ' ' + (job.model || '---')}</td>
+                <td><span style="font-size:0.85rem; font-weight:700;">${job.service_name || 'General Repair'}</span></td>
+                <td><i class="fas fa-user-cog" style="color:var(--accent)"></i> ${job.mechanic_name || 'Unassigned'}</td>
+                <td><span class="badge ${statusClass}">${status}</span></td>
+                ${isMech ? `
+                <td>
+                    <div style="display:flex; gap:8px;">
+                        <button class="btn-action job-status-btn" style="padding:6px 12px; font-size:0.75rem; min-width:110px;" 
+                                onclick="window.handleJobClick('${job.job_id}', '${status}', '${job.mechanic_id || 0}', '${job.bay_id || 0}', 'true', 'false')">
+                            <i class="fas fa-sync-alt"></i> Update Status
+                        </button>
+                    </div>
+                </td>` : ''}`;
+          }
+          row += `</tr>`;
+          activeHtml += row;
+        });
+
+        body.innerHTML = activeHtml || '<tr><td colspan="6" style="text-align:center; padding:2rem; color:var(--text-dim);">No active jobs.</td></tr>';
+        window.isFetchingJobs = false;
+      } catch (err) {
+        window.isFetchingJobs = false;
+        console.error("[ULTRA-DASH] Error:", err);
+      }
+    }
+
+    async function refreshSettledJobs() {
+      const body = document.getElementById('settledJobsBody');
+      if (!body) return;
+
+      body.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:3rem; color:var(--text-dim);"><i class="fas fa-spinner fa-spin"></i> Loading settled history...</td></tr>';
+
+      try {
+        const response = await fetch('tenant-dashboard.php?action=fetch_settlement_history&_t=' + Date.now());
+        const data = await response.json();
+
+        if (data.error) throw new Error(data.error);
+
+        let html = '';
+        data.forEach(job => {
+          const status = (job.status || 'PENDING').toUpperCase();
+          const statusClass = status === 'COMPLETED' || status === 'SETTLED' ? 'badge-active' : (status === 'CANCELLED' || status === 'REJECTED' ? 'badge-danger' : 'badge-pending');
+
+          html += `<tr>
+                <td><strong>${job.plate_no || 'N/A'}</strong></td>
+                <td>
+                  <div style="font-weight:600;">${job.customer_name || 'Walk-in'}</div>
+                  <div style="font-size:0.75rem; color:var(--text-dim);">${(job.make || '') + ' ' + (job.model || '---')}</div>
+                </td>
+                <td><span style="font-size:0.85rem; font-weight:700;">${job.service_name || 'General Repair'}</span></td>
+                <td style="font-weight:800; color:var(--accent);">₱${parseFloat(job.total_amount || 0).toLocaleString()}</td>
+                <td><span class="badge ${statusClass}">${status}</span></td>
+                <td>
+                  <button class="btn-action" style="padding:6px 12px; font-size:0.75rem; background:rgba(59,130,246,0.1); color:#3b82f6; border:1px solid rgba(59,130,246,0.2);" 
+                    onclick="window.viewJobReceipt(${job.job_id})">
+                    <i class="fas fa-file-invoice"></i> Receipt
+                  </button>
+                </td>
+              </tr>`;
+        });
+
+        body.innerHTML = html || '<tr><td colspan="6" style="text-align:center; padding:3rem; color:var(--text-dim);">No settled jobs found in history.</td></tr>';
+      } catch (err) {
+        console.error("Settled Jobs Error:", err);
+        body.innerHTML = '<tr><td colspan="6" style="text-align:center; color:var(--danger); padding:2rem;">' + err.message + '</td></tr>';
+      }
+    }
+    window.printSettledHistory = function () {
+      const table = document.getElementById('settledJobsTable');
+      if (!table) return;
+
+      const shopName = "<?php echo addslashes($shop_name ?? 'Auto Shop'); ?>";
+      const printWindow = window.open('', '_blank', 'width=1000,height=800');
+
+      const tableClone = table.cloneNode(true);
+      // Remove action columns/buttons from print
+      const headers = tableClone.querySelectorAll('th');
+      const rows = tableClone.querySelectorAll('tr');
+
+      let grandTotal = 0;
+      rows.forEach((row, index) => {
+        const cells = row.querySelectorAll('td');
+        if (cells.length >= 5) {
+          // TOTAL BILL is index 4
+          const amountText = cells[4].innerText.replace(/[^0-9.]/g, '');
+          grandTotal += parseFloat(amountText) || 0;
         }
+      });
 
-        window.showEODReport = function() {
-          const content = document.getElementById('eodContent');
-          const dateText = document.getElementById('eodDateText');
-          content.innerHTML = '<div style="text-align:center; padding:3rem;"><i class="fas fa-spinner fa-spin fa-2x"></i><p style="margin-top:1rem;">Calculating collection totals...</p></div>';
-          openModal('eodModal');
+      // Remove action columns/buttons from print
+      headers[headers.length - 1].remove();
+      rows.forEach(row => {
+        const cells = row.querySelectorAll('td');
+        if (cells.length > 0) cells[cells.length - 1].remove();
+      });
 
-          fetch('tenant-dashboard.php?action=fetch_eod_summary')
-            .then(r => r.json())
-            .then(data => {
-              dateText.innerText = new Date(data.date).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-              
-              let breakdownHtml = '';
-              data.breakdown.forEach(m => {
-                breakdownHtml += `
+      printWindow.document.write(`
+        <html>
+          <head>
+            <title>Settled Jobs History Report</title>
+            <style>
+              body { font-family: sans-serif; padding: 20px; color: #333; }
+              header { text-align: center; margin-bottom: 30px; border-bottom: 2px solid #333; padding-bottom: 10px; }
+              table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+              th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+              th { background: #f4f4f4; }
+              .badge { display: none; } /* Hide badges in print if they look bad, or style them */
+              .total-cell { font-weight: bold; }
+              @media print {
+                .no-print { display: none; }
+              }
+            </style>
+          </head>
+          <body>
+            <header>
+              <h1>${shopName}</h1>
+              <h2>Settled Jobs History Report</h2>
+              <p>Generated on: ${new Date().toLocaleString()}</p>
+            </header>
+            ${tableClone.outerHTML}
+            
+            <div style="margin-top: 20px; text-align: right; padding: 15px; border: 2px solid #333; background: #f9f9f9;">
+              <span style="font-size: 1.2rem; font-weight: bold; margin-right: 20px;">GRAND TOTAL:</span>
+              <span style="font-size: 1.5rem; font-weight: 900; color: #10b981;">₱${grandTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+            </div>
+
+            <div style="margin-top: 50px; text-align: right; font-size: 0.9rem;">
+              <p>__________________________</p>
+              <p>Authorized Signature</p>
+            </div>
+            <script>
+              window.onload = function() { window.print(); window.close(); }
+            <\/script>
+          </body>
+        </html>
+      `);
+      printWindow.document.close();
+    };
+    window.refreshSettledJobs = refreshSettledJobs;
+
+    // Auto-retry every 10s if stuck
+    setInterval(() => {
+      const body = document.getElementById('dashboardRepairJobsBody');
+      if (body && body.innerText.includes('Loading')) {
+        console.log("[ULTRA-DASH] Stuck detected, retrying...");
+        refreshDashboardJobs();
+      }
+    }, 10000);
+
+    window.refreshMyUpcomingAppointments = function () {
+      const body = document.getElementById('myUpcomingAppointmentsBody');
+      if (!body) return;
+
+      fetch('tenant-dashboard.php?action=fetch_my_upcoming_appointments')
+        .then(r => r.json())
+        .then(data => {
+          if (!data || data.length === 0) {
+            body.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-dim); padding:3rem;">No upcoming assigned appointments.</td></tr>';
+            return;
+          }
+
+          body.innerHTML = data.map(a => {
+            const d = new Date(a.appointment_date + ' ' + a.appointment_time);
+            const dateStr = d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+            const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+            return `
+                <tr>
+                  <td>
+                    <div style="font-weight:800; color:#fff;">${dateStr}</div>
+                    <div style="font-size:0.8rem; color:var(--accent); font-weight:700;"><i class="far fa-clock"></i> ${timeStr}</div>
+                  </td>
+                  <td>
+                    <div style="font-weight:700; color:#fff;">${a.customer_name}</div>
+                    <div style="font-size:0.75rem; color:var(--text-dim);">Customer ID: #${a.customer_id}</div>
+                  </td>
+                  <td>
+                    <div style="font-weight:700;">${a.plate_no || '---'}</div>
+                    <div style="font-size:0.75rem; color:var(--text-dim);">${a.make || ''} ${a.model || ''}</div>
+                  </td>
+                  <td>
+                    <span style="font-size:0.85rem; font-weight:700; color:var(--accent);">${a.service_name || 'General Service'}</span>
+                  </td>
+                  <td>
+                    <span class="badge badge-info" style="font-size:0.65rem; padding:4px 10px; border-radius:10px;">CONFIRMED</span>
+                  </td>
+                </tr>
+              `;
+          }).join('');
+        })
+        .catch(err => {
+          console.error("Fetch Appts Error:", err);
+          body.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--danger); padding:2rem;">Failed to load appointments.</td></tr>';
+        });
+    };
+
+    // Auto-refresh for mechanic
+    if (typeof userRole !== 'undefined' && userRole === 'MECHANIC') {
+      setTimeout(window.refreshMyUpcomingAppointments, 500);
+      setInterval(window.refreshMyUpcomingAppointments, 30000);
+    }
+
+    window.showEODReport = function () {
+      const content = document.getElementById('eodContent');
+      const dateText = document.getElementById('eodDateText');
+      content.innerHTML = '<div style="text-align:center; padding:3rem;"><i class="fas fa-spinner fa-spin fa-2x"></i><p style="margin-top:1rem;">Calculating collection totals...</p></div>';
+      openModal('eodModal');
+
+      fetch('tenant-dashboard.php?action=fetch_eod_summary')
+        .then(r => r.json())
+        .then(data => {
+          dateText.innerText = new Date(data.date).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+
+          let breakdownHtml = '';
+          data.breakdown.forEach(m => {
+            breakdownHtml += `
                   <div style="background:rgba(255,255,255,0.03); padding:1rem; border-radius:15px; border:1px solid rgba(255,255,255,0.05);">
                     <p style="color:var(--text-dim); font-size:0.75rem; text-transform:uppercase; margin-bottom:5px;">${m.payment_method}</p>
                     <p style="font-size:1.1rem; font-weight:700; color:white;">₱${parseFloat(m.total).toLocaleString()}</p>
                     <small style="color:var(--accent)">${m.count} trans.</small>
                   </div>
                 `;
-              });
+          });
 
-              let transHtml = '';
-              data.transactions.forEach(t => {
-                transHtml += `
+          let transHtml = '';
+          data.transactions.forEach(t => {
+            transHtml += `
                   <div style="display:flex; justify-content:space-between; align-items:center; padding:12px 0; border-bottom:1px solid rgba(255,255,255,0.03);">
                     <div>
                         <p style="margin:0; font-weight:600; font-size:0.9rem;">${t.customer_name || 'Walk-in Customer'}</p>
@@ -7995,9 +11626,9 @@ try {
                     <p style="margin:0; font-weight:700; color:var(--accent);">₱${parseFloat(t.amount).toLocaleString()}</p>
                   </div>
                 `;
-              });
+          });
 
-              content.innerHTML = `
+          content.innerHTML = `
                 <div style="background:var(--accent-gradient); padding:1.5rem; border-radius:20px; text-align:center; margin-bottom:1.5rem;">
                     <p style="color:white; opacity:0.8; font-size:0.85rem; margin-bottom:5px;">Total Collection Today</p>
                     <h2 style="color:white; font-size:2rem; margin:0; font-weight:900;">₱${parseFloat(data.total).toLocaleString()}</h2>
@@ -8013,15 +11644,15 @@ try {
                     ${transHtml || '<p style="text-align:center; color:var(--text-dim); padding:1rem;">No transactions recorded today.</p>'}
                 </div>
               `;
-            });
-        };
+        });
+    };
 
-        window.printEOD = function() {
-            const date = document.getElementById('eodDateText').innerText;
-            const content = document.getElementById('eodContent').innerHTML;
-            const shopName = '<?php echo addslashes($shop_name); ?>';
-            const win = window.open('', '_blank');
-            win.document.write(`
+    window.printEOD = function () {
+      const date = document.getElementById('eodDateText').innerText;
+      const content = document.getElementById('eodContent').innerHTML;
+      const shopName = '<?php echo addslashes($shop_name); ?>';
+      const win = window.open('', '_blank');
+      win.document.write(`
                 <html>
                     <head>
                         <title>EOD Summary - ${date}</title>
@@ -8134,10 +11765,10 @@ try {
                             </thead>
                             <tbody>
                                 ${Array.from(document.querySelectorAll('#eodContent div:last-child > div[style*="display:flex"]')).map(div => {
-                                    const name = div.querySelector('p:first-child').innerText;
-                                    const meta = div.querySelector('small').innerText;
-                                    const price = div.querySelector('p:last-child').innerText;
-                                    return `
+        const name = div.querySelector('p:first-child').innerText;
+        const meta = div.querySelector('small').innerText;
+        const price = div.querySelector('p:last-child').innerText;
+        return `
                                         <tr>
                                             <td>
                                                 <div class="row-customer">${name}</div>
@@ -8146,7 +11777,7 @@ try {
                                             <td class="row-price">${price}</td>
                                         </tr>
                                     `;
-                                }).join('')}
+      }).join('')}
                             </tbody>
                         </table>
 
@@ -8166,665 +11797,611 @@ try {
                     </body>
                 </html>
             `);
-            win.document.close();
-            setTimeout(() => { win.print(); }, 500);
-        };
+      win.document.close();
+      setTimeout(() => { win.print(); }, 500);
+    };
 
-        window.toggleWalkInField = function(val) {
-          const field = document.getElementById('walkinField');
-          if (field) {
-            field.style.display = (val === 'WALKIN') ? 'block' : 'none';
-            const input = field.querySelector('input');
-            if (val === 'WALKIN') {
-              input.setAttribute('required', 'required');
-              input.focus();
-            } else {
-              input.removeAttribute('required');
-            }
-          }
-        };
-
-        window.syncMasterService = function(el, formId) {
-          const form = document.getElementById(formId);
-          const opt = el.options[el.selectedIndex];
-          const nameInput = form.querySelector('input[name="service_name"]');
-          const priceInput = form.querySelector('input[name="price"]');
-          
-          if (opt.value) {
-            const info = JSON.parse(opt.getAttribute('data-info'));
-            nameInput.value = info.service_name;
-            nameInput.readOnly = true;
-            nameInput.style.opacity = "0.6";
-            
-            priceInput.min = info.min_price;
-            priceInput.max = info.max_price;
-            priceInput.placeholder = `Price must be ₱${parseFloat(info.min_price).toLocaleString()} - ₱${parseFloat(info.max_price).toLocaleString()}`;
-            
-            // Visual hint
-            let hint = form.querySelector('.price-hint');
-            if (!hint) {
-               hint = document.createElement('p');
-               hint.className = 'price-hint';
-               hint.style.fontSize = '0.75rem';
-               hint.style.marginTop = '4px';
-               priceInput.parentNode.appendChild(hint);
-            }
-            hint.innerHTML = `<i class="fas fa-info-circle"></i> Price Boundary: <b style="color:var(--success);">₱${parseFloat(info.min_price).toLocaleString()}</b> to <b style="color:var(--error);">₱${parseFloat(info.max_price).toLocaleString()}</b>`;
-          } else {
-            nameInput.readOnly = false;
-            nameInput.style.opacity = "1";
-            priceInput.removeAttribute('min');
-            priceInput.removeAttribute('max');
-            priceInput.placeholder = "0.00";
-            const hint = form.querySelector('.price-hint');
-            if (hint) hint.remove();
-          }
-        };
-
-        window.openPaymentForJob = function (jobId, customerId, amount) {
-          const custSelect = document.querySelector('#addPaymentForm select[name="customer_id"]');
-          const amtInput = document.getElementById('pay_amount');
-          const jidInput = document.getElementById('pay_job_id');
-
-          if (custSelect) {
-              custSelect.value = customerId;
-              window.toggleWalkInField(customerId);
-          }
-          if (amtInput) amtInput.value = amount;
-          if (jidInput) jidInput.value = jobId;
-
-          openModal('paymentModal');
+    window.toggleWalkInField = function (val) {
+      const field = document.getElementById('walkinField');
+      if (field) {
+        field.style.display = (val === 'WALKIN') ? 'block' : 'none';
+        const input = field.querySelector('input');
+        if (val === 'WALKIN') {
+          input.setAttribute('required', 'required');
+          input.focus();
+        } else {
+          input.removeAttribute('required');
         }
+      }
+    };
 
-        function toggleJobStatusEdit(editMode) {
-          const editBtn = document.getElementById('editJobBtn');
-          const saveBtn = document.getElementById('saveJobBtn');
-          const mechSel = document.getElementById('status_mechanic_id');
-          const baySel = document.getElementById('status_bay_id');
-          const statusSel = document.getElementById('job_current_status');
-          const remarksField = document.getElementById('status_remarks');
 
-          if (editMode) {
-            if (editBtn) editBtn.style.display = 'none';
-            if (saveBtn) { saveBtn.style.display = 'flex'; }
-            if (mechSel) mechSel.disabled = false;
-            if (baySel) baySel.disabled = false;
-            if (remarksField) remarksField.disabled = false;
+    window.openPaymentForJob = function (jobId, customerId, amount, walkinName = '') {
+      console.log("[PAYMENT] Open from Jobs. Job:", jobId, "Base:", amount);
+      const custSelect = document.querySelector('#addPaymentForm select[name="customer_id"]');
+      const amtInput = document.getElementById('pay_amount');
+      const amtHidden = document.getElementById('pay_amount_hidden');
+      const jidInput = document.getElementById('pay_job_id');
+      const partsList = document.getElementById('paymentPartsList');
 
-            // Status remains disabled until both Mechanic and Bay are selected
-            if (statusSel) {
-              const hasMech = mechSel && mechSel.value && mechSel.value !== "";
-              const hasBay = baySel && baySel.value && baySel.value !== "";
-              statusSel.disabled = !(hasMech && hasBay);
-            }
-          } else {
-            if (editBtn) editBtn.style.display = 'flex';
-            if (saveBtn) saveBtn.style.display = 'none';
-            if (mechSel) mechSel.disabled = true;
-            if (baySel) baySel.disabled = true;
-            if (statusSel) statusSel.disabled = true;
-            if (remarksField) remarksField.disabled = true;
-          }
+      window.basePaymentAmount = parseFloat(amount || 0);
+
+      if (partsList) partsList.innerHTML = '';
+      const partsJsonInput = document.getElementById('pay_parts_json');
+      if (partsJsonInput) partsJsonInput.value = '[]';
+
+      if (custSelect) {
+        custSelect.value = customerId;
+        window.toggleWalkInField(customerId);
+        if (customerId === 'WALKIN') {
+          const wInput = document.querySelector('#addPaymentForm input[name="walkin_name"]');
+          if (wInput) wInput.value = walkinName;
         }
+      }
+      if (amtInput) amtInput.value = window.basePaymentAmount.toFixed(2);
+      if (amtHidden) amtHidden.value = window.basePaymentAmount.toFixed(2);
+      if (jidInput) jidInput.value = jobId;
 
-        function openJobStatusModal(id, currentStatus, currentMechId, currentBayId, editMode = false) {
-          console.log("MODAL_TRIGGERED", { id, currentStatus, currentMechId, currentBayId });
+      window.syncPaymentParts();
+      openModal('paymentModal');
+    }
 
-          const jidInput = document.getElementById('status_job_id');
-          const statusSelect = document.getElementById('job_current_status');
-          const summaryBox = document.getElementById('jobDetailsSummary');
-          const modalTitle = document.getElementById('jobModalTitle');
 
-          if (!jidInput || !statusSelect) {
-            alert("Interface Error: Job Status Form inputs not found.");
-            return;
+    // Utilities removed (redundant)
+
+    // Utilities removed (redundant)
+
+
+
+    // Redundant modal logic removed
+
+
+    // togglePartResults removed
+
+    // showPartResults and refreshJobPartsList removed
+
+    // Redundant logic removed
+
+
+    // Duplicates removed (Handled by top engine)
+
+
+
+
+    // Real-time badge logic
+    // Standardized Badge Logic
+    function checkAnnBadge() {
+      const storageKey = 'lastAnnId_<?php echo $tenant_id; ?>_<?php echo $_SESSION['user_id'] ?? 0; ?>';
+      const lastSeen = localStorage.getItem(storageKey) || 0;
+
+      fetch('tenant-dashboard.php?action=fetch_latest_ann_id')
+        .then(r => r.json())
+        .then(data => {
+          const badge = document.getElementById('annBadge');
+          if (badge && data.latest_id && data.latest_id > parseInt(lastSeen)) {
+            badge.classList.add('active');
           }
+        }).catch(e => console.log('[SUBS] Badge sync fail'));
+    }
+    checkAnnBadge();
+    setInterval(checkAnnBadge, 15000); // Check every 15s
 
-          if (modalTitle) {
-            modalTitle.innerText = ('<?php echo addslashes($role); ?>' === 'MECHANIC') ? 'Repair Progress Update' : 'Repair Status & Editing';
-          }
-
-          jidInput.value = id;
-          if (statusSelect) {
-            statusSelect.value = currentStatus;
-            const hiddenStatus = document.getElementById('job_current_status_hidden');
-            if (hiddenStatus) hiddenStatus.value = currentStatus;
-          }
-
-          // Set UI state — editMode=true opens directly editable, false = view-first
-          toggleJobStatusEdit(editMode);
-
-          // Fetch extra details for summary
-          if (summaryBox) {
-            summaryBox.style.display = 'block';
-            document.getElementById('summary_vehicle').innerText = "Loading vehicle...";
-            document.getElementById('summary_service').innerText = "---";
-
-            fetch(`tenant-dashboard.php?action=fetch_job_details&job_id=${id} `)
-              .then(res => res.json())
-              .then(data => {
-                if (data.status === 'success' && data.job) {
-                  document.getElementById('summary_vehicle').innerText = `${data.job.plate_no} - ${data.job.make} ${data.job.model} `;
-                  document.getElementById('summary_service').innerText = data.job.service_name;
-
-                  // Also populate the remarks field if available
-                  const remField = document.getElementById('status_remarks');
-                  if (remField) remField.value = data.job.latest_remarks || "";
-                }
-              }).catch(e => console.error("Summary fetch failed", e));
-          }
-
-          const mS = document.getElementById('status_mechanic_id');
-          const bS = document.getElementById('status_bay_id');
-
-          if (mS) {
-            mS.innerHTML = '<option value="">Loading tools...</option>';
-            mS.onchange = () => {
-              const statusSel = document.getElementById('job_current_status');
-              if (statusSel) statusSel.disabled = !(mS.value && bS && bS.value);
-            };
-          }
-          if (bS) {
-            bS.innerHTML = '<option value="">Loading slots...</option>';
-            bS.onchange = () => {
-              const statusSel = document.getElementById('job_current_status');
-              if (statusSel) statusSel.disabled = !(bS.value && mS && mS.value);
-            };
-          }
-
-          const modalEl = document.getElementById('jobStatusModal');
-          if (modalEl) {
-            modalEl.style.display = 'flex';
-            modalEl.style.zIndex = '999999';
-          } else {
-            alert("Modal ID 'jobStatusModal' not found!");
-          }
-
-          fetch(`tenant-dashboard.php?action=fetch_available_resources&preferred_id=${currentBayId || 0}& _t=${Date.now()} `)
-            .then(res => res.text())
-            .then(text => {
-              console.log("Raw API Output for fetch_available_resources:", text);
-              const jsonMatch = text.match(/\{[\s\S]*\}/);
-              if (!jsonMatch) {
-                console.error("Could not parse JSON. Raw API response:", text);
-                alert("API Error: " + text.substring(0, 50));
-                throw new Error("Invalid resource JSON: " + text.substring(0, 50));
-              }
-              const data = JSON.parse(jsonMatch[0]);
-
-              if (data.error) {
-                alert("Database Error: " + data.error);
-                console.error("DB Error:", data.error);
-              }
-
-              let mHtml = '<option value="">-- No Mechanic --</option>';
-              if (data.mechanics) {
-                data.mechanics.forEach(m => {
-                  const sel = (m.mechanic_id == currentMechId) ? 'selected' : '';
-                  const isBusy = (m.status && m.status.toUpperCase() !== 'AVAILABLE') && !sel;
-                  const dis = isBusy ? 'disabled' : '';
-                  const lbl = isBusy ? `${m.full_name} (Busy)` : m.full_name;
-                  mHtml += `<option value="${m.mechanic_id}" ${sel} ${dis}> ${lbl}</option>`;
-                });
-              }
-              if (mS) mS.innerHTML = mHtml;
-
-              let bHtml = '<option value="">-- No Bay --</option>';
-              if (data.bays) {
-                data.bays.forEach(b => {
-                  const sel = (b.bay_id == currentBayId) ? 'selected' : '';
-                  const isOcc = (b.status && b.status.toUpperCase() !== 'AVAILABLE') && !sel;
-                  const dis = isOcc ? 'disabled' : '';
-                  const lbl = isOcc ? `${b.bay_name} (Occupied)` : b.bay_name;
-                  bHtml += `<option value="${b.bay_id}" ${sel} ${dis}> ${lbl}</option>`;
-                });
-              }
-              if (bS) bS.innerHTML = bHtml;
-
-              // Support hidden IDs since selects are disabled for mechanics
-              const mHidden = document.getElementById('status_mechanic_id_hidden');
-              if (mHidden) mHidden.value = currentMechId || '';
-              const bHidden = document.getElementById('status_bay_id_hidden');
-              if (bHidden) bHidden.value = currentBayId || '';
-
-              // Final UI Check: Enable status if job already has resources after fetch
-              const statusSel = document.getElementById('job_current_status');
-              if (statusSel) statusSel.disabled = !(mS.value && bS && bS.value);
-            }).catch(err => console.error("Resource fetch error:", err));
-        }
-        window.openJobStatusModal = openJobStatusModal;
+    // Utilities removed (redundant)
 
 
+    function toggleAnnouncement() {
+      try {
+        const panel = document.getElementById('annPanel');
+        const overlay = document.getElementById('annOverlay');
+        if (panel) panel.classList.toggle('active');
+        if (overlay) overlay.classList.toggle('active');
 
-        // Real-time badge logic
-        // Standardized Badge Logic
-        function checkAnnBadge() {
-          const storageKey = 'lastAnnId_<?php echo $tenant_id; ?>_<?php echo $_SESSION['user_id'] ?? 0; ?>';
-          const lastSeen = localStorage.getItem(storageKey) || 0;
-
-          fetch('tenant-dashboard.php?action=fetch_latest_ann_id')
-            .then(r => r.json())
-            .then(data => {
-              const badge = document.getElementById('annBadge');
-              if (badge && data.latest_id && data.latest_id > parseInt(lastSeen)) {
-                badge.classList.add('active');
-              }
-            }).catch(e => console.log('[SUBS] Badge sync fail'));
-        }
-        checkAnnBadge();
-        setInterval(checkAnnBadge, 15000); // Check every 15s
-
-        function showAlert(title, message, type = 'info') {
-          document.getElementById('notiTitle').innerText = title;
-          document.getElementById('notiMessage').innerText = message;
-          const icon = document.getElementById('notiIcon');
-          const btn = document.getElementById('notiConfirmBtn');
-          const cancelBtn = document.getElementById('notiCancelBtn');
-          cancelBtn.style.display = 'none';
-          btn.onclick = closeNotiModal;
-          if (type === 'error') {
-            icon.innerHTML = '<i class="fa-solid fa-circle-xmark"></i>';
-            icon.style.color = 'var(--danger)';
-            icon.style.background = 'rgba(239, 68, 68, 0.1)';
-          } else if (type === 'success') {
-            icon.innerHTML = '<i class="fa-solid fa-circle-check"></i>';
-            icon.style.color = 'var(--success)';
-            icon.style.background = 'rgba(16, 185, 129, 0.1)';
-          } else {
-            icon.innerHTML = '<i class="fa-solid fa-circle-info"></i>';
-            icon.style.color = 'var(--accent)';
-            icon.style.background = 'rgba(99, 102, 241, 0.1)';
-          }
-          document.getElementById('notificationModal').style.display = 'flex';
-        }
-
-        function showConfirm(title, message, onConfirm) {
-          document.getElementById('notiTitle').innerText = title;
-          document.getElementById('notiMessage').innerText = message;
-          const icon = document.getElementById('notiIcon');
-          const btn = document.getElementById('notiConfirmBtn');
-          const cancelBtn = document.getElementById('notiCancelBtn');
-          icon.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i>';
-          icon.style.color = '#f59e0b';
-          icon.style.background = 'rgba(245, 158, 11, 0.1)';
-          cancelBtn.style.display = 'block';
-          btn.onclick = () => { onConfirm(); closeNotiModal(); };
-          document.getElementById('notificationModal').style.display = 'flex';
-        }
-
-        function closeNotiModal() { document.getElementById('notificationModal').style.display = 'none'; }
-
-        function toggleAnnouncement() {
+        if (panel && panel.classList.contains('active')) {
+          // Mark as read safely
           try {
-            const panel = document.getElementById('annPanel');
-            const overlay = document.getElementById('annOverlay');
-            if (panel) panel.classList.toggle('active');
-            if (overlay) overlay.classList.toggle('active');
-
-            if (panel && panel.classList.contains('active')) {
-              // Mark as read safely
-              try {
-                localStorage.setItem('lastAnnId_<?php echo $tenant_id; ?>_<?php echo $_SESSION['user_id'] ?? 0; ?>', '<?php echo $maxAnnId; ?>');
-              } catch (e) { }
-              const badge = document.getElementById('annBadge');
-              if (badge) badge.classList.remove('active');
-            } else {
-              if (typeof cancelStaffAnnEdit === 'function') {
-                cancelStaffAnnEdit();
-              }
-            }
-          } catch (err) {
-            console.error("Broadcast toggle issue: ", err);
+            localStorage.setItem('lastAnnId_<?php echo $tenant_id; ?>_<?php echo $_SESSION['user_id'] ?? 0; ?>', '<?php echo $maxAnnId; ?>');
+          } catch (e) { }
+          const badge = document.getElementById('annBadge');
+          if (badge) badge.classList.remove('active');
+        } else {
+          if (typeof cancelStaffAnnEdit === 'function') {
+            cancelStaffAnnEdit();
           }
         }
+      } catch (err) {
+        console.error("Broadcast toggle issue: ", err);
+      }
+    }
 
-        // --- NEW MECHANIC DASHBOARD FUNCTIONS ---
-        function refreshMechanicStation() {
-          // Load Work History
-          fetch('tenant-dashboard.php?action=fetch_mechanic_work_log')
-            .then(r => r.json())
-            .then(res => {
-              if (res.status === 'success') {
-                let html = '';
-                res.data.forEach(log => {
-                  html += `<tr>
+    // --- NEW MECHANIC DASHBOARD FUNCTIONS ---
+    function refreshMechanicStation() {
+      // Load Work History
+      fetch('tenant-dashboard.php?action=fetch_mechanic_work_log')
+        .then(r => r.json())
+        .then(res => {
+          if (res.status === 'success') {
+            let html = '';
+            res.data.forEach(log => {
+              html += `<tr>
                 <td style="font-size:0.75rem;">${new Date(log.created_at).toLocaleString()}</td>
                 <td><div style="font-weight:700;">${log.plate_no}</div><div style="font-size:0.75rem; color:var(--text-dim);">${log.make} ${log.model}</div></td>
                 <td><span class="badge ${log.status_update === 'COMPLETED' ? 'badge-active' : 'badge-pending'}">${log.status_update}</span></td>
                 <td style="max-width:300px; font-size:0.85rem;">${log.remarks || '-'}</td>
               </tr>`;
-                });
-                document.getElementById('mechanicHistoryTable').innerHTML = html || '<tr><td colspan="4" style="text-align:center;">No history found.</td></tr>';
-              }
             });
+            document.getElementById('mechanicHistoryTable').innerHTML = html || '<tr><td colspan="4" style="text-align:center;">No history found.</td></tr>';
+          }
+        });
 
-          // Load Inventory Lookup (Read-only)
-          fetch('tenant-dashboard.php?action=fetch_inventory')
-            .then(r => r.json())
-            .then(res => {
-              let html = '';
-              res.forEach(item => {
-                const low = parseInt(item.quantity) < 10;
-                html += `<tr class="inventory-lookup-row">
+      // Load Inventory Lookup (Read-only)
+      fetch('tenant-dashboard.php?action=fetch_inventory')
+        .then(r => r.json())
+        .then(res => {
+          let html = '';
+          res.forEach(item => {
+            const low = parseInt(item.quantity) < 10;
+            html += `<tr class="inventory-lookup-row">
               <td style="font-weight:700;">${item.item_name}</td>
               <td>${item.brand || '-'}</td>
               <td>${item.quantity}</td>
               <td><span class="badge ${low ? 'badge-pending' : 'badge-active'}">${low ? 'LOW STOCK' : 'STOCKED'}</span></td>
             </tr>`;
-              });
-              document.getElementById('inventoryLookupTable').innerHTML = html || '<tr><td colspan="4" style="text-align:center;">No inventory found.</td></tr>';
-            });
-        }
-
-        function filterInventoryLookup(query) {
-          const rows = document.querySelectorAll('.inventory-lookup-row');
-          const q = query.toLowerCase();
-          rows.forEach(r => {
-            const txt = r.innerText.toLowerCase();
-            r.style.display = txt.includes(q) ? '' : 'none';
           });
-        }
+          document.getElementById('inventoryLookupTable').innerHTML = html || '<tr><td colspan="4" style="text-align:center;">No inventory found.</td></tr>';
+        });
+    }
 
-        // Removed duplicated checkAnnBadge
+    function filterInventoryLookup(query) {
+      const rows = document.querySelectorAll('.inventory-lookup-row');
+      const q = query.toLowerCase();
+      rows.forEach(r => {
+        const txt = r.innerText.toLowerCase();
+        r.style.display = txt.includes(q) ? '' : 'none';
+      });
+    }
 
-        function enableStaffAnnEdit() {
-          const display = document.getElementById('annList');
-          const editor = document.getElementById('staffAnnEditor');
-          const ctrl = document.getElementById('staffAnnControls');
-          if (display) display.style.display = 'none';
-          if (editor) editor.style.display = 'block';
-          if (ctrl) ctrl.style.display = 'none';
-        }
+    // Removed duplicated checkAnnBadge
 
-        function cancelStaffAnnEdit() {
-          const display = document.getElementById('annList');
-          const editor = document.getElementById('staffAnnEditor');
-          const ctrl = document.getElementById('staffAnnControls');
-          if (display) display.style.display = 'block';
-          if (editor) editor.style.display = 'none';
-          if (ctrl) ctrl.style.display = 'block';
-        }
+    function enableStaffAnnEdit() {
+      const display = document.getElementById('annList');
+      const editor = document.getElementById('staffAnnEditor');
+      const ctrl = document.getElementById('staffAnnControls');
+      if (display) display.style.display = 'none';
+      if (editor) editor.style.display = 'block';
+      if (ctrl) ctrl.style.display = 'none';
+    }
 
-        function saveStaffAnnEdit() {
-          const val = document.getElementById('staffAnnInput').value;
-          if (!val.trim()) return alert("Please type an announcement.");
+    function cancelStaffAnnEdit() {
+      const display = document.getElementById('annList');
+      const editor = document.getElementById('staffAnnEditor');
+      const ctrl = document.getElementById('staffAnnControls');
+      if (display) display.style.display = 'block';
+      if (editor) editor.style.display = 'none';
+      if (ctrl) ctrl.style.display = 'block';
+    }
 
-          const fd = new FormData();
-          fd.append('announcement', val);
+    function saveStaffAnnEdit() {
+      const val = document.getElementById('staffAnnInput').value;
+      if (!val.trim()) return alert("Please type an announcement.");
 
-          fetch('tenant-dashboard.php?action=edit_staff_ann', { method: 'POST', body: fd })
-            .then(r => r.json())
-            .then(data => {
-              if (data.status === 'success') {
-                location.reload();
-              } else alert(data.message);
-            });
-        }
+      const fd = new FormData();
+      fd.append('announcement', val);
 
-        // --- ELITE REPAIR LOGIC ---
-        function handleStatusSubmit(e) {
-          e.preventDefault();
-          const form = e.target;
-          const fd = new FormData(form);
+      fetch('tenant-dashboard.php?action=edit_staff_ann', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(data => {
+          if (data.status === 'success') {
+            location.reload();
+          } else alert(data.message);
+        });
+    }
 
-          // VALIDATION: MUST assign resources first
-          const mId = document.getElementById('status_mechanic_id')?.value;
-          const bId = document.getElementById('status_bay_id')?.value;
-          if (!mId || !bId) {
-            return showAlert('Assignment Required', 'Please assign both a Mechanic and a Service Bay before saving updates.', 'error');
-          }
+    // Duplicate handleStatusSubmit removed (Handled by top engine)
 
-          // Collect checklist
-          const checked = [];
-          document.querySelectorAll('.ann-chk:checked').forEach(c => checked.push(c.value));
-          fd.append('checklist', checked.join(', '));
+    const jsf = document.getElementById('jobStatusForm');
+    if (jsf) {
+      jsf.addEventListener('submit', window.handleStatusSubmit);
+    }
 
-          fetch('tenant-dashboard.php?action=update_job_status', { method: 'POST', body: fd })
-            .then(r => r.json())
-            .then(data => {
-              if (data.status === 'success') {
-                showToast("Job status successfully updated!");
-                closeModal('jobStatusModal');
-                if (typeof refreshJobOrders === 'function') refreshJobOrders();
-                if (typeof refreshBaysList === 'function') refreshBaysList();
-                if (typeof refreshMechanicsList === 'function') refreshMechanicsList();
-                if (typeof dashboardOverviewRefresh === 'function') dashboardOverviewRefresh();
-              } else showAlert('Validation Error', data.message, 'error');
-            });
-        }
-        const jsf = document.getElementById('jobStatusForm');
-        if (jsf) {
-          jsf.addEventListener('submit', handleStatusSubmit);
-        }
+    function updateTimers() {
+      document.querySelectorAll('.active-timer').forEach(el => {
+        const startStr = el.getAttribute('data-start');
+        if (!startStr) return;
+        const start = new Date(startStr).getTime();
+        const now = new Date().getTime();
+        const diff = now - start;
 
-        function updateTimers() {
-          document.querySelectorAll('.active-timer').forEach(el => {
-            const startStr = el.getAttribute('data-start');
-            if (!startStr) return;
-            const start = new Date(startStr).getTime();
-            const now = new Date().getTime();
-            const diff = now - start;
+        const h = Math.floor(diff / 3600000);
+        const m = Math.floor((diff % 3600000) / 60000);
+        const s = Math.floor((diff % 60000) / 1000);
 
-            const h = Math.floor(diff / 3600000);
-            const m = Math.floor((diff % 3600000) / 60000);
-            const s = Math.floor((diff % 60000) / 1000);
+        el.innerText = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+      });
+    }
+    setInterval(updateTimers, 1000);
 
-            el.innerText = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-          });
-        }
-        setInterval(updateTimers, 1000);
+    // Settings Logic moved to top engine
 
-        window.saveSingleSetting = function (field) {
-          const input = document.getElementById('setting_' + field);
-          if (!input) return;
 
-          const value = input.value;
-          const btn = event.currentTarget;
-          const originalHtml = btn.innerHTML;
+    // Live Preview Logic moved to top engine
 
-          btn.classList.add('saving');
-          btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
+  </script>
 
-          const fd = new FormData();
-          fd.append('field', field);
-          fd.append('value', value);
-
-          fetch('tenant-dashboard.php?action=save_setting_item', { method: 'POST', body: fd })
-            .then(r => r.json())
-            .then(data => {
-              if (data.status === 'success') {
-                showToast("Feature updated successfully!");
-                if (['primary_color', 'secondary_color', 'ui_style', 'border_radius', 'logo_url', 'banner_url', 'shop_name'].includes(field)) {
-                  const frame = document.getElementById('livePreviewFrame');
-                  if (frame) frame.src = frame.src;
-                }
-              } else {
-                showToast(data.message, 'error');
-              }
-            })
-            .catch(err => showToast("Connection error", "error"))
-            .finally(() => {
-              btn.classList.remove('saving');
-              btn.innerHTML = originalHtml;
-            });
-        };
-
-        window.saveSettingWithFile = function (field) {
-          const input = document.getElementById('setting_' + field);
-          if (!input || !input.files[0]) return showToast("Please select a file first", "error");
-
-          const btn = event.currentTarget;
-          const originalHtml = btn.innerHTML;
-
-          btn.classList.add('saving');
-          btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Uploading...';
-
-          const fd = new FormData();
-          fd.append('field', field);
-          fd.append(field, input.files[0]);
-
-          fetch('tenant-dashboard.php?action=save_setting_item', { method: 'POST', body: fd })
-            .then(r => r.json())
-            .then(data => {
-              if (data.status === 'success') {
-                showToast("File uploaded and saved!");
-                const urlInput = document.getElementById('setting_' + field.replace('_file', '_url'));
-                if (urlInput) urlInput.value = data.new_url;
-
-                const frame = document.getElementById('livePreviewFrame');
-                if (frame) frame.src = frame.src;
-              } else {
-                showToast(data.message, 'error');
-              }
-            })
-            .catch(err => showToast("Upload error", "error"))
-            .finally(() => {
-              btn.classList.remove('saving');
-              btn.innerHTML = originalHtml;
-            });
-        };
-
-        window.highlightInPreview = function (field) {
-          const frame = document.getElementById('livePreviewFrame');
-          if (frame && frame.contentWindow) {
-            frame.contentWindow.postMessage({ action: 'highlight', field: field }, '*');
-          }
-        };
-      </script>
-
-      <div class="modal-overlay" id="notificationModal" style="z-index: 9999; display: none;">
-        <div class="modal-card"
-          style="max-width: 450px; text-align: center; padding: 3rem 2.5rem; background: rgba(10,10,20,0.95); border: 1px solid var(--glass-border); box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);">
-          <div id="notiIcon"
-            style="width: 80px; height: 80px; background: rgba(99, 102, 241, 0.1); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 2rem; font-size: 2.5rem; color: var(--accent); transition: 0.3s;">
-            <i class="fa-solid fa-circle-info"></i>
-          </div>
-          <h2 id="notiTitle" style="margin-bottom: 1rem; font-size: 1.6rem; font-weight: 800; color: white;">
-            Notice
-          </h2>
-          <p id="notiMessage" style="color: var(--text-dim); margin-bottom: 2.5rem; line-height: 1.6; font-size: 1rem;">
-            Message goes
-            here.</p>
-          <div id="notiActions" style="display: flex; gap: 1rem; justify-content: center;">
-            <button id="notiConfirmBtn" class="btn-action"
-              style="min-width: 120px; padding: 0.9rem 2rem; border-radius: 12px; font-weight: 800; cursor: pointer; background: var(--accent); border:none; color:white;">Confirm</button>
-            <button id="notiCancelBtn" class="btn-outline"
-              style="min-width: 120px; padding: 0.9rem 2rem; border-radius: 12px; font-weight: 800; display: none;"
-              onclick="closeNotiModal()">Cancel</button>
-          </div>
-        </div>
+  <div class="modal-overlay" id="notificationModal" style="z-index: 9999; display: none;">
+    <div class="modal-card"
+      style="max-width: 450px; text-align: center; padding: 3rem 2.5rem; background: rgba(10,10,20,0.95); border: 1px solid var(--glass-border); box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);">
+      <div id="notiIcon"
+        style="width: 80px; height: 80px; background: rgba(99, 102, 241, 0.1); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 2rem; font-size: 2.5rem; color: var(--accent); transition: 0.3s;">
+        <i class="fa-solid fa-circle-info"></i>
       </div>
+      <h2 id="notiTitle" style="margin-bottom: 1rem; font-size: 1.6rem; font-weight: 800; color: white;">
+        Notice
+      </h2>
+      <p id="notiMessage" style="color: var(--text-dim); margin-bottom: 2.5rem; line-height: 1.6; font-size: 1rem;">
+        Message goes
+        here.</p>
+      <div id="notiActions" style="display: flex; gap: 1rem; justify-content: center;">
+        <button id="notiConfirmBtn" class="btn-action"
+          style="min-width: 120px; padding: 0.9rem 2rem; border-radius: 12px; font-weight: 800; cursor: pointer; background: var(--accent); border:none; color:white;">Confirm</button>
+        <button id="notiCancelBtn" class="btn-outline"
+          style="min-width: 120px; padding: 0.9rem 2rem; border-radius: 12px; font-weight: 800; display: none;"
+          onclick="closeNotiModal()">Cancel</button>
+      </div>
+    </div>
+  </div>
 
-      <!-- CLEANED OUT DUPLICATED ADD AND EDIT SERVICE MODALS -->
+  <!-- CLEANED OUT DUPLICATED ADD AND EDIT SERVICE MODALS -->
 
 
 
 
 
-      <!-- Toast UI -->
-      <div id="toastContainer" class="toast-container"></div>
-      <script>
-        // V100 MASTER ENGINE: PURGED DUPLICATES
-        console.log("[SYSTEM] V100 MASTER ENGINE ONLINE.");
+  <!-- Toast UI -->
+  <div id="toastContainer" class="toast-container"></div>
+  <script>
+    // V100 MASTER ENGINE: PURGED DUPLICATES
+    console.log("[SYSTEM] V100 MASTER ENGINE ONLINE.");
 
-        window.openAssignBayModal = function (id, name) {
-          document.getElementById('assign_bay_id').value = id;
-          openModal('assignBayModal');
-          const jS = document.getElementById('assign_job_id');
-          const mS = document.getElementById('assign_mechanic_id');
-          jS.innerHTML = 'Loading...'; mS.innerHTML = 'Loading...';
-          fetch('tenant-dashboard.php?action=fetch_available_resources')
-            .then(r => r.json()).then(res => {
-              jS.innerHTML = '<option value="">-- Select Pending Job --</option>';
-              res.pending_jobs.forEach(j => { jS.innerHTML += `<option value="${j.job_id}">${j.plate_no} - ${j.service_name}</option>`; });
-              mS.innerHTML = '<option value="">-- Auto-Assign --</option>';
-              res.mechanics.forEach(m => { mS.innerHTML += `<option value="${m.mechanic_id}">${m.full_name}</option>`; });
-            });
-        };
+    window.openAssignBayModal = function (id, name) {
+      setSafeValue('assign_bay_id', id);
+      const title = document.getElementById('assignBayTitle');
+      if (title) title.innerText = 'Check-in: ' + name;
 
-        window.setPreviewSize = function (type) {
-          const frame = document.getElementById('livePreviewFrame');
-          const title = document.getElementById('previewTitleText');
-          const btnDesktop = document.getElementById('btnViewDesktop');
-          const btnMobile = document.getElementById('btnViewMobile');
+      // Reset Quick Register state
+      const qGroup = document.getElementById('quickRegisterGroup');
+      const eGroup = document.getElementById('existingVehicleGroup');
+      const qBtn = document.getElementById('quickRegBtn');
+      if (qGroup) qGroup.style.display = 'none';
+      if (eGroup) eGroup.style.display = 'flex';
+      if (qBtn) {
+        qBtn.innerText = '+ Register New';
+        qBtn.style.color = 'var(--accent)';
+      }
 
-          if (type === 'mobile') {
-            frame.style.width = '375px';
-            frame.style.margin = '0 auto';
-            frame.style.display = 'block';
-            title.innerText = 'Website Preview (Mobile)';
-            btnMobile.style.background = 'rgba(255,255,255,0.1)';
-            btnMobile.style.color = 'var(--accent)';
-            btnDesktop.style.background = 'transparent';
-            btnDesktop.style.color = 'var(--text-dim)';
-          } else {
-            frame.style.width = '100%';
-            frame.style.margin = '0';
-            title.innerText = 'Website Preview (Desktop)';
-            btnDesktop.style.background = 'rgba(255,255,255,0.1)';
-            btnDesktop.style.color = 'var(--accent)';
-            btnMobile.style.background = 'transparent';
-            btnMobile.style.color = 'var(--text-dim)';
-          }
-        };
+      // Reset inputs
+      const form = document.getElementById('assignBayForm');
+      if (form) {
+        form.querySelectorAll('input[type="text"]').forEach(i => i.value = '');
+      }
 
-        document.addEventListener('DOMContentLoaded', () => {
-          ['assignBayForm'].forEach(fid => {
-            const f = document.getElementById(fid);
-            if (f) {
-              f.addEventListener('submit', function (e) {
-                e.preventDefault();
-                const btn = this.querySelector('button[type="submit"]'); btn.disabled = true;
-                const action = fid === 'assignBayForm' ? 'assign_bay_job' : 'update_job_status';
-                fetch('tenant-dashboard.php?action=' + action, { method: 'POST', body: new FormData(this) })
-                  .then(r => r.json()).then(data => {
-                    if (data.status === 'success') { showToast("Success!"); closeModal(fid.replace('Form', 'Modal')); refreshBaysList(); refreshJobOrders(); }
-                    else { showToast(data.message, 'error'); }
-                  }).finally(() => btn.disabled = false);
-              });
-            }
+      openModal('assignBayModal');
+
+      const vS = document.getElementById('assign_vehicle_id');
+      const sS = document.getElementById('assign_service_id');
+      const mS = document.getElementById('assign_mechanic_id');
+
+      if (vS) vS.innerHTML = '<option>Loading...</option>';
+      if (sS) sS.innerHTML = '<option>Loading...</option>';
+      if (mS) mS.innerHTML = '<option>Loading...</option>';
+
+      Promise.all([
+        fetch('tenant-dashboard.php?action=fetch_vehicles').then(r => r.json()),
+        fetch('tenant-dashboard.php?action=fetch_services').then(r => r.json()),
+        fetch('tenant-dashboard.php?action=fetch_available_resources').then(r => r.json())
+      ]).then(([vehicles, services, res]) => {
+        if (vS) {
+          vS.innerHTML = '<option value="">-- Select Machine --</option>';
+          (vehicles || []).forEach(v => { vS.innerHTML += `<option value="${v.vehicle_id}">${v.plate_no} (${v.model})</option>`; });
+        }
+        if (sS) {
+          sS.innerHTML = '<option value="">-- Select Repair --</option>';
+          (services || []).forEach(s => { sS.innerHTML += `<option value="${s.service_id}">${s.service_name}</option>`; });
+        }
+        if (mS) {
+          mS.innerHTML = '<option value="">-- Auto-Assign --</option>';
+          (res.mechanics || []).forEach(m => {
+            const shift = (m.shift_start && m.shift_end)
+              ? ` — ${new Date('1970-01-01T'+m.shift_start).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} – ${new Date('1970-01-01T'+m.shift_end).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}${m.shift_days ? ' | '+m.shift_days.replace(/,/g,'·') : ''}` : '';
+            mS.innerHTML += `<option value="${m.mechanic_id}">${m.full_name}${shift}</option>`;
           });
+        }
+      });
+    };
+
+    window.processBayAssignment = function () {
+      const form = document.getElementById('assignBayForm');
+      if (!form) return;
+
+      const fd = new FormData(form);
+      const btn = form.querySelector('button[onclick*="processBayAssignment"]');
+      const originalHtml = btn ? btn.innerHTML : 'Start Walk-in Repair';
+
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Initializing...';
+      }
+
+      fetch('tenant-dashboard.php?action=assign_bay_job', {
+        method: 'POST',
+        body: fd
+      }).then(r => r.json()).then(data => {
+        if (data.status === 'success') {
+          showToast(data.message);
+          closeModal('assignBayModal');
+          if (window.refreshBaysList) window.refreshBaysList();
+          if (window.refreshJobOrders) window.refreshJobOrders();
+          if (window.dashboardOverviewRefresh) window.dashboardOverviewRefresh();
+          // Reload if critical
+          if (data.reload) location.reload();
+        } else {
+          alert(data.message || "Failed to assign bay.");
+        }
+      }).catch(err => {
+        console.error("Assignment Error:", err);
+        alert("Connection Error. Please check network.");
+      }).finally(() => {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = originalHtml;
+        }
+      });
+    };
+
+    window.toggleQuickRegister = function () {
+      const qGroup = document.getElementById('quickRegisterGroup');
+      const eGroup = document.getElementById('existingVehicleGroup');
+      const btn = document.getElementById('quickRegBtn');
+      const vSelect = document.getElementById('assign_vehicle_id');
+
+      if (qGroup.style.display === 'none') {
+        qGroup.style.display = 'flex';
+        eGroup.style.display = 'none';
+        btn.innerText = '← Select Existing';
+        btn.style.color = '#94a3b8';
+        if (vSelect) vSelect.value = '';
+      } else {
+        qGroup.style.display = 'none';
+        eGroup.style.display = 'flex';
+        btn.innerText = '+ Register New';
+        btn.style.color = 'var(--accent)';
+      }
+    };
+
+    window.setPreviewSize = function (type) {
+      const frame = document.getElementById('livePreviewFrame');
+      const title = document.getElementById('previewTitleText');
+      const btnDesktop = document.getElementById('btnViewDesktop');
+      const btnMobile = document.getElementById('btnViewMobile');
+
+      if (type === 'mobile') {
+        frame.style.width = '375px';
+        frame.style.margin = '0 auto';
+        frame.style.display = 'block';
+        title.innerText = 'Website Preview (Mobile)';
+        btnMobile.style.background = 'rgba(255,255,255,0.1)';
+        btnMobile.style.color = 'var(--accent)';
+        btnDesktop.style.background = 'transparent';
+        btnDesktop.style.color = 'var(--text-dim)';
+      } else {
+        frame.style.width = '100%';
+        frame.style.margin = '0';
+        title.innerText = 'Website Preview (Desktop)';
+        btnDesktop.style.background = 'rgba(255,255,255,0.1)';
+        btnDesktop.style.color = 'var(--accent)';
+        btnMobile.style.background = 'transparent';
+        btnMobile.style.color = 'var(--text-dim)';
+      }
+    };
+
+
+    document.addEventListener('DOMContentLoaded', () => {
+      [].forEach(fid => {
+        const f = document.getElementById(fid);
+        if (f) {
+          f.addEventListener('submit', function (e) {
+            e.preventDefault();
+            const btn = this.querySelector('button[type="submit"]'); btn.disabled = true;
+            const action = fid === 'assignBayForm' ? 'assign_bay_job' : 'update_job_status';
+            fetch('tenant-dashboard.php?action=' + action, { method: 'POST', body: new FormData(this) })
+              .then(r => r.json()).then(data => {
+                if (data.status === 'success') { showToast("Success!"); closeModal(fid.replace('Form', 'Modal')); refreshBaysList(); refreshJobOrders(); }
+                else { showToast(data.message, 'error'); }
+              }).finally(() => btn.disabled = false);
+          });
+        }
+      });
+    });
+  </script>
+
+  <script>
+    window.currentUserRole = '<?php echo $role; ?>';
+    // FORCING SIDEBAR TO THE VISUAL FRONT
+    window.addEventListener('load', () => {
+      const sb = document.querySelector('.sidebar');
+      if (sb) {
+        sb.style.zIndex = '2147483647';
+        sb.style.pointerEvents = 'auto';
+        sb.style.display = 'flex';
+        console.log("[SYSTEM] Navigation Sidebar Locked to Top Stack.");
+      }
+    });
+
+    // Navigation engine moved to top for reliability
+
+
+    window.toggleSidebar = function () {
+      document.body.classList.toggle('sidebar-collapsed');
+      const icon = document.querySelector('#sidebarToggle i');
+      if (icon) {
+        if (document.body.classList.contains('sidebar-collapsed')) {
+          icon.className = 'fas fa-chevron-right';
+        } else {
+          icon.className = 'fas fa-chevron-left';
+        }
+      }
+    };
+
+    // Initialize View on Load
+    document.addEventListener('DOMContentLoaded', () => {
+      // Default view logic
+      const activeSection = document.querySelector('.view-section.active');
+      if (!activeSection) {
+        const dash = document.getElementById('dashboard');
+        if (dash) dash.classList.add('active');
+      }
+
+      // Ensure sidebar is visible on load for large screens
+      if (window.innerWidth > 1024) {
+        document.body.classList.remove('sidebar-collapsed');
+      } else {
+        document.body.classList.add('sidebar-collapsed');
+      }
+    });
+
+    window.dashboardOverviewRefresh = function () {
+      if (typeof window.refreshOverviewStats === 'function') window.refreshOverviewStats();
+      if (typeof window.refreshDashboardJobs === 'function') window.refreshDashboardJobs();
+    };
+
+    window.refreshOverviewStats = function () {
+      fetch('tenant-dashboard.php?action=fetch_overview_stats')
+        .then(r => r.json())
+        .then(data => {
+          if (data.error) return;
+          const elBays = document.getElementById('stat-avail-bays');
+          const elJobs = document.getElementById('stat-pending-jobs');
+          const elRev = document.getElementById('stat-revenue');
+          const elUnpaid = document.getElementById('stat-pending-payments');
+          const elApp = document.getElementById('stat-appointments-today');
+
+          if (elBays) elBays.innerHTML = `${data.avail_bays} <i class="fas fa-warehouse" style="color:var(--accent); font-size:1.4rem;"></i>`;
+          if (elJobs) elJobs.innerHTML = `${data.pending_jobs} <i class="fas fa-car-crash" style="color:var(--warning); font-size:1.4rem;"></i>`;
+          if (elRev) elRev.innerHTML = `₱${parseFloat(data.revenue).toLocaleString(undefined, { minimumFractionDigits: 2 })} <i class="fas fa-coins" style="color:#fcd34d; font-size:1.4rem;"></i>`;
+          if (elUnpaid) elUnpaid.innerHTML = `₱${parseFloat(data.unpaid_balance).toLocaleString(undefined, { minimumFractionDigits: 2 })} <i class="fas fa-file-invoice-dollar" style="color:var(--danger); font-size:1.4rem;"></i>`;
+          if (elApp && data.appointments_today !== undefined) elApp.innerHTML = `${data.appointments_today} <i class="fas fa-calendar-check" style="color:#60a5fa; font-size:1.4rem;"></i>`;
         });
-      </script>
+    };
 
-      <script>
-        // FORCING SIDEBAR TO THE VISUAL FRONT
-        window.addEventListener('load', () => {
-          const sb = document.querySelector('.sidebar');
-          if (sb) {
-            sb.style.zIndex = '2147483647';
-            sb.style.pointerEvents = 'auto';
-            console.log("[SYSTEM] Navigation Sidebar Locked to Top Stack.");
+    window.refreshDashboardJobs = function () {
+      const body = document.getElementById('dashboardRepairJobsBody');
+      if (!body) return;
+
+      fetch('tenant-dashboard.php?action=fetch_dashboard_jobs_diagnostic')
+        .then(r => r.json())
+        .then(data => {
+          if (!data || data.length === 0) {
+            body.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:2rem; color:var(--text-dim);">No active jobs found.</td></tr>';
+            return;
           }
+
+          body.innerHTML = data.map(j => {
+            if (window.currentUserRole === 'CASHIER') {
+              return `
+                <tr class="hover-bright">
+                  <td><strong>${j.plate_no}</strong></td>
+                  <td>${j.make} ${j.model}<br><small style="opacity:0.5;">${j.customer_name}</small></td>
+                  <td>${j.service_name}</td>
+                  <td style="color:white; font-weight:700;">₱${parseFloat(j.total_amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                  <td><span class="badge ${j.status === 'COMPLETED' ? 'badge-active' : (j.status === 'IN_PROGRESS' ? 'badge-info' : 'badge-pending')}">${j.status}</span></td>
+                  <td>
+                    <button class="btn-action" style="padding:5px 15px; font-size:0.75rem; background:var(--accent); color:white; border:none; border-radius:8px; cursor:pointer;" 
+                      onclick="window.openRecordPaymentModal(${j.job_id}, '${j.customer_id}', '${j.customer_name}', ${j.total_amount})">
+                      Collect
+                    </button>
+                  </td>
+                </tr>
+              `;
+            } else {
+              return `
+                <tr class="hover-bright">
+                  <td><strong>${j.plate_no}</strong></td>
+                  <td>${j.make} ${j.model}<br><small style="opacity:0.5;">${j.customer_name}</small></td>
+                  <td>${j.service_name}</td>
+                  <td><small style="color:var(--accent);">${j.mechanic_name}</small></td>
+                  <td><span class="badge ${j.status === 'COMPLETED' ? 'badge-active' : (j.status === 'IN_PROGRESS' ? 'badge-info' : 'badge-pending')}">${j.status}</span></td>
+                  ${window.currentUserRole === 'MECHANIC' ? `<td><button class="btn-outline" onclick="window.handleJobClick(${j.job_id}, '${j.status}', ${j.mechanic_id}, ${j.bay_id})">Manage</button></td>` : ''}
+                </tr>
+              `;
+            }
+          }).join('');
         });
+    };
 
-        // GLOBAL PRIORITY SYNC FOR CUSTOMERS
-        window.refreshAddCustomerList = function () {
-          const body = document.getElementById('customersBody');
-          if (!body) return;
+    window.refreshSettledJobs = function () {
+      const body = document.getElementById('settledJobsBody');
+      if (!body) return;
+      body.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:2rem;"><i class="fas fa-spinner fa-spin"></i></td></tr>';
 
-          const current = body.innerHTML.toLowerCase();
-          if (current.includes('loading') || current.trim() === '') {
-            body.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:3rem;"><i class="fas fa-spinner fa-spin" style="font-size:2rem; color:var(--accent);"></i><br><br>Retrieving customer records...</td></tr>';
+      fetch('tenant-dashboard.php?action=fetch_settlement_history')
+        .then(r => r.json())
+        .then(data => {
+          if (!data || data.length === 0) {
+            body.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:2rem; color:var(--text-dim);">No history found.</td></tr>';
+            return;
           }
+          body.innerHTML = data.map(j => {
+            const statusClass = (j.status === 'COMPLETED' || j.status === 'SETTLED') ? 'badge-active' : (j.status === 'CANCELLED' ? 'badge-danger' : 'badge-pending');
+            const displayModel = (j.make || j.model) ? `${j.make} ${j.model}`.trim() : 'Manual Entry';
+            return `
+              <tr class="hover-bright">
+                <td style="padding: 1.2rem 1rem;"><span style="background:rgba(255,255,255,0.05); padding:6px 12px; border-radius:8px; border:1px solid rgba(255,255,255,0.1); font-family:monospace; color:var(--accent); font-weight:800; font-size:0.85rem; letter-spacing:1px;">${j.plate_no}</span></td>
+                <td style="padding: 1.2rem 1rem;"><div style="font-weight:700; font-size:0.95rem; margin-bottom:4px; color:#fff;">${displayModel}</div><div style="opacity:0.6; font-size:0.75rem; display:flex; align-items:center; gap:5px;"><i class="fas fa-user-circle"></i> ${j.customer_name}</div></td>
+                <td style="padding: 1.2rem 1rem;"><span style="color:var(--text-dim); font-size:0.85rem; background:rgba(255,255,255,0.02); padding:4px 8px; border-radius:6px;">${j.service_name}</span></td>
+                <td style="padding: 1.2rem 1rem;"><small style="color:var(--text-dim);"><i class="far fa-clock"></i> ${new Date(j.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</small></td>
+                <td style="padding: 1.2rem 1rem; font-weight:800; color:white; font-size:1.1rem;">₱${parseFloat(j.total_amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                <td style="padding: 1.2rem 1rem;"><span class="badge ${statusClass}" style="padding: 6px 12px; font-size: 0.7rem; font-weight: 800;">${j.status}</span></td>
+                <td style="padding: 1.2rem 1rem;">
+                  <button class="btn-action" style="padding:8px 16px; font-size:0.75rem; background:rgba(var(--accent-rgb), 0.1); color:var(--accent); border:1px solid rgba(var(--accent-rgb), 0.2); border-radius:10px; cursor:pointer; font-weight:700; transition:0.3s;" 
+                    onmouseover="this.style.background='var(--accent)'; this.style.color='white';" 
+                    onmouseout="this.style.background='rgba(var(--accent-rgb), 0.1)'; this.style.color='var(--accent)';"
+                    onclick="window.viewJobReceipt(${j.job_id})">
+                    <i class="fas fa-file-invoice"></i> Receipt
+                  </button>
+                </td>
+              </tr>
+            `;
+          }).join('');
+        });
+    };
 
-          fetch('tenant-dashboard.php?action=fetch_customers&_cache=' + Date.now())
-            .then(r => r.text())
-            .then(text => {
-              try {
-                const start = text.indexOf('[');
-                const end = text.lastIndexOf(']') + 1;
-                const data = JSON.parse(text.substring(start, end));
 
-                const countEl = document.getElementById('customerTotalCount');
-                if (countEl) countEl.innerText = `${data.length} Total`;
+    // GLOBAL PRIORITY SYNC FOR CUSTOMERS
+    window.refreshAddCustomerList = function () {
+      const body = document.getElementById('customersBody');
+      if (!body) return;
 
-                if (!Array.isArray(data) || data.length === 0) {
-                  body.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:3rem; color:var(--text-dim); opacity:0.6;"><i class="fas fa-user-friends" style="font-size:3rem; margin-bottom:1rem;"></i><br>Database is empty. No customers found.</td></tr>';
-                  return;
-                }
+      const current = body.innerHTML.toLowerCase();
+      if (current.includes('loading') || current.trim() === '') {
+        body.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:3rem;"><i class="fas fa-spinner fa-spin" style="font-size:2rem; color:var(--accent);"></i><br><br>Retrieving customer records...</td></tr>';
+      }
 
-                body.innerHTML = data.map(c => `
+      fetch('tenant-dashboard.php?action=fetch_customers&_cache=' + Date.now())
+        .then(r => r.text())
+        .then(text => {
+          try {
+            const start = text.indexOf('[');
+            const end = text.lastIndexOf(']') + 1;
+            const data = JSON.parse(text.substring(start, end));
+
+            const countEl = document.getElementById('customerTotalCount');
+            if (countEl) countEl.innerText = `${data.length} Total`;
+
+            if (!Array.isArray(data) || data.length === 0) {
+              body.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:3rem; color:var(--text-dim); opacity:0.6;"><i class="fas fa-user-friends" style="font-size:3rem; margin-bottom:1rem;"></i><br>Database is empty. No customers found.</td></tr>';
+              return;
+            }
+
+            body.innerHTML = data.map(c => `
           <tr class="hover-bright">
                       <td>
                         <div style="display:flex; align-items:center; gap:12px;">
@@ -8842,28 +12419,28 @@ try {
                       <td><span class="badge badge-active">${c.status || 'ACTIVE'}</span></td>
                       <td><button class="btn-outline" style="padding:6px 12px; font-size:0.8rem;" onclick="window.openCustomerProfile(${c.customer_id})"><i class="fas fa-search"></i> Profile</button></td>
                     </tr>`).join('');
-              } catch (e) {
-                body.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:2rem; color:var(--danger);">Sync failed. Click "New Customer" to add manually.</td></tr>';
-              }
-            }).catch(e => { body.innerHTML = '<tr><td colspan="5">Connection error.</td></tr>'; });
-        };
+          } catch (e) {
+            body.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:2rem; color:var(--danger);">Sync failed. Click "New Customer" to add manually.</td></tr>';
+          }
+        }).catch(e => { body.innerHTML = '<tr><td colspan="5">Connection error.</td></tr>'; });
+    };
 
-        window.openCustomerProfile = function (customerId) {
-          const body = document.getElementById('profileModalContent');
-          if (!body) return;
-          body.innerHTML = '<div style="text-align:center; padding:5rem;"><i class="fas fa-spinner fa-spin" style="font-size:3rem; color:var(--accent);"></i><br><br>Analyzing customer history...</div>';
-          openModal('customerProfileModal');
+    window.openCustomerProfile = function (customerId) {
+      const body = document.getElementById('profileModalContent');
+      if (!body) return;
+      body.innerHTML = '<div style="text-align:center; padding:5rem;"><i class="fas fa-spinner fa-spin" style="font-size:3rem; color:var(--accent);"></i><br><br>Analyzing customer history...</div>';
+      openModal('customerProfileModal');
 
-          fetch(`tenant-dashboard.php?action=fetch_customer_details&customer_id=${customerId}`)
-            .then(res => res.json())
-            .then(data => {
-              if (data.status === 'error') {
-                body.innerHTML = `<div style="color:var(--danger); padding:2rem; text-align:center;">${data.message}</div>`;
-                return;
-              }
+      fetch(`tenant-dashboard.php?action=fetch_customer_details&customer_id=${customerId}`)
+        .then(res => res.json())
+        .then(data => {
+          if (data.status === 'error') {
+            body.innerHTML = `<div style="color:var(--danger); padding:2rem; text-align:center;">${data.message}</div>`;
+            return;
+          }
 
-              const c = data.customer;
-              const vehiclesHtml = data.vehicles.length ? data.vehicles.map(v => `
+          const c = data.customer;
+          const vehiclesHtml = data.vehicles.length ? data.vehicles.map(v => `
                 <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); padding:1rem; border-radius:15px; margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
                   <div>
                     <div style="font-weight:800; color:var(--text-main); font-size:1.1rem;">${v.plate_no}</div>
@@ -8873,7 +12450,7 @@ try {
                 </div>
               `).join('') : '<div style="text-align:center; padding:1rem; opacity:0.5; border:1px dashed rgba(255,255,255,0.1); border-radius:10px;">No vehicles found</div>';
 
-              const apptsHtml = data.appointments.length ? data.appointments.map(a => `
+          const apptsHtml = data.appointments.length ? data.appointments.map(a => `
                 <div style="padding:1rem; border-bottom:1px solid rgba(255,255,255,0.05); display:flex; justify-content:space-between; align-items:center;">
                   <div>
                     <div style="font-size:0.95rem; font-weight:700;">${a.service_name || 'Repair Job'}</div>
@@ -8883,7 +12460,7 @@ try {
                 </div>
               `).join('') : '<div style="text-align:center; padding:2rem; opacity:0.5;">No service history records.</div>';
 
-              body.innerHTML = `
+          body.innerHTML = `
                 <div style="display:grid; grid-template-columns:320px 1fr; gap:2.5rem;">
                   <div style="background:rgba(255,255,255,0.02); padding:2rem; border-radius:20px; border:1px solid rgba(255,255,255,0.05);">
                     <div style="width:100px; height:100px; border-radius:25px; background:var(--accent); margin:0 auto 1.5rem; display:flex; align-items:center; justify-content:center; font-size:3rem; font-weight:900; color:white; box-shadow:0 10px 20px rgba(0,0,0,0.3);">
@@ -8913,27 +12490,27 @@ try {
                   </div>
                 </div>
               `;
-            }).catch(err => {
-              body.innerHTML = '<div style="text-align:center; padding:3rem; color:var(--danger);">Error connecting to API.</div>';
-            });
-        };
+        }).catch(err => {
+          body.innerHTML = '<div style="text-align:center; padding:3rem; color:var(--danger);">Error connecting to API.</div>';
+        });
+    };
 
-        // GLOBAL PRIORITY SEARCH
-        window.openVehicleProfile = function (vehicleId) {
-          const body = document.getElementById('profileModalContent'); // Reuse customer modal layout or use another if available
-          if (!body) return;
-          body.innerHTML = '<div style="text-align:center; padding:5rem;"><i class="fas fa-spinner fa-spin" style="font-size:3rem; color:var(--accent);"></i><br><br>Fetching vehicle history...</div>';
-          openModal('customerProfileModal'); // Reusing the same large profile modal for consistency
+    // GLOBAL PRIORITY SEARCH
+    window.openVehicleProfile = function (vehicleId) {
+      const body = document.getElementById('profileModalContent'); // Reuse customer modal layout or use another if available
+      if (!body) return;
+      body.innerHTML = '<div style="text-align:center; padding:5rem;"><i class="fas fa-spinner fa-spin" style="font-size:3rem; color:var(--accent);"></i><br><br>Fetching vehicle history...</div>';
+      openModal('customerProfileModal'); // Reusing the same large profile modal for consistency
 
-          fetch(`tenant-dashboard.php?action=fetch_vehicle_history&id=${vehicleId}`)
-            .then(res => res.json())
-            .then(data => {
-              if (!data.length) {
-                body.innerHTML = '<div style="text-align:center; padding:5rem;">No history records found for this vehicle.</div>';
-                return;
-              }
-              const v = data[0];
-              const historyHtml = data.map(h => `
+      fetch(`tenant-dashboard.php?action=fetch_vehicle_history&id=${vehicleId}`)
+        .then(res => res.json())
+        .then(data => {
+          if (!data.length) {
+            body.innerHTML = '<div style="text-align:center; padding:5rem;">No history records found for this vehicle.</div>';
+            return;
+          }
+          const v = data[0];
+          const historyHtml = data.map(h => `
                 <div style="padding:1rem; border-bottom:1px solid rgba(255,255,255,0.05); display:flex; justify-content:space-between; align-items:center;">
                   <div>
                     <div style="font-size:0.95rem; font-weight:700;">${h.service_name || 'Repair Job'}</div>
@@ -8943,7 +12520,7 @@ try {
                 </div>
               `).join('');
 
-              body.innerHTML = `
+          body.innerHTML = `
                 <div style="display:grid; grid-template-columns:320px 1fr; gap:2.5rem;">
                   <div style="background:rgba(255,255,255,0.02); padding:2rem; border-radius:20px; border:1px solid rgba(255,255,255,0.05);">
                     <div style="width:100px; height:100px; border-radius:25px; background:var(--accent); margin:0 auto 1.5rem; display:flex; align-items:center; justify-content:center; font-size:3rem; font-weight:900; color:white; box-shadow:0 10px 20px rgba(0,0,0,0.3);">
@@ -8967,41 +12544,41 @@ try {
                   </div>
                 </div>
               `;
-            });
-        };
+        });
+    };
 
-        window.searchTable = function (input, bodyId) {
-          const filter = input.value.toLowerCase().trim();
-          const body = document.getElementById(bodyId);
-          if (!body) return;
-          const rows = body.getElementsByTagName('tr');
-          for (let i = 0; i < rows.length; i++) {
-            const row = rows[i];
-            // Skip loading or empty rows
-            if (row.cells.length === 1 && (row.innerText.includes('Loading') || row.innerText.includes('No '))) continue;
-            const text = row.innerText.toLowerCase();
-            row.style.display = text.includes(filter) ? "" : "none";
-          }
-        };
+    window.searchTable = function (input, bodyId) {
+      const filter = input.value.toLowerCase().trim();
+      const body = document.getElementById(bodyId);
+      if (!body) return;
+      const rows = body.getElementsByTagName('tr');
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        // Skip loading or empty rows
+        if (row.cells.length === 1 && (row.innerText.includes('Loading') || row.innerText.includes('No '))) continue;
+        const text = row.innerText.toLowerCase();
+        row.style.display = text.includes(filter) ? "" : "none";
+      }
+    };
 
-        window.openBayProfile = function (bayId) {
-          const body = document.getElementById('bayProfileModalContent');
-          if (!body) return;
+    window.openBayProfile = function (bayId) {
+      const body = document.getElementById('bayProfileModalContent');
+      if (!body) return;
 
-          body.innerHTML = '<div style="text-align:center; padding:3rem;"><div class="spinner" style="margin:0 auto 1rem;"></div><p>Gathering bay intelligence...</p></div>';
-          openModal('bayProfileModal');
+      body.innerHTML = '<div style="text-align:center; padding:3rem;"><div class="spinner" style="margin:0 auto 1rem;"></div><p>Gathering bay intelligence...</p></div>';
+      window.openModal('bayProfileModal');
 
-          fetch(`tenant-dashboard.php?action=fetch_bay_details&id=${bayId} `)
-            .then(res => res.json())
-            .then(data => {
-              if (data.status === 'error') throw new Error(data.message);
+      fetch(`tenant-dashboard.php?action=fetch_bay_details&id=${bayId}`)
+        .then(res => res.json())
+        .then(data => {
+          if (data.status === 'error') throw new Error(data.message);
 
-              const b = data.bay;
-              const isAvail = b.status === 'AVAILABLE';
-              const current = data.current_job;
-              const history = data.history;
+          const b = data.bay;
+          const isAvail = b.status === 'AVAILABLE';
+          const current = data.current_job;
+          const history = data.history;
 
-              let historyHtml = history.length ? history.map(h => `
+          let historyHtml = history.length ? history.map(h => `
                 <div style="padding:1rem; border-bottom:1px solid rgba(255,255,255,0.05); display:flex; justify-content:space-between; align-items:center;">
                   <div>
                     <div style="font-size:0.95rem; font-weight:700;">${h.service_name}</div>
@@ -9014,91 +12591,96 @@ try {
                 </div>
               `).join('') : '<div style="text-align:center; padding:2rem; opacity:0.5;">No recent history.</div>';
 
-              let currentJobHtml = current ? `
-                <div style="background:rgba(16,185,129,0.05); border:1px solid rgba(16,185,129,0.2); padding:1.5rem; border-radius:20px; margin-bottom:2rem;">
+          let currentJobHtml = current ? `
+                <div style="background:rgba(16,185,129,0.05); border:1px solid rgba(16,185,129,0.2); padding:1.5rem; border-radius:20px; margin-bottom:2rem; box-shadow:0 10px 30px rgba(0,0,0,0.2);">
                   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
                     <span class="badge badge-active">ACTIVE REPAIR</span>
                     <span style="font-size:0.8rem; font-weight:700; color:var(--accent);">JO-${current.job_id.toString().padStart(4, '0')}</span>
                   </div>
                   <h4 style="margin:0; font-size:1.2rem;">${current.service_name}</h4>
                   <div style="margin-top:10px; font-size:0.9rem; opacity:0.8;">
-                    <i class="fas fa-car" style="margin-right:8px;"></i> ${current.plate_no} (${current.make} ${current.model})<br>
+                    <i class="fas fa-car" style="margin-right:8px;"></i> ${current.plate_no} ${ (current.make || current.model) ? `(${[current.make, current.model].filter(Boolean).join(' ')})` : '' }<br>
                     <i class="fas fa-user" style="margin-right:8px;"></i> ${current.customer_name}
                   </div>
-                  <button onclick="closeModal('bayProfileModal'); window.openJobStatusModal(${current.job_id}, '${current.status}', ${current.mechanic_id}, ${b.bay_id})" 
+                  <button class="job-status-btn" onclick="window.closeModal('bayProfileModal'); window.handleJobClick(${current.job_id}, '${current.status}', ${current.mechanic_id}, ${b.bay_id}, true, false)" 
+                      data-jid="${current.job_id}" data-status="${current.status}" data-mid="${current.mechanic_id}" data-bid="${b.bay_id}" data-edit="true" data-focus="false"
                       style="width:100%; margin-top:1.5rem; background:var(--accent); color:white; border:none; padding:0.8rem; border-radius:12px; font-weight:700; cursor:pointer;">
                     Control Repair Stream
                   </button>
                 </div>
               ` : `
-                <div style="background:rgba(255,255,255,0.02); border:1px dashed rgba(255,255,255,0.1); padding:2rem; border-radius:20px; text-align:center; margin-bottom:2rem;">
-                  <i class="fas fa-check-circle" style="font-size:2.5rem; color:var(--accent); opacity:0.3; margin-bottom:1rem;"></i>
-                  <h4 style="margin:0;">Bay is Ready</h4>
-                  <p style="font-size:0.85rem; color:var(--text-dim); margin:10px 0 1.5rem;">This slot is currently optimal for a new service assignment.</p>
-                  <button onclick="closeModal('bayProfileModal'); openAssignBayModal(${b.bay_id}, '${b.bay_name}')" 
-                      style="background:var(--accent); color:white; border:none; padding:0.8rem 2rem; border-radius:12px; font-weight:800; cursor:pointer; box-shadow:0 10px 20px var(--accent-glow);">
-                    Establish Operational Flow
+                <div style="background:rgba(255,255,255,0.02); border:1px dashed rgba(255,255,255,0.1); padding:1.5rem; border-radius:20px; text-align:center; margin-bottom:2rem;">
+                  <i class="fas fa-check-circle" style="font-size:2rem; color:var(--success); opacity:0.5; margin-bottom:10px;"></i>
+                  <h4 style="margin:0; color:var(--success);">Bay is Ready</h4>
+                  <p style="font-size:0.8rem; color:var(--text-dim); margin-top:5px;">Currently optimal for new assignments.</p>
+                  <button onclick="window.closeModal('bayProfileModal'); window.openAssignBayModal(${b.bay_id}, '${b.bay_name}')" 
+                      style="width:100%; margin-top:1.2rem; background:var(--accent); color:white; border:none; padding:0.9rem; border-radius:12px; font-weight:800; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:10px; transition:0.3s;">
+                    <i class="fas fa-sign-in-alt"></i> Process Walk-in Check-in
                   </button>
                 </div>
               `;
 
-              body.innerHTML = `
-          <div style="display:grid; grid-template-columns:300px 1fr; gap:2.5rem;">
-                    <div style="background:rgba(255,255,255,0.02); padding:2rem; border-radius:20px; border:1px solid rgba(255,255,255,0.05);">
-                      <div style="width:80px; height:80px; border-radius:20px; background:var(--accent); margin:0 auto 1.5rem; display:flex; align-items:center; justify-content:center; font-size:2.5rem; font-weight:900; color:white; box-shadow:0 10px 20px rgba(0,0,0,0.3);">
+          body.innerHTML = `
+                <div style="display:grid; grid-template-columns:260px 1fr; gap:2rem;">
+                    <div style="background:rgba(255,255,255,0.02); padding:1.5rem; border-radius:24px; border:1px solid rgba(255,255,255,0.05); height:fit-content;">
+                      <div style="width:70px; height:70px; border-radius:18px; background:var(--accent); margin:0 auto 1.2rem; display:flex; align-items:center; justify-content:center; font-size:2rem; font-weight:900; color:white; box-shadow:0 10px 20px rgba(0,0,0,0.3);">
                         ${b.bay_name.charAt(0).toUpperCase()}
                       </div>
-                      <h3 style="text-align:center; margin-bottom:0.5rem; font-size:1.5rem;">${b.bay_name}</h3>
-                      <div style="text-align:center; margin-bottom:2rem;"><span class="badge ${isAvail ? 'badge-active' : ''}">${b.status}</span></div>
+                      <h3 style="text-align:center; margin-bottom:0.5rem; font-size:1.3rem;">${b.bay_name}</h3>
+                      <div style="text-align:center; margin-bottom:1.5rem;"><span class="badge ${isAvail ? 'badge-active' : ''}" style="padding:6px 12px;">${b.status}</span></div>
                       
-                      <div style="display:flex; flex-direction:column; gap:15px;">
-                        <div style="display:flex; align-items:center; gap:10px;"><i class="fas fa-tools" style="width:20px; color:var(--accent);"></i> <span style="font-size:0.9rem;">Service Ready</span></div>
-                        <div style="display:flex; align-items:center; gap:10px;"><i class="fas fa-clock" style="width:20px; color:var(--accent);"></i> <span style="font-size:0.9rem;">24/7 Monitoring</span></div>
+                      <div style="display:flex; flex-direction:column; gap:12px; padding-top:1rem; border-top:1px solid rgba(255,255,255,0.05);">
+                        <div style="display:flex; align-items:center; gap:10px; font-size:0.85rem; opacity:0.8;"><i class="fas fa-tools" style="width:16px; color:var(--accent);"></i> <span>Service Ready</span></div>
+                        <div style="display:flex; align-items:center; gap:10px; font-size:0.85rem; opacity:0.8;"><i class="fas fa-clock" style="width:16px; color:var(--accent);"></i> <span>Live Monitoring</span></div>
                       </div>
                     </div>
-                    <div>
-                      <h4 style="font-size:0.8rem; text-transform:uppercase; letter-spacing:1.5px; color:var(--text-dim); margin-bottom:1.2rem;">Operational Status</h4>
-                      ${currentJobHtml}
+                    <div style="display:flex; flex-direction:column;">
+                      <div style="margin-bottom:1.5rem;">
+                        <h4 style="font-size:0.75rem; text-transform:uppercase; letter-spacing:1.5px; color:var(--accent); margin-bottom:1rem; font-weight:800;">Operational Status</h4>
+                        ${currentJobHtml}
+                      </div>
                       
-                      <h4 style="font-size:0.8rem; text-transform:uppercase; letter-spacing:1.5px; color:var(--text-dim); margin-bottom:1.2rem;">Utilization History</h4>
-                      <div style="background:rgba(255,255,255,0.01); border-radius:20px; border:1px solid rgba(255,255,255,0.05); overflow:hidden;">
-                        ${historyHtml}
+                      <div style="flex:1;">
+                        <h4 style="font-size:0.75rem; text-transform:uppercase; letter-spacing:1.5px; color:var(--text-dim); margin-bottom:1rem; font-weight:800;">Utilization History</h4>
+                        <div style="background:rgba(255,255,255,0.01); border-radius:20px; border:1px solid rgba(255,255,255,0.05); overflow:hidden;">
+                          ${historyHtml}
+                        </div>
                       </div>
                     </div>
-                  </div>
+                </div>
           `;
-            }).catch(err => {
-              body.innerHTML = `<div style="text-align:center; padding:3rem; color:var(--danger);">${err.message}</div>`;
-            });
-        };
+        }).catch(err => {
+          body.innerHTML = `<div style="text-align:center; padding:3rem; color:var(--danger);">${err.message}</div>`;
+        });
+    };
 
-        window.openVehicleHistory = function (vehicleId) {
-          const body = document.getElementById('vehicleHistoryContent');
-          const info = document.getElementById('historyVehicleInfo');
-          if (!body) return;
+    window.openVehicleHistory = function (vehicleId) {
+      const body = document.getElementById('vehicleHistoryContent');
+      const info = document.getElementById('historyVehicleInfo');
+      if (!body) return;
 
-          body.innerHTML = '<div style="text-align:center; padding:5rem;"><div class="spinner" style="margin:0 auto 1.5rem;"></div><p style="opacity:0.6;">Retrieving vehicle lineage...</p></div>';
-          openModal('vehicleHistoryModal');
+      body.innerHTML = '<div style="text-align:center; padding:5rem;"><div class="spinner" style="margin:0 auto 1.5rem;"></div><p style="opacity:0.6;">Retrieving vehicle lineage...</p></div>';
+      openModal('vehicleHistoryModal');
 
-          fetch(`tenant-dashboard.php?action=fetch_vehicle_history&id=${vehicleId} `)
-            .then(res => res.json())
-            .then(data => {
-              if (!data || data.length === 0) {
-                body.innerHTML = '<div style="text-align:center; padding:5rem; opacity:0.5;"><i class="fas fa-history" style="font-size:3rem; margin-bottom:1.5rem;"></i><br>No service history records found for this unit.</div>';
-                return;
-              }
+      fetch(`tenant-dashboard.php?action=fetch_vehicle_history&id=${vehicleId} `)
+        .then(res => res.json())
+        .then(data => {
+          if (!data || data.length === 0) {
+            body.innerHTML = '<div style="text-align:center; padding:5rem; opacity:0.5;"><i class="fas fa-history" style="font-size:3rem; margin-bottom:1.5rem;"></i><br>No service history records found for this unit.</div>';
+            return;
+          }
 
-              const first = data[0];
-              info.innerHTML = `<i class="fas fa-car" style = "color:var(--accent); margin-right:8px;" ></i> ${first.plate_no} • ${first.make} ${first.model} `;
+          const first = data[0];
+          info.innerHTML = `<i class="fas fa-car" style = "color:var(--accent); margin-right:8px;" ></i> ${first.plate_no} • ${first.make} ${first.model} `;
 
-              body.innerHTML = `
+          body.innerHTML = `
           <div style="display:flex; flex-direction:column; gap:1.2rem;">
             ${data.map(h => {
-                let badgeClass = 'badge-pending';
-                if (h.status === 'COMPLETED') badgeClass = 'badge-active';
-                if (h.status === 'IN_PROGRESS') badgeClass = 'badge-warning';
+            let badgeClass = 'badge-pending';
+            if (h.status === 'COMPLETED') badgeClass = 'badge-active';
+            if (h.status === 'IN_PROGRESS') badgeClass = 'badge-warning';
 
-                return `
+            return `
                 <div class="hover-bright" style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:20px; padding:1.8rem; transition:0.3s;">
                   <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:1.5rem;">
                     <div>
@@ -9129,36 +12711,36 @@ try {
                   </div>
                 </div>
               `}).join('')
-                }
+            }
             </div>
           `;
-            })
-            .catch(err => {
-              body.innerHTML = `<div style="text-align:center; padding:5rem; color:var(--danger);"><i class="fas fa-exclamation-triangle" style="font-size:3rem; margin-bottom:1rem;"></i><br>Intelligence breach: ${err.message}</div>`;
-            });
-        };
+        })
+        .catch(err => {
+          body.innerHTML = `<div style="text-align:center; padding:5rem; color:var(--danger);"><i class="fas fa-exclamation-triangle" style="font-size:3rem; margin-bottom:1rem;"></i><br>Intelligence breach: ${err.message}</div>`;
+        });
+    };
 
-        // Execute immediate refresh check
-        setTimeout(() => {
-          if (typeof window.refreshBaysList === 'function') window.refreshBaysList();
-        }, 1000);
-      </script>
-    </div>
+
+
+    window.toggleWalkInField = function (val) {
+      const field = document.getElementById('walkinField');
+      if (field) field.style.display = (val === 'WALKIN') ? 'block' : 'none';
+    };
+
+    // Execute immediate refresh check
+    setTimeout(() => {
+      if (typeof window.refreshBaysList === 'function') window.refreshBaysList();
+    }, 1000);
+  </script>
+  </div>
   </div>
 
-  <!-- Chat Support Widget -->
-  <div id="supportChatWidget" style="position:fixed; bottom:30px; right:30px; z-index:9999;">
-    <!-- Unified Chat Button -->
-    <div id="chatBubble" onclick="toggleChat()"
-      style="display:flex; align-items:center; gap:0; cursor:pointer; position:relative; background:var(--accent); color:white; padding:8px 8px 8px 18px; border-radius:100px; font-weight:800; font-size:0.9rem; box-shadow:0 10px 30px var(--accent-glow); transition:0.3s;">
-      <span style="margin-right:12px;">Support Chat</span>
-      <div
-        style="width:45px; height:45px; background:rgba(255,255,255,0.2); border-radius:50%; display:flex; align-items:center; justify-content:center; color:white;">
-        <i class="fas fa-comment-dots" style="font-size:1.2rem;"></i>
-      </div>
-      <span id="tenantChatBadge"
-        style="display:none; position:absolute; top:-10px; right:-5px; background:#ff4757; color:white; font-size:0.7rem; font-weight:900; min-width:24px; height:24px; border-radius:12px; align-items:center; justify-content:center; border:2px solid var(--bg-deep); box-shadow:0 0 15px rgba(255, 71, 87, 0.5); animation: chatPulse 2s infinite;">0</span>
-    </div>
+  <!-- Chat Support Sidebar Panel -->
+  <div id="chatOverlay" onclick="toggleChat()"
+    style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9998; transition:opacity 0.3s;">
+  </div>
+  <div id="supportChatWidget"
+    style="position:fixed; top:0; right:-420px; width:400px; height:100vh; z-index:9999; background:var(--bg-deep); border-left:1px solid var(--glass-border); box-shadow:-10px 0 40px rgba(0,0,0,0.5); display:flex; flex-direction:column; transition:right 0.3s ease;">
     <style>
       @keyframes chatPulse {
         0% {
@@ -9178,36 +12760,35 @@ try {
       }
     </style>
 
-    <!-- Chat Window -->
-    <div id="chatWindow"
-      style="position:absolute; bottom:80px; right:0; width:350px; height:500px; background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:24px; display:none; flex-direction:column; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.5); backdrop-filter:blur(20px);">
-      <!-- Header -->
-      <div
-        style="background:var(--accent); padding:1.5rem; color:white; display:flex; justify-content:space-between; align-items:center;">
-        <div>
-          <h4 style="margin:0; font-size:1rem; font-weight:800;">Support Chat</h4>
-          <span style="font-size:0.7rem; opacity:0.8;">Platform Administrator</span>
-        </div>
-        <i class="fas fa-times" onclick="toggleChat()" style="cursor:pointer; opacity:0.7;"></i>
+    <!-- Header -->
+    <div
+      style="background:var(--accent); padding:1.5rem; color:white; display:flex; justify-content:space-between; align-items:center; flex-shrink:0;">
+      <div>
+        <h4 style="margin:0; font-size:1.1rem; font-weight:800;"><i class="fas fa-headset"
+            style="margin-right:8px;"></i>Support Chat</h4>
+        <span style="font-size:0.7rem; opacity:0.8;">Platform Administrator</span>
       </div>
-      <!-- Messages -->
-      <div id="chatMessages"
-        style="flex:1; padding:1.2rem; overflow-y:auto; display:flex; flex-direction:column; gap:12px; background:rgba(0,0,0,0.2);">
-        <div style="text-align:center; padding:2rem; color:var(--text-dim); font-size:0.8rem;">
-          How can we help you today?
-        </div>
-      </div>
-      <!-- Input -->
-      <div
-        style="padding:1.2rem; border-top:1px solid var(--glass-border); display:flex; align-items:flex-end; gap:10px;">
-        <textarea id="chatInput" placeholder="Type a message..." rows="1"
-          style="flex:1; background:rgba(255,255,255,0.05); border:1px solid var(--glass-border); border-radius:12px; padding:0.8rem; color:white; font-size:0.9rem; outline:none; resize:none; font-family:inherit; min-height:45px; max-height:120px;"></textarea>
-        <button onclick="sendMessage()"
-          style="background:var(--accent); border:none; width:45px; height:45px; border-radius:12px; color:white; cursor:pointer; transition:0.3s; flex-shrink:0;">
-          <i class="fas fa-paper-plane"></i>
-        </button>
+      <i class="fas fa-times" onclick="toggleChat()" style="cursor:pointer; opacity:0.7; font-size:1.2rem;"></i>
+    </div>
+    <!-- Messages -->
+    <div id="chatMessages"
+      style="flex:1; padding:1.2rem; overflow-y:auto; display:flex; flex-direction:column; gap:12px; background:rgba(0,0,0,0.2);">
+      <div style="text-align:center; padding:2rem; color:var(--text-dim); font-size:0.8rem;">
+        How can we help you today?
       </div>
     </div>
+    <!-- Input -->
+    <div
+      style="padding:1.2rem; border-top:1px solid var(--glass-border); display:flex; align-items:flex-end; gap:10px; flex-shrink:0;">
+      <textarea id="chatInput" placeholder="Type a message..." rows="1"
+        style="flex:1; background:rgba(255,255,255,0.05); border:1px solid var(--glass-border); border-radius:12px; padding:0.8rem; color:white; font-size:0.9rem; outline:none; resize:none; font-family:inherit; min-height:45px; max-height:120px;"></textarea>
+      <button onclick="sendMessage()"
+        style="background:var(--accent); border:none; width:45px; height:45px; border-radius:12px; color:white; cursor:pointer; transition:0.3s; flex-shrink:0;">
+        <i class="fas fa-paper-plane"></i>
+      </button>
+    </div>
+    <!-- Hidden badge for JS compatibility -->
+    <span id="tenantChatBadge" style="display:none;">0</span>
   </div>
 
   <script>
@@ -9216,11 +12797,15 @@ try {
 
     function toggleChat() {
       chatOpen = !chatOpen;
-      const win = document.getElementById('chatWindow');
-      win.style.display = chatOpen ? 'flex' : 'none';
+      const panel = document.getElementById('supportChatWidget');
+      const overlay = document.getElementById('chatOverlay');
+      panel.style.right = chatOpen ? '0' : '-420px';
+      overlay.style.display = chatOpen ? 'block' : 'none';
       if (chatOpen) {
         fetch('tenant-dashboard.php?action=mark_support_read'); // Mark as read on open
         document.getElementById('tenantChatBadge').style.display = 'none';
+        const sBadge = document.getElementById('sidebarChatBadge');
+        if (sBadge) sBadge.style.display = 'none';
         fetchMessages();
         setTimeout(() => {
           const box = document.getElementById('chatMessages');
@@ -9239,11 +12824,14 @@ try {
 
             // Show badge if window closed and there are unread admin messages
             const badge = document.getElementById('tenantChatBadge');
+            const sBadge = document.getElementById('sidebarChatBadge');
             if (!chatOpen && newCount > 0) {
               badge.innerText = newCount;
               badge.style.display = 'flex';
+              if (sBadge) { sBadge.innerText = newCount; sBadge.style.display = 'inline-flex'; }
             } else if (chatOpen) {
               badge.style.display = 'none';
+              if (sBadge) sBadge.style.display = 'none';
             }
 
             renderMessages(data.messages);
@@ -9543,7 +13131,7 @@ try {
                         if (msgId) document.getElementById(msgId).style.display = 'none';
                         this.reset();
                         // Refresh appropriate list
-                        if (typeof window.refreshStaffList === 'function' && action === 'add_staff') refreshStaffList();
+                        if (typeof window.renderStaffTable === 'function' && action === 'add_staff') renderStaffTable();
                         else if (typeof window.refreshServicesList === 'function' && action === 'add_service') refreshServicesList();
                         else location.reload(); // Hard fallback for other lists
                       }, msgId ? 1500 : 200);
@@ -9577,7 +13165,30 @@ try {
           });
         }
       });
+
+      // INITIAL DATA LOAD
     })();
+
+    window.addEventListener('load', () => {
+      console.log("[RUNTIME] Initializing Dashboard Modules...");
+      const runSafe = (fnName) => {
+        try {
+          if (typeof window[fnName] === 'function') window[fnName]();
+        } catch (e) {
+          console.warn(`[MODULE_LOAD_FAIL] ${fnName}:`, e.message);
+        }
+      };
+
+      runSafe('refreshShiftRequests');
+      runSafe('refreshVehiclesList');
+      runSafe('refreshAppointmentsList');
+      runSafe('refreshDashboardJobs');
+      runSafe('refreshServicesList');
+      runSafe('refreshJobOrders');
+      runSafe('refreshBaysList');
+      runSafe('refreshSettledJobs');
+      runSafe('refreshPaymentsList');
+    });
   </script>
 </body>
 

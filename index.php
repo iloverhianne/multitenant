@@ -27,10 +27,12 @@ try {
     <link
         href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
         rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         :root {
             --bg-deep: #030712;
             --accent: #6366f1;
+            --accent-rgb: 99, 102, 241;
             --accent-glow: rgba(99, 102, 241, 0.4);
             --glass: rgba(255, 255, 255, 0.03);
             --glass-border: rgba(255, 255, 255, 0.08);
@@ -244,68 +246,161 @@ try {
         .hero {
             padding: 12rem 10% 8rem;
             display: flex;
-            flex-direction: column;
             align-items: center;
-            justify-content: center;
-            min-height: 80vh;
+            justify-content: space-between;
+            min-height: 100vh;
             position: relative;
-            text-align: center;
+            text-align: left;
+            background: linear-gradient(rgba(3, 7, 18, 0.7), rgba(3, 7, 18, 0.9)), url('assets/img/hero-bg.png');
+            background-size: cover;
+            background-position: center;
+            overflow: hidden;
         }
 
         .hero-content {
             z-index: 10;
-            max-width: 900px;
-            margin: 0 auto;
-        }
-
-        .badge-new {
-            background: rgba(99, 102, 241, 0.1);
-            color: var(--accent);
-            padding: 0.6rem 1.2rem;
-            border-radius: 100px;
-            font-size: 0.8rem;
-            font-weight: 800;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            margin-bottom: 2rem;
-            border: 1px solid rgba(99, 102, 241, 0.2);
-            text-transform: uppercase;
-            letter-spacing: 1.5px;
-            backdrop-filter: blur(5px);
-        }
-
-        .hero h1 {
-            font-size: clamp(3rem, 7vw, 6.5rem);
-            font-weight: 900;
-            line-height: 1;
-            margin-bottom: 2.5rem;
-            letter-spacing: -4px;
-            text-transform: uppercase;
-        }
-
-        .hero h1 span {
-            background: linear-gradient(90deg, #6366f1, #a855f7, #ec4899);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            display: block;
+            max-width: 800px;
+            margin: 0;
+            text-align: left;
         }
 
         .hero p {
             font-size: 1.25rem;
             color: var(--text-dim);
-            margin: 0 auto 4rem;
-            max-width: 700px;
+            margin: 0 0 4rem 0;
+            max-width: 600px;
             line-height: 1.8;
             border: none;
             padding: 0;
+            text-align: left;
         }
 
         .hero-btns {
             display: flex;
             gap: 1.5rem;
-            justify-content: center;
+            justify-content: flex-start;
             flex-wrap: wrap;
+        }
+
+        /* Tracker Mockup */
+        .tracker-card {
+            background: rgba(255, 255, 255, 0.03);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 32px;
+            padding: 2.5rem;
+            width: 380px;
+            box-shadow: 0 50px 100px rgba(0, 0, 0, 0.5);
+            position: relative;
+            z-index: 5;
+            animation: float-tracker 8s ease-in-out infinite;
+            transform-style: preserve-3d;
+            perspective: 1000px;
+        }
+
+        @keyframes float-tracker {
+
+            0%,
+            100% {
+                transform: translateY(0) rotateX(5deg) rotateY(-10deg);
+            }
+
+            50% {
+                transform: translateY(-30px) rotateX(10deg) rotateY(-5deg);
+            }
+        }
+
+        .tracker-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+        }
+
+        .tracker-status {
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--success);
+            padding: 0.4rem 1rem;
+            border-radius: 100px;
+            font-size: 0.7rem;
+            font-weight: 800;
+            text-transform: uppercase;
+        }
+
+        .tracker-steps {
+            list-style: none;
+        }
+
+        .tracker-step {
+            display: flex;
+            gap: 1.5rem;
+            margin-bottom: 1.8rem;
+            position: relative;
+        }
+
+        .tracker-step:not(:last-child)::after {
+            content: '';
+            position: absolute;
+            left: 14px;
+            top: 35px;
+            width: 2px;
+            height: 30px;
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .tracker-dot {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.05);
+            border: 2px solid rgba(255, 255, 255, 0.1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            font-size: 0.8rem;
+            transition: all 0.5s;
+        }
+
+        .tracker-step.completed .tracker-dot {
+            background: var(--success);
+            border-color: var(--success);
+            color: white;
+            box-shadow: 0 0 20px rgba(16, 185, 129, 0.3);
+        }
+
+        .tracker-step.active .tracker-dot {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
+            box-shadow: 0 0 20px var(--accent-glow);
+        }
+
+        .tracker-info h4 {
+            font-size: 0.95rem;
+            font-weight: 800;
+            margin-bottom: 0.2rem;
+        }
+
+        .tracker-info p {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+            margin: 0;
+        }
+
+        [data-theme="light"] .hero {
+            background: linear-gradient(rgba(255, 255, 255, 0.8), rgba(255, 255, 255, 0.95)), url('assets/img/hero-bg.png');
+        }
+
+        [data-theme="light"] .tracker-card {
+            background: white;
+            border-color: rgba(0, 0, 0, 0.05);
+            box-shadow: 0 40px 80px rgba(0, 0, 0, 0.08);
+        }
+
+        [data-theme="light"] .tracker-dot {
+            background: #f1f5f9;
+            border-color: #e2e8f0;
         }
 
         .btn-primary {
@@ -1057,12 +1152,11 @@ try {
             border-radius: 32px;
             width: 100%;
             max-width: 550px;
-            /* Slightly reduced */
             padding: 2.2rem;
-            /* Reduced from 3rem */
             position: relative;
-            box-shadow: 0 50px 100px -20px rgba(0, 0, 0, 0.8);
+            box-shadow: 0 50px 100px -20px rgba(0, 0, 0, 0.4);
             animation: modalFadeIn 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+            backdrop-filter: blur(20px);
         }
 
         @keyframes modalFadeIn {
@@ -1078,15 +1172,19 @@ try {
         }
 
         .modal-card h3 {
-            font-size: 2rem;
+            font-size: 2.2rem;
             font-weight: 900;
-            margin-bottom: 1rem;
-            letter-spacing: -1px;
+            margin-bottom: 0.8rem;
+            letter-spacing: -1.5px;
+            color: var(--text-main);
+            line-height: 1.1;
         }
 
         .modal-card p {
             color: var(--text-dim);
             margin-bottom: 2rem;
+            font-size: 1rem;
+            font-weight: 500;
         }
 
         .form-group {
@@ -1098,31 +1196,44 @@ try {
         .form-group label {
             display: block;
             margin-bottom: 0.5rem;
-            font-size: 0.9rem;
-            font-weight: 600;
-            color: rgba(255, 255, 255, 0.8);
+            font-size: 0.85rem;
+            font-weight: 700;
+            color: var(--text-main);
+            opacity: 0.7;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
 
         .form-group input,
         .form-group select {
             width: 100%;
-            padding: 1rem;
-            background: #0f172a;
+            padding: 1.1rem;
+            background: rgba(0, 0, 0, 0.05);
             border: 1px solid var(--glass-border);
-            border-radius: 12px;
-            color: white;
+            border-radius: 16px;
+            color: var(--text-main);
             font-size: 0.95rem;
+            font-weight: 500;
             outline: none;
-            transition: all 0.3s;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        [data-theme="dark"] .form-group input,
+        [data-theme="dark"] .form-group select {
+            background: rgba(255, 255, 255, 0.03);
         }
 
         .form-group select {
             appearance: none;
-            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%231e293b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
             background-repeat: no-repeat;
             background-position: right 1rem center;
             background-size: 1rem;
             padding-right: 2.5rem;
+        }
+
+        [data-theme="dark"] .form-group select {
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
         }
 
         .form-group select optgroup {
@@ -1138,8 +1249,15 @@ try {
             padding: 10px;
         }
 
-        .form-group input:focus {
+        .form-group input:focus,
+        .form-group select:focus {
             border-color: var(--accent);
+            background: white;
+            box-shadow: 0 0 0 4px var(--accent-glow);
+        }
+
+        [data-theme="dark"] .form-group input:focus,
+        [data-theme="dark"] .form-group select:focus {
             background: rgba(255, 255, 255, 0.08);
         }
 
@@ -1166,6 +1284,148 @@ try {
             background: rgba(255, 255, 255, 0.1);
             transform: rotate(90deg);
         }
+
+        /* Custom File Upload Styling */
+        .file-upload-wrapper {
+            position: relative;
+            width: 100%;
+        }
+
+        .file-upload-wrapper input[type="file"] {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            opacity: 0;
+            cursor: pointer;
+            z-index: 2;
+        }
+
+        .file-upload-btn {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 1rem;
+            background: rgba(var(--accent-rgb), 0.05);
+            border: 2px dashed var(--glass-border);
+            border-radius: 16px;
+            color: var(--text-dim);
+            font-size: 0.85rem;
+            font-weight: 600;
+            transition: all 0.3s;
+            text-align: left;
+        }
+
+        .file-upload-wrapper:hover .file-upload-btn {
+            border-color: var(--accent);
+            background: rgba(var(--accent-rgb), 0.1);
+            color: var(--text-main);
+        }
+
+        .file-upload-btn i {
+            font-size: 1.2rem;
+            color: var(--accent);
+        }
+
+        /* Theme Toggle */
+        .theme-toggle {
+            background: var(--glass);
+            border: 1px solid var(--glass-border);
+            width: 44px;
+            height: 44px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            color: var(--text-main);
+            transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            margin-right: 0.5rem;
+            font-size: 1.1rem;
+            backdrop-filter: blur(10px);
+        }
+
+        .theme-toggle:hover {
+            background: var(--accent);
+            color: white;
+            transform: scale(1.1) rotate(15deg);
+        }
+
+        /* Light Mode Variables */
+        [data-theme="light"] {
+            --bg-deep: #f0f4f8;
+            --text-main: #1e293b;
+            --text-dim: #64748b;
+            --glass: rgba(255, 255, 255, 0.8);
+            --glass-border: rgba(0, 0, 0, 0.05);
+            --accent-glow: rgba(99, 102, 241, 0.15);
+        }
+
+        [data-theme="light"] body {
+            background-image:
+                radial-gradient(circle at 0% 0%, rgba(99, 102, 241, 0.05) 0%, transparent 50%),
+                radial-gradient(circle at 100% 100%, rgba(168, 85, 247, 0.05) 0%, transparent 50%);
+        }
+
+        [data-theme="light"] nav {
+            background: rgba(255, 255, 255, 0.7);
+            border-bottom-color: rgba(0, 0, 0, 0.05);
+        }
+
+        [data-theme="light"] nav.scrolled {
+            background: rgba(255, 255, 255, 0.9);
+        }
+
+        [data-theme="light"] .feature-card,
+        [data-theme="light"] .pricing-card,
+        [data-theme="light"] .testimonial-card,
+        [data-theme="light"] .step-number {
+            background: white;
+            border-color: rgba(0, 0, 0, 0.05);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.03);
+        }
+
+        [data-theme="light"] .logo,
+        [data-theme="light"] .nav-links a:hover,
+        [data-theme="light"] .hero h1,
+        [data-theme="light"] .feature-card h3,
+        [data-theme="light"] .step h4,
+        [data-theme="light"] .step-number,
+        [data-theme="light"] .price {
+            color: #0f172a;
+        }
+
+        [data-theme="light"] .btn-secondary {
+            background: #ffffff;
+            color: #0f172a;
+            border-color: #e2e8f0;
+        }
+
+        [data-theme="light"] .btn-nav {
+            background: #1e293b;
+            color: white !important;
+        }
+
+        [data-theme="light"] footer {
+            background: #ffffff;
+            border-top: 1px solid #e2e8f0;
+        }
+
+        [data-theme="light"] footer h4,
+        [data-theme="light"] footer .logo,
+        [data-theme="light"] footer .footer-bottom p {
+            color: #0f172a;
+        }
+
+        [data-theme="light"] footer p,
+        [data-theme="light"] footer .footer-links a {
+            color: #64748b;
+        }
+
+        [data-theme="light"] .social-icon {
+            background: #f1f5f9;
+            color: #0f172a;
+            border: 1px solid #e2e8f0;
+        }
     </style>
 </head>
 
@@ -1185,6 +1445,9 @@ try {
             <a href="#pricing">Pricing</a>
         </div>
         <div class="nav-actions">
+            <button class="theme-toggle" id="theme-toggle" title="Toggle Light/Dark Mode">
+                <i class="fas fa-moon"></i>
+            </button>
             <a href="login.php?from=superadmin" class="btn-nav">Sign In</a>
             <a href="javascript:void(0)" onclick="openModal()" class="btn-register">Join Platform</a>
         </div>
@@ -1195,23 +1458,58 @@ try {
         <section class="hero">
             <div class="hero-content">
                 <div class="badge-new reveal">
-                    <span>New</span> Engine v4.0 Active
+                    <span>Active</span> Next-Gen Shop Platform
                 </div>
                 <h1 class="reveal" style="transition-delay: 0.1s;">Scale Your <span>Repair Empire</span></h1>
-                <p class="reveal" style="transition-delay: 0.2s;">The ultimate multi-tenant platform for independent
-                    auto shops. Provision your independent dashboard, manage technicians, and scale operations globally.
+                <p class="reveal" style="transition-delay: 0.2s;">
+                    The ultimate multi-tenant platform for independent auto shops.
+                    Manage bays, technicians, and inventory with a unified digital core.
                 </p>
 
                 <div class="hero-btns reveal" style="transition-delay: 0.3s;">
-                    <a href="#pricing" class="btn-primary">Provision Your Hub <span
-                            style="font-size: 1.2rem;">→</span></a>
-                    <a href="#features" class="btn-secondary">Explore Solutions</a>
+                    <a href="#pricing" class="btn-primary">Get Started <span
+                            style="font-size: 1.2rem; margin-left: 10px;">→</span></a>
+                    <a href="#features" class="btn-secondary">View Demo</a>
                 </div>
+            </div>
 
+            <div class="tracker-card reveal" style="transition-delay: 0.4s;">
+                <div class="tracker-header">
+                    <h3 style="font-size: 1.1rem; font-weight: 800;">Repair Status</h3>
+                    <div class="tracker-status">In Progress</div>
+                </div>
+                <div class="tracker-steps">
+                    <div class="tracker-step completed">
+                        <div class="tracker-dot">✓</div>
+                        <div class="tracker-info">
+                            <h4>Vehicle Intake</h4>
+                            <p>Completed at 09:30 AM</p>
+                        </div>
+                    </div>
+                    <div class="tracker-step completed">
+                        <div class="tracker-dot">✓</div>
+                        <div class="tracker-info">
+                            <h4>Diagnostic Scan</h4>
+                            <p>Issues: O2 Sensor, Spark Plugs</p>
+                        </div>
+                    </div>
+                    <div class="tracker-step active">
+                        <div class="tracker-dot">3</div>
+                        <div class="tracker-info">
+                            <h4>Repair Ongoing</h4>
+                            <p>Mechanic: Juan Dela Cruz</p>
+                        </div>
+                    </div>
+                    <div class="tracker-step">
+                        <div class="tracker-dot">4</div>
+                        <div class="tracker-info">
+                            <h4>Ready for Pickup</h4>
+                            <p>Estimated: 04:30 PM</p>
+                        </div>
+                    </div>
+                </div>
             </div>
         </section>
-
-
 
         <!-- Multi-Tenant Value Proposition -->
         <section class="features" id="tenant-value" style="padding-bottom: 0;">
@@ -1225,19 +1523,19 @@ try {
             </div>
             <div class="features-grid">
                 <div class="feature-card">
-                    <div class="feature-icon">⛓️</div>
+                    <div class="feature-icon"><i class="fa-solid fa-shield-halved"></i></div>
                     <h3>Total Isolation</h3>
                     <p>Your data is cryptographically isolated. No tenant can ever see another's clients, inventory, or
                         financial reports.</p>
                 </div>
                 <div class="feature-card">
-                    <div class="feature-icon">🎨</div>
+                    <div class="feature-icon"><i class="fa-solid fa-palette"></i></div>
                     <h3>White-Label Ready</h3>
                     <p>Customize your shop's portal with your own logo, color palette, and personalized service
                         categories.</p>
                 </div>
                 <div class="feature-card">
-                    <div class="feature-icon">🚀</div>
+                    <div class="feature-icon"><i class="fa-solid fa-rocket"></i></div>
                     <h3>Instant Deployment</h3>
                     <p>No servers to maintain. Get your repair shop's digital management system live in under 60
                         seconds.</p>
@@ -1335,42 +1633,42 @@ try {
 
             <div class="pricing-grid">
                 <?php if (empty($plans)): ?>
-                    <p style="grid-column: 1/-1; text-align: center; color: var(--text-dim);">No plans available at the
-                        moment.</p>
+                        <p style="grid-column: 1/-1; text-align: center; color: var(--text-dim);">No plans available at the
+                            moment.</p>
                 <?php else: ?>
-                    <?php foreach ($plans as $plan):
-                        $isPopular = (strpos($plan['plan_name'], 'PRO') !== false);
-                        ?>
-                        <div class="pricing-card <?php echo $isPopular ? 'popular' : ''; ?>">
-                            <?php if ($isPopular): ?>
-                                <span class="popular-badge">High Performance</span>
-                            <?php endif; ?>
-                            <h4>
-                                <?php echo htmlspecialchars($plan['plan_name']); ?>
-                            </h4>
-                            <div class="price" id="price-<?php echo $plan['plan_id']; ?>">₱
-                                <?php echo number_format($plan['price'], 0); ?><span
-                                    id="period-<?php echo $plan['plan_id']; ?>">/mo</span>
-                            </div>
-                            <p id="savings-<?php echo $plan['plan_id']; ?>"
-                                style="color: var(--success); font-size: 0.8rem; margin-top: -0.5rem; height: 1.2rem; display: none;">
-                                Savings Applied
-                            </p>
-                            <ul class="pricing-features">
-                                <li>
-                                    <?php echo $plan['max_users']; ?> Staff Accounts
-                                </li>
-                                <li>
-                                    <?php echo $plan['max_service_bays']; ?> Active Service Bays
-                                </li>
-                                <li>Priority Support Enabled</li>
-                                <li>Cloud Data Backup</li>
-                                <li>Zero Transaction Fees</li>
-                            </ul>
-                            <a href="javascript:void(0)" onclick="handlePricingClick(<?php echo $plan['plan_id']; ?>)"
-                                class="btn-primary" style="margin-top: 2.5rem; width: 100%; text-align: center;">Choose Plan</a>
-                        </div>
-                    <?php endforeach; ?>
+                        <?php foreach ($plans as $plan):
+                            $isPopular = (strpos($plan['plan_name'], 'PRO') !== false);
+                            ?>
+                                <div class="pricing-card <?php echo $isPopular ? 'popular' : ''; ?>">
+                                    <?php if ($isPopular): ?>
+                                            <span class="popular-badge">High Performance</span>
+                                    <?php endif; ?>
+                                    <h4>
+                                        <?php echo htmlspecialchars($plan['plan_name']); ?>
+                                    </h4>
+                                    <div class="price" id="price-<?php echo $plan['plan_id']; ?>">₱
+                                        <?php echo number_format($plan['price'], 0); ?><span
+                                            id="period-<?php echo $plan['plan_id']; ?>">/mo</span>
+                                    </div>
+                                    <p id="savings-<?php echo $plan['plan_id']; ?>"
+                                        style="color: var(--success); font-size: 0.8rem; margin-top: -0.5rem; height: 1.2rem; display: none;">
+                                        Savings Applied
+                                    </p>
+                                    <ul class="pricing-features">
+                                        <li>
+                                            <?php echo $plan['max_users']; ?> Staff Accounts
+                                        </li>
+                                        <li>
+                                            <?php echo $plan['max_service_bays']; ?> Active Service Bays
+                                        </li>
+                                        <li>Priority Support Enabled</li>
+                                        <li>Cloud Data Backup</li>
+                                        <li>Zero Transaction Fees</li>
+                                    </ul>
+                                    <a href="javascript:void(0)" onclick="handlePricingClick(<?php echo $plan['plan_id']; ?>)"
+                                        class="btn-primary" style="margin-top: 2.5rem; width: 100%; text-align: center;">Choose Plan</a>
+                                </div>
+                        <?php endforeach; ?>
                 <?php endif; ?>
             </div>
         </section>
@@ -1505,18 +1803,18 @@ try {
                         <select name="plan" id="planSelect" required>
                             <optgroup label="Monthly Billing" id="opt-monthly">
                                 <?php foreach ($plans as $plan): ?>
-                                    <option value="<?php echo $plan['plan_id']; ?>" data-cycle="monthly">
-                                        <?php echo htmlspecialchars($plan['plan_name']); ?> - ₱
-                                        <?php echo number_format($plan['price'], 0); ?>/mo
-                                    </option>
+                                        <option value="<?php echo $plan['plan_id']; ?>" data-cycle="monthly">
+                                            <?php echo htmlspecialchars($plan['plan_name']); ?> - ₱
+                                            <?php echo number_format($plan['price'], 0); ?>/mo
+                                        </option>
                                 <?php endforeach; ?>
                             </optgroup>
                             <optgroup label="Yearly Billing" id="opt-yearly">
                                 <?php foreach ($plans as $plan): ?>
-                                    <option value="<?php echo $plan['plan_id']; ?>" data-cycle="yearly">
-                                        <?php echo htmlspecialchars($plan['plan_name']); ?> - ₱
-                                        <?php echo number_format($plan['price_yearly'], 0); ?>/yr
-                                    </option>
+                                        <option value="<?php echo $plan['plan_id']; ?>" data-cycle="yearly">
+                                            <?php echo htmlspecialchars($plan['plan_name']); ?> - ₱
+                                            <?php echo number_format($plan['price_yearly'], 0); ?>/yr
+                                        </option>
                                 <?php endforeach; ?>
                             </optgroup>
                         </select>
@@ -1540,12 +1838,23 @@ try {
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
                     <div class="form-group">
                         <label>Business Proof (BIR/Permit)</label>
-                        <input type="file" name="business_proof" accept="image/*,.pdf" style="padding: 0.8rem;"
-                            required>
+                        <div class="file-upload-wrapper">
+                            <input type="file" name="business_proof" accept="image/*,.pdf" onchange="updateFileName(this)" required>
+                            <div class="file-upload-btn">
+                                <i class="fas fa-file-invoice"></i>
+                                <span>Upload Permit...</span>
+                            </div>
+                        </div>
                     </div>
                     <div class="form-group">
                         <label>Owner's ID Photo</label>
-                        <input type="file" name="id_photo" accept="image/*" style="padding: 0.8rem;" required>
+                        <div class="file-upload-wrapper">
+                            <input type="file" name="id_photo" accept="image/*" onchange="updateFileName(this)" required>
+                            <div class="file-upload-btn">
+                                <i class="fas fa-id-card"></i>
+                                <span>Upload ID...</span>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -1587,6 +1896,18 @@ try {
                     document.getElementById('hiddenPlanId').value = plan.plan_id;
                     document.getElementById('hiddenBillingCycle').value = cycleToUse;
                 }
+            }
+        }
+
+        function updateFileName(input) {
+            const wrapper = input.closest('.file-upload-wrapper');
+            const btn = wrapper.querySelector('.file-upload-btn span');
+            if (input.files && input.files.length > 0) {
+                btn.innerText = input.files[0].name;
+                btn.style.color = 'var(--accent)';
+            } else {
+                btn.innerText = 'Upload File...';
+                btn.style.color = 'var(--text-dim)';
             }
         }
 
@@ -1707,6 +2028,38 @@ try {
                     savingsEl.style.display = isYearly ? 'block' : 'none';
                 }
             });
+        }
+    </script>
+    <script>
+        // Theme Management
+        const themeToggle = document.getElementById('theme-toggle');
+        const themeIcon = themeToggle.querySelector('i');
+        const htmlElement = document.documentElement;
+
+        // Check for saved theme or system preference
+        const savedTheme = localStorage.getItem('theme');
+        if (savedTheme) {
+            htmlElement.setAttribute('data-theme', savedTheme);
+            updateThemeIcon(savedTheme);
+        }
+
+        themeToggle.addEventListener('click', () => {
+            const currentTheme = htmlElement.getAttribute('data-theme');
+            const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+
+            htmlElement.setAttribute('data-theme', newTheme);
+            localStorage.setItem('theme', newTheme);
+            updateThemeIcon(newTheme);
+        });
+
+        function updateThemeIcon(theme) {
+            if (theme === 'light') {
+                themeIcon.classList.remove('fa-moon');
+                themeIcon.classList.add('fa-sun');
+            } else {
+                themeIcon.classList.remove('fa-sun');
+                themeIcon.classList.add('fa-moon');
+            }
         }
     </script>
 </body>

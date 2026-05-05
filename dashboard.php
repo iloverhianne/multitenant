@@ -1134,6 +1134,27 @@ try {
             --success: #10b981;
             --warning: #f59e0b;
             --info: #3b82f6;
+            --card-bg: rgba(255, 255, 255, 0.03);
+            --input-bg: rgba(0, 0, 0, 0.2);
+            --modal-bg: rgba(15, 23, 42, 0.95);
+        }
+
+        [data-theme="light"] {
+            --bg-deep: #f8fafc;
+            --accent: #4f46e5;
+            --accent-glow: rgba(79, 70, 229, 0.4);
+            --gradient: linear-gradient(135deg, #4f46e5, #3730a3);
+            --glass: #ffffff;
+            --glass-border: rgba(0, 0, 0, 0.1);
+            --text-main: #0f172a;
+            --text-dim: #475569;
+            --error: #dc2626;
+            --success: #059669;
+            --warning: #d97706;
+            --info: #2563eb;
+            --card-bg: #ffffff;
+            --input-bg: #ffffff;
+            --modal-bg: rgba(255, 255, 255, 0.98);
         }
 
         * {
@@ -1172,8 +1193,13 @@ try {
             min-height: 100vh;
             display: grid;
             grid-template-columns: 280px 1fr;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
             scrollbar-width: thin;
             scrollbar-color: rgba(255, 255, 255, 0.2) rgba(0, 0, 0, 0.3);
+        }
+
+        body.sidebar-collapsed {
+            grid-template-columns: 85px 1fr;
         }
 
         /* Sidebar Styling */
@@ -1187,6 +1213,73 @@ try {
             position: sticky;
             top: 0;
             height: 100vh;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            z-index: 5000;
+        }
+
+        /* Sidebar Trigger (Floating Arrow) */
+        .sidebar-trigger {
+            position: absolute;
+            right: -14px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 28px;
+            height: 28px;
+            background: var(--accent);
+            border: 1px solid var(--glass-border);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #000;
+            cursor: pointer;
+            z-index: 5001;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        }
+
+        .sidebar-trigger:hover {
+            transform: translateY(-50%) scale(1.15);
+            background: #fff;
+            box-shadow: 0 0 15px var(--accent);
+        }
+
+        .sidebar-trigger i {
+            transition: transform 0.3s ease;
+        }
+
+        body.sidebar-collapsed .sidebar-trigger i {
+            transform: rotate(180deg);
+        }
+
+        /* Hide labels in collapsed state */
+        body.sidebar-collapsed .nav-label,
+        body.sidebar-collapsed .brand-logo span,
+        body.sidebar-collapsed .badge-pending {
+            display: none !important;
+        }
+
+        body.sidebar-collapsed .sidebar {
+            padding: 2.5rem 0.5rem;
+            align-items: center;
+        }
+
+        body.sidebar-collapsed .brand-logo {
+            padding-left: 0;
+            justify-content: center;
+            display: flex;
+            font-size: 1.2rem;
+        }
+
+        body.sidebar-collapsed .nav-item {
+            justify-content: center;
+            padding: 0.9rem 0;
+            width: 50px;
+        }
+
+        body.sidebar-collapsed .nav-item i {
+            font-size: 1.25rem;
+            margin: 0;
         }
 
         .brand-logo {
@@ -2156,9 +2249,17 @@ try {
 <body>
 
     <aside class="sidebar">
+        <!-- Sidebar Toggle -->
+        <div class="sidebar-trigger" onclick="window.toggleSidebar()">
+            <i class="fas fa-chevron-left"></i>
+        </div>
+
         <div class="brand-logo">AutoFix <span>Hub</span></div>
         <nav class="nav-menu">
-            <div class="nav-item active" data-view="dashboard"><i class="fa-solid fa-gauge-high"></i> Dashboard</div>
+            <div class="nav-item active" data-view="dashboard">
+                <i class="fa-solid fa-gauge-high"></i>
+                <span class="nav-label">Dashboard</span>
+            </div>
             
             <div class="nav-item" data-view="shops"
                 style="display:flex; align-items:center; justify-content:space-between; width:100%;">
@@ -2168,7 +2269,7 @@ try {
                         <div id="sidebar-notif-dot" class="notif-dot"
                             style="display: <?php echo ($pending_tenant_count > 0) ? 'block' : 'none'; ?>;"></div>
                     </div>
-                    <span>Tenant Management</span>
+                    <span class="nav-label">Tenant Management</span>
                 </div>
                 <span id="sidebar-pending-badge" class="badge-pending"
                     style="display: <?php echo ($pending_tenant_count > 0) ? 'block' : 'none'; ?>;">
@@ -2176,22 +2277,52 @@ try {
                 </span>
             </div>
             
-            <div class="nav-item" data-view="plans"><i class="fa-solid fa-credit-card"></i> Subscriptions</div>
-            <div class="nav-item" data-view="payments"><i class="fa-solid fa-sack-dollar"></i> Sales Report</div>
-            <div class="nav-item" data-view="price_standards"><i class="fa-solid fa-tags"></i> Price Standards</div>
-            <div class="nav-item" data-view="reports"><i class="fa-solid fa-chart-pie"></i> Reports</div>
-            <div class="nav-item" data-view="logs"><i class="fa-solid fa-clipboard-list"></i> Audit Logs</div>
-            <div class="nav-item" data-view="backup"><i class="fa-solid fa-database"></i> Backup</div>
-            <div class="nav-item" data-view="settings"><i class="fa-solid fa-gears"></i> Settings</div>
+            <div class="nav-item" data-view="plans">
+                <i class="fa-solid fa-credit-card"></i>
+                <span class="nav-label">Subscriptions</span>
+            </div>
+            <div class="nav-item" data-view="payments">
+                <i class="fa-solid fa-sack-dollar"></i>
+                <span class="nav-label">Sales Report</span>
+            </div>
+            <div class="nav-item" data-view="price_standards">
+                <i class="fa-solid fa-tags"></i>
+                <span class="nav-label">Price Standards</span>
+            </div>
+            <div class="nav-item" data-view="reports">
+                <i class="fa-solid fa-chart-pie"></i>
+                <span class="nav-label">Reports</span>
+            </div>
+            <div class="nav-item" data-view="logs">
+                <i class="fa-solid fa-clipboard-list"></i>
+                <span class="nav-label">Audit Logs</span>
+            </div>
+            <div class="nav-item" data-view="backup">
+                <i class="fa-solid fa-database"></i>
+                <span class="nav-label">Backup</span>
+            </div>
+            <div class="nav-item" data-view="settings">
+                <i class="fa-solid fa-gears"></i>
+                <span class="nav-label">Settings</span>
+            </div>
             
             <div class="nav-item" data-view="chat" style="display:flex; justify-content:space-between; align-items:center; margin-top:1.5rem; border-top:1px solid rgba(255,255,255,0.05); padding-top:1.5rem;">
-                <div style="display:flex; align-items:center; gap:12px;"><i class="fa-solid fa-headset"></i> Chat Support</div>
+                <div style="display:flex; align-items:center; gap:12px;">
+                    <i class="fa-solid fa-headset"></i>
+                    <span class="nav-label">Chat Support</span>
+                </div>
                 <span id="globalChatBadge" style="display:none; background:var(--error); color:white; font-size:0.6rem; padding:2px 6px; border-radius:10px;">0</span>
             </div>
         </nav>
+        
+        <div class="nav-item" id="theme-toggle" style="margin-top: auto; border-top: 1px solid var(--glass-border); padding-top: 1.5rem; display:flex; align-items:center; gap:12px;">
+            <i class="fa-solid fa-moon"></i>
+            <span class="nav-label">Dark Mode</span>
+        </div>
         <div class="nav-item" id="logoutBtn"
-            style="color: var(--error); margin-top: auto; border-top: 1px solid var(--glass-border); padding-top: 1.5rem; display:flex; align-items:center; gap:12px;">
-            <i class="fa-solid fa-right-from-bracket"></i> Logout Account
+            style="color: var(--error); margin-top: 0.5rem; display:flex; align-items:center; gap:12px;">
+            <i class="fa-solid fa-right-from-bracket"></i>
+            <span class="nav-label">Logout Account</span>
         </div>
     </aside>
 
@@ -3552,7 +3683,9 @@ try {
             // 1. Calculate GLOBAL Stats first (independent of filters)
             payments.forEach(p => {
                 const ps = (p.status || '').trim().toUpperCase();
-                const isPaid = (ps === 'PAID' || ps === 'SUCCESS');
+                const ts = (p.tenantStatus || '').trim().toUpperCase();
+                const isRejected = (ps === 'REJECTED' || ps === 'FAILED' || ts === 'REJECTED' || (p.shopName || '').includes('[REJECTED]'));
+                const isPaid = (ps === 'PAID' || ps === 'SUCCESS' || ps === 'COMPLETED') && !isRejected;
 
                 if (isPaid) {
                     const amt = parseFloat(p.amount) || 0;
@@ -3637,7 +3770,11 @@ try {
                 let filteredSum = 0;
                 let filteredTnxList = filtered.filter(p => {
                     const ps = (p.status || '').toUpperCase();
-                    if (ps === 'PAID' || ps === 'SUCCESS') {
+                    const ts = (p.tenantStatus || '').toUpperCase();
+                    const isRejected = (ps === 'REJECTED' || ps === 'FAILED' || ts === 'REJECTED' || (p.shopName || '').includes('[REJECTED]'));
+                    const isPaid = (ps === 'PAID' || ps === 'SUCCESS' || ps === 'COMPLETED') && !isRejected;
+
+                    if (isPaid) {
                         filteredSum += parseFloat(p.amount);
                         return true;
                     }
@@ -4250,7 +4387,6 @@ try {
             const pass = document.getElementById('newAdminPass').value;
             
             if (!name || !email || !pass) return alert("Please fill in all admin fields.");
-            if (pass.length < 8) return alert("Password must be at least 8 chars.");
             
             const originalText = btn.innerText;
             btn.innerText = 'Adding...';
@@ -5513,6 +5649,22 @@ try {
         // Poll every 30 seconds
         setInterval(checkPendingNotifications, 30000);
 
+        // --- SIDEBAR TOGGLE LOGIC ---
+        window.toggleSidebar = function() {
+            const body = document.body;
+            body.classList.toggle('sidebar-collapsed');
+            const isCollapsed = body.classList.contains('sidebar-collapsed');
+            localStorage.setItem('superadmin_sidebar_collapsed', isCollapsed);
+        };
+
+        // Persistent Sidebar State Restoration
+        (function() {
+            const isCollapsed = localStorage.getItem('superadmin_sidebar_collapsed') === 'true';
+            if (isCollapsed) {
+                document.body.classList.add('sidebar-collapsed');
+            }
+        })();
+
         window.addEventListener('load', () => {
             loadDB();
             checkPendingNotifications(); // Initial check
@@ -5739,6 +5891,37 @@ try {
         window.addEventListener('load', () => {
             if (document.getElementById('backup').classList.contains('active')) refreshBackups();
         });
+
+        // Theme Management for Super Admin Dashboard
+        (function () {
+            const themeBtn = document.getElementById('theme-toggle');
+            if (!themeBtn) return;
+            const themeIcon = themeBtn.querySelector('i');
+            const themeLabel = themeBtn.querySelector('.nav-label');
+            const html = document.documentElement;
+
+            const updateThemeUI = (theme) => {
+                if (theme === 'light') {
+                    if (themeIcon) themeIcon.classList.replace('fa-moon', 'fa-sun');
+                    if (themeLabel) themeLabel.innerText = 'Light Mode';
+                } else {
+                    if (themeIcon) themeIcon.classList.replace('fa-sun', 'fa-moon');
+                    if (themeLabel) themeLabel.innerText = 'Dark Mode';
+                }
+            };
+
+            const savedTheme = localStorage.getItem('superadmin_theme') || 'dark';
+            html.setAttribute('data-theme', savedTheme);
+            updateThemeUI(savedTheme);
+
+            themeBtn.addEventListener('click', () => {
+                const current = html.getAttribute('data-theme');
+                const next = current === 'light' ? 'dark' : 'light';
+                html.setAttribute('data-theme', next);
+                localStorage.setItem('superadmin_theme', next);
+                updateThemeUI(next);
+            });
+        })();
     </script>
 </body>
 
