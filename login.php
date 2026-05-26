@@ -24,7 +24,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
 
     try {
         $db = getDB();
-        
+
         // Super Admin Check
         // 1. Hardcoded check (Fallback/Emergency)
         if ($user === 'superadmin' && $pass === 'admin123') {
@@ -33,9 +33,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
             $_SESSION['name'] = 'Main Admin';
             $_SESSION['shop_name'] = 'AutoFix Hub';
             $_SESSION['isLoggedIn'] = true;
-            
+            $_SESSION['pending_auto_backup'] = true;
+
             // LOG LOGIN
-            try { $db->prepare("INSERT INTO audit_logs (activity_type, description) VALUES ('AUTH', 'Super Admin logged in (Hardcoded Emergency Account)')")->execute(); } catch(Exception $e){}
+            try {
+                $now = date('Y-m-d H:i:s');
+                $db->prepare("INSERT INTO audit_logs (activity_type, description, created_at) VALUES ('AUTH', 'Super Admin logged in (Hardcoded Emergency Account)', ?)")->execute([$now]);
+            } catch (Exception $e) {
+            }
 
             session_write_close();
             echo json_encode(['status' => 'success', 'role' => 'SUPER_ADMIN', 'redirect' => 'dashboard.php']);
@@ -71,61 +76,77 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
                     exit;
                 }
 
-            // Check if it's a Super Admin (role_id 1 AND tenant_id is NULL)
-            if ($row['role_id'] == 1 && ($row['tenant_id'] === null || $row['tenant_id'] == 0)) {
+                // Check if it's a Super Admin (role_id 1 AND tenant_id is NULL)
+                if ($row['role_id'] == 1 && ($row['tenant_id'] === null || $row['tenant_id'] == 0)) {
+                    $_SESSION['user_id'] = $row['user_id'];
+                    $_SESSION['role'] = 'SUPER_ADMIN';
+                    $_SESSION['name'] = $row['name'];
+                    $_SESSION['shop_name'] = 'AutoFix Hub';
+                    $_SESSION['isLoggedIn'] = true;
+                    $_SESSION['pending_auto_backup'] = true;
+
+                    // LOG LOGIN
+                    try {
+                        $now = date('Y-m-d H:i:s');
+                        $db->prepare("INSERT INTO audit_logs (user_id, activity_type, description, created_at) VALUES (?, 'AUTH', 'Super Admin logged in to Hub Console', ?)")->execute([$row['user_id'], $now]);
+                    } catch (Exception $e) {
+                    }
+
+                    session_write_close();
+                    echo json_encode(['status' => 'success', 'role' => 'SUPER_ADMIN', 'redirect' => 'dashboard.php']);
+                    exit;
+                }
+
+                // 3. Workshop Association Check
+                // We only enforce the TID (Tenant ID) restriction for regular staff (Mechanics, Cashiers).
+                // Owners, Managers, and Super Admins can login from ANY portal and will be routed correctly.
+                $isStaff = !in_array(strtoupper($row['role_name']), ['OWNER', 'MANAGER', 'SUPER_ADMIN']);
+                if ($tid && $row['tenant_id'] != $tid && $isStaff) {
+                    echo json_encode(['status' => 'error', 'message' => 'User not associated with this workshop.']);
+                    exit;
+                }
                 $_SESSION['user_id'] = $row['user_id'];
-                $_SESSION['role'] = 'SUPER_ADMIN';
+                $_SESSION['tenant_id'] = $row['tenant_id'];
+                $_SESSION['role'] = $row['role_name'];
                 $_SESSION['name'] = $row['name'];
-                $_SESSION['shop_name'] = 'AutoFix Hub';
+                $_SESSION['shop_name'] = $row['shop_name'] ?? 'Super Admin';
                 $_SESSION['isLoggedIn'] = true;
+                if (strtoupper($row['role_name']) === 'SUPER_ADMIN') {
+                    $_SESSION['pending_auto_backup'] = true;
+                }
 
                 // LOG LOGIN
-                try { $db->prepare("INSERT INTO audit_logs (user_id, activity_type, description) VALUES (?, 'AUTH', 'Super Admin logged in to Hub Console')")->execute([$row['user_id']]); } catch(Exception $e){}
+                try {
+                    $logMsg = $row['name'] . " (" . strtoupper($row['role_name']) . ") logged in to " . ($row['shop_name'] ?? 'Workshop');
+                    $now = date('Y-m-d H:i:s');
+                    $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description, created_at) VALUES (?, ?, 'AUTH', ?, ?)")
+                        ->execute([$row['tenant_id'], $row['user_id'], $logMsg, $now]);
+                } catch (Exception $e) {
+                }
 
                 session_write_close();
-                echo json_encode(['status' => 'success', 'role' => 'SUPER_ADMIN', 'redirect' => 'dashboard.php']);
-                exit;
+                echo json_encode([
+                    'status' => 'success',
+                    'role' => $row['role_name'],
+                    'redirect' => (strtoupper($row['role_name']) === 'SUPER_ADMIN') ? 'dashboard.php' : 'tenant-dashboard.php'
+                ]);
+            } else {
+                echo json_encode(['status' => 'error', 'message' => 'Invalid credentials (password mismatch).']);
             }
-
-            if ($tid && $row['tenant_id'] != $tid) {
-                echo json_encode(['status' => 'error', 'message' => 'User not associated with this workshop.']);
-                exit;
-            }
-            $_SESSION['user_id'] = $row['user_id'];
-            $_SESSION['tenant_id'] = $row['tenant_id'];
-            $_SESSION['role'] = $row['role_name'];
-            $_SESSION['name'] = $row['name'];
-            $_SESSION['shop_name'] = $row['shop_name'] ?? 'Super Admin';
-            $_SESSION['isLoggedIn'] = true;
-
-            // LOG LOGIN
-            try {
-                $logMsg = $row['name'] . " (" . strtoupper($row['role_name']) . ") logged in to " . ($row['shop_name'] ?? 'Workshop');
-                $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'AUTH', ?)")
-                   ->execute([$row['tenant_id'], $row['user_id'], $logMsg]);
-            } catch(Exception $e){}
-
-            session_write_close();
-            echo json_encode([
-                'status' => 'success',
-                'role' => $row['role_name'],
-                'redirect' => (strtoupper($row['role_name']) === 'SUPER_ADMIN') ? 'dashboard.php' : 'tenant-dashboard.php'
-            ]);
         } else {
-            echo json_encode(['status' => 'error', 'message' => 'Invalid credentials (password mismatch).']);
+            echo json_encode(['status' => 'error', 'message' => 'Invalid credentials (email not found).']);
         }
-    } else {
-        echo json_encode(['status' => 'error', 'message' => 'Invalid credentials (email not found).']);
+    } catch (Exception $e) {
+        echo json_encode(['status' => 'error', 'message' => 'System error.']);
     }
-} catch (Exception $e) { echo json_encode(['status' => 'error', 'message' => 'System error.']); }
-exit;
+    exit;
 }
 
 // FETCH SHOP BRANDING & ACTUAL COLORS & SLUG
 $shop_name = '';
 $shop_logo = '';
 $shop_slug = '';
-$primary_color = '#6366f1'; 
+$primary_color = '#6366f1';
 $secondary_color = '#020617';
 
 if (($tid ?? '')) {
@@ -138,89 +159,337 @@ if (($tid ?? '')) {
             $shop_name = $res['shop_name'];
             $shop_logo = $res['logo_url'];
             $shop_slug = $res['slug'];
-            if (!empty($res['primary_color'])) $primary_color = $res['primary_color'];
-            if (!empty($res['secondary_color'])) $secondary_color = $res['secondary_color'];
+            if (!empty($res['primary_color']))
+                $primary_color = $res['primary_color'];
+            if (!empty($res['secondary_color']))
+                $secondary_color = $res['secondary_color'];
         }
-    } catch (Exception $e) {}
+    } catch (Exception $e) {
+    }
 }
 
-if (strpos($primary_color, '#') !== 0) $primary_color = '#' . $primary_color;
-if (strpos($secondary_color, '#') !== 0) $secondary_color = '#' . $secondary_color;
+if (strpos($primary_color, '#') !== 0)
+    $primary_color = '#' . $primary_color;
+if (strpos($secondary_color, '#') !== 0)
+    $secondary_color = '#' . $secondary_color;
 $rgb = sscanf($primary_color, "#%02x%02x%02x");
 $accentGlow = $rgb ? "rgba({$rgb[0]}, {$rgb[1]}, {$rgb[2]}, 0.4)" : "rgba(99, 102, 241, 0.4)";
 ?>
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title><?php echo ($from === 'superadmin') ? 'Admin Login | AutoFix Hub' : 'Staff Portal | ' . htmlspecialchars($shop_name ?: 'Workshop'); ?></title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <title>
+        <?php echo ($from === 'superadmin') ? 'Admin Login | AutoFix Hub' : 'Staff Portal | ' . htmlspecialchars($shop_name ?: 'Workshop'); ?>
+    </title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&display=swap"
+        rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         :root {
-            --bg-deep: <?php echo $secondary_color; ?>;
-            --accent: <?php echo $primary_color; ?>;
-            --accent-glow: <?php echo $accentGlow; ?>;
+            --bg-deep:
+                <?php echo $secondary_color; ?>
+            ;
+            --accent:
+                <?php echo $primary_color; ?>
+            ;
+            --accent-glow:
+                <?php echo $accentGlow; ?>
+            ;
             --glass: rgba(15, 23, 42, 0.7);
             --glass-border: rgba(255, 255, 255, 0.1);
             --text-main: #f8fafc;
             --text-dim: #94a3b8;
         }
 
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Outfit', sans-serif; }
-        body { background: var(--bg-deep); color: var(--text-main); min-height: 100vh; display: flex; justify-content: center; align-items: center; padding: 15px; position: relative; overflow-x: hidden; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Outfit', sans-serif;
+        }
 
-        .admin-split { width: 100%; max-width: 1050px; min-height: 650px; display: flex; background: rgba(15, 23, 42, 0.5); backdrop-filter: blur(40px); border-radius: 30px; border: 1px solid var(--glass-border); overflow: hidden; box-shadow: 0 40px 100px rgba(0,0,0,0.8); }
-        .admin-left { flex: 1.2; padding: 3.5rem; background: linear-gradient(135deg, rgba(99, 102, 241, 0.1), transparent); border-right: 1px solid var(--glass-border); display: flex; flex-direction: column; justify-content: center; }
-        .admin-right { flex: 1; padding: 4rem 3rem; display: flex; flex-direction: column; justify-content: center; background: rgba(0,0,0,0.2); position: relative; }
+        body {
+            background: var(--bg-deep);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 15px;
+            position: relative;
+            overflow-x: hidden;
+        }
 
-        .staff-split { width: 100%; max-width: 950px; min-height: 550px; display: flex; background: var(--glass); backdrop-filter: blur(25px); border-radius: 25px; border: 1px solid var(--glass-border); overflow: hidden; box-shadow: 0 50px 100px rgba(0,0,0,0.5); }
-        .staff-left { flex: 1; background: url('https://images.unsplash.com/photo-1492144534655-ae79c964c9d7?q=80&w=1000&auto=format&fit=crop') center center; background-size: cover; position: relative; padding: 2.5rem; display: flex; flex-direction: column; justify-content: flex-end; }
-        .staff-left::after { content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: linear-gradient(to top, var(--bg-deep) 0%, transparent 70%); opacity: 0.8; }
-        .staff-right { flex: 1; padding: 4rem 3rem; display: flex; flex-direction: column; justify-content: center; background: rgba(0,0,0,0.2); position: relative; }
+        .admin-split {
+            width: 100%;
+            max-width: 1050px;
+            min-height: 650px;
+            display: flex;
+            background: rgba(15, 23, 42, 0.5);
+            backdrop-filter: blur(40px);
+            border-radius: 30px;
+            border: 1px solid var(--glass-border);
+            overflow: hidden;
+            box-shadow: 0 40px 100px rgba(0, 0, 0, 0.8);
+        }
 
-        .shop-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 2rem; }
-        .shop-brand img { width: 34px; height: 34px; border-radius: 8px; object-fit: cover; }
-        .shop-brand .logo-alt { width: 34px; height: 34px; background: var(--accent); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 0.9rem; }
-        .shop-brand span { font-weight: 800; font-size: 1.1rem; }
+        .admin-left {
+            flex: 1.2;
+            padding: 3.5rem;
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.1), transparent);
+            border-right: 1px solid var(--glass-border);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
 
-        .input-wrapper { position: relative; display: flex; align-items: center; margin-bottom: 1.2rem; }
-        .input-wrapper i:not(.password-toggle) { position: absolute; left: 1.1rem; color: var(--text-dim); }
-        .input-wrapper input { width: 100%; background: rgba(0, 0, 0, 0.4); border: 1px solid var(--glass-border); color: white; padding: 1rem 3.5rem 1rem 3rem; border-radius: 12px; font-size: 0.95rem; outline: none; transition: 0.3s; }
-        .input-wrapper input:focus { border-color: var(--accent); background: rgba(0, 0, 0, 0.6); }
+        .admin-right {
+            flex: 1;
+            padding: 4rem 3rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.2);
+            position: relative;
+        }
 
-        .btn-main { width: 100%; background: var(--accent); color: white; border: none; padding: 1.1rem; border-radius: 12px; font-size: 1rem; font-weight: 800; cursor: pointer; transition: 0.4s; box-shadow: 0 10px 25px var(--accent-glow); margin-top: 0.5rem; }
-        .btn-main:hover { transform: translateY(-2px); box-shadow: 0 15px 35px var(--accent-glow); }
+        .staff-split {
+            width: 100%;
+            max-width: 950px;
+            min-height: 550px;
+            display: flex;
+            background: var(--glass);
+            backdrop-filter: blur(25px);
+            border-radius: 25px;
+            border: 1px solid var(--glass-border);
+            overflow: hidden;
+            box-shadow: 0 50px 100px rgba(0, 0, 0, 0.5);
+        }
 
-        .lang-switcher { position: absolute; top: 1.5rem; right: 2rem; display: flex; gap: 8px; background: rgba(255,255,255,0.05); padding: 4px 12px; border-radius: 100px; border: 1px solid var(--glass-border); }
-        .lang-btn { font-size: 0.7rem; font-weight: 800; color: var(--text-dim); cursor: pointer; transition: 0.3s; }
-        .lang-btn.active { color: var(--accent); }
-        .lang-btn:hover { color: white; }
+        .staff-left {
+            flex: 1;
+            background: url('https://images.unsplash.com/photo-1492144534655-ae79c964c9d7?q=80&w=1000&auto=format&fit=crop') center center;
+            background-size: cover;
+            position: relative;
+            padding: 2.5rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+        }
 
-        .btn-back-nav { position: absolute; top: 1.5rem; left: 2.5rem; color: var(--text-dim); text-decoration: none; font-weight: 700; font-size: 0.85rem; display: flex; align-items: center; gap: 6px; transition: 0.3s; }
-        .btn-back-nav:hover { color: white; transform: translateX(-5px); }
+        .staff-left::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(to top, var(--bg-deep) 0%, transparent 70%);
+            opacity: 0.8;
+        }
 
-        .password-toggle { position: absolute; right: 1.2rem; color: var(--text-dim); cursor: pointer; transition: 0.3s; z-index: 10; padding: 5px; }
-        .password-toggle:hover { color: white; }
+        .staff-right {
+            flex: 1;
+            padding: 4rem 3rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.2);
+            position: relative;
+        }
 
-        #toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #ef4444; color: white; padding: 0.8rem 2rem; border-radius: 12px; font-weight: 600; opacity: 0; transition: 0.4s; z-index: 1000; }
-        #toast.show { opacity: 1; transform: translateX(-50%) translateY(10px); }
+        .shop-brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 2rem;
+        }
 
-        @media (max-width: 850px) { .admin-left, .staff-left, .btn-back-nav { display: none; } }
+        .shop-brand img {
+            width: 34px;
+            height: 34px;
+            border-radius: 8px;
+            object-fit: cover;
+        }
+
+        .shop-brand .logo-alt {
+            width: 34px;
+            height: 34px;
+            background: var(--accent);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 0.9rem;
+        }
+
+        .shop-brand span {
+            font-weight: 800;
+            font-size: 1.1rem;
+        }
+
+        .input-wrapper {
+            position: relative;
+            display: flex;
+            align-items: center;
+            margin-bottom: 1.2rem;
+        }
+
+        .input-wrapper i:not(.password-toggle) {
+            position: absolute;
+            left: 1.1rem;
+            color: var(--text-dim);
+        }
+
+        .input-wrapper input {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid var(--glass-border);
+            color: white;
+            padding: 1rem 3.5rem 1rem 3rem;
+            border-radius: 12px;
+            font-size: 0.95rem;
+            outline: none;
+            transition: 0.3s;
+        }
+
+        .input-wrapper input:focus {
+            border-color: var(--accent);
+            background: rgba(0, 0, 0, 0.6);
+        }
+
+        .btn-main {
+            width: 100%;
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 1.1rem;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 800;
+            cursor: pointer;
+            transition: 0.4s;
+            box-shadow: 0 10px 25px var(--accent-glow);
+            margin-top: 0.5rem;
+        }
+
+        .btn-main:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 15px 35px var(--accent-glow);
+        }
+
+        .lang-switcher {
+            position: absolute;
+            top: 1.5rem;
+            right: 2rem;
+            display: flex;
+            gap: 8px;
+            background: rgba(255, 255, 255, 0.05);
+            padding: 4px 12px;
+            border-radius: 100px;
+            border: 1px solid var(--glass-border);
+        }
+
+        .lang-btn {
+            font-size: 0.7rem;
+            font-weight: 800;
+            color: var(--text-dim);
+            cursor: pointer;
+            transition: 0.3s;
+        }
+
+        .lang-btn.active {
+            color: var(--accent);
+        }
+
+        .lang-btn:hover {
+            color: white;
+        }
+
+        .btn-back-nav {
+            position: absolute;
+            top: 1.5rem;
+            left: 2.5rem;
+            color: var(--text-dim);
+            text-decoration: none;
+            font-weight: 700;
+            font-size: 0.85rem;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: 0.3s;
+        }
+
+        .btn-back-nav:hover {
+            color: white;
+            transform: translateX(-5px);
+        }
+
+        .password-toggle {
+            position: absolute;
+            right: 1.2rem;
+            color: var(--text-dim);
+            cursor: pointer;
+            transition: 0.3s;
+            z-index: 10;
+            padding: 5px;
+        }
+
+        .password-toggle:hover {
+            color: white;
+        }
+
+        #toast {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #ef4444;
+            color: white;
+            padding: 0.8rem 2rem;
+            border-radius: 12px;
+            font-weight: 600;
+            opacity: 0;
+            transition: 0.4s;
+            z-index: 1000;
+        }
+
+        #toast.show {
+            opacity: 1;
+            transform: translateX(-50%) translateY(10px);
+        }
+
+        @media (max-width: 850px) {
+
+            .admin-left,
+            .staff-left,
+            .btn-back-nav {
+                display: none;
+            }
+        }
     </style>
 </head>
+
 <body>
 
     <?php if ($from === 'superadmin'): ?>
         <div class="admin-split">
             <div class="admin-left">
-                <div style="font-size: 1.5rem; font-weight: 900; color: white;">AutoFix <span style="color:var(--accent);">Hub</span></div>
+                <div style="font-size: 1.5rem; font-weight: 900; color: white;">AutoFix <span
+                        style="color:var(--accent);">Hub</span></div>
                 <div>
-                    <h1 style="font-size: 3.2rem; font-weight: 950; line-height: 1; margin-bottom: 2rem; letter-spacing: -2px; color: white;">The Ultimate <br><span style="color:var(--accent);">Command Center</span>.</h1>
+                    <h1
+                        style="font-size: 3.2rem; font-weight: 950; line-height: 1; margin-bottom: 2rem; letter-spacing: -2px; color: white;">
+                        The Ultimate <br><span style="color:var(--accent);">Command Center</span>.</h1>
                     <ul style="list-style:none; color: var(--text-dim); font-size: 1rem;">
-                        <li style="margin-bottom:0.8rem;"><i class="fas fa-shield-alt" style="color:var(--accent); margin-right:10px;"></i> Multi-Tenant Isolation</li>
-                        <li style="margin-bottom:0.8rem;"><i class="fas fa-chart-line" style="color:var(--accent); margin-right:10px;"></i> Real-time Analytics</li>
+                        <li style="margin-bottom:0.8rem;"><i class="fas fa-shield-alt"
+                                style="color:var(--accent); margin-right:10px;"></i> Multi-Tenant Isolation</li>
+                        <li style="margin-bottom:0.8rem;"><i class="fas fa-chart-line"
+                                style="color:var(--accent); margin-right:10px;"></i> Real-time Analytics</li>
                     </ul>
                 </div>
                 <div style="color: var(--text-dim); font-size: 0.8rem;">&copy; <?php echo date('Y'); ?> AutoFix Hub</div>
@@ -233,16 +502,28 @@ $accentGlow = $rgb ? "rgba({$rgb[0]}, {$rgb[1]}, {$rgb[2]}, 0.4)" : "rgba(99, 10
                 </div>
                 <form id="loginForm">
                     <div style="margin-bottom: 1.2rem;">
-                        <label style="display:block; font-size:0.75rem; font-weight:800; color:var(--text-dim); margin-bottom:8px; text-transform:uppercase;">Username</label>
-                        <div class="input-wrapper"><i class="far fa-user"></i><input type="text" id="username" placeholder="e.g. superadmin" required></div>
+                        <label
+                            style="display:block; font-size:0.75rem; font-weight:800; color:var(--text-dim); margin-bottom:8px; text-transform:uppercase;">Email
+                            / Username</label>
+                        <div class="input-wrapper"><i class="far fa-user"></i><input type="text" id="username"
+                                placeholder="e.g. superadmin or email" required></div>
                     </div>
                     <div style="margin-bottom: 1.5rem;">
-                        <label style="display:block; font-size:0.75rem; font-weight:800; color:var(--text-dim); margin-bottom:8px; text-transform:uppercase;">Security Key</label>
-                        <div class="input-wrapper"><i class="fas fa-lock"></i><input type="password" id="password" placeholder="••••••••" required><i class="far fa-eye password-toggle"></i></div>
+                        <label
+                            style="display:block; font-size:0.75rem; font-weight:800; color:var(--text-dim); margin-bottom:8px; text-transform:uppercase;">Security
+                            Key</label>
+                        <div class="input-wrapper"><i class="fas fa-lock"></i><input type="password" id="password"
+                                placeholder="••••••••" required><i class="far fa-eye password-toggle"></i></div>
                     </div>
-                    <button type="submit" class="btn-main" id="loginBtn"><span>Login to Dashboard</span><div id="spinner" style="display:none; width:20px; height:20px; border:2px solid rgba(255,255,255,0.3); border-top:2px solid white; border-radius:50%; animation:spin 0.8s linear infinite; margin: 0 auto;"></div></button>
+                    <button type="submit" class="btn-main" id="loginBtn"><span>Login to Portal</span>
+                        <div id="spinner"
+                            style="display:none; width:20px; height:20px; border:2px solid rgba(255,255,255,0.3); border-top:2px solid white; border-radius:50%; animation:spin 0.8s linear infinite; margin: 0 auto;">
+                        </div>
+                    </button>
                 </form>
-                <div style="text-align:center; margin-top:2rem; font-size:0.85rem; color:var(--text-dim);">New partner? <a href="index.php#pricing" style="color:var(--accent); text-decoration:none; font-weight:700;">Register business</a></div>
+                <div style="text-align:center; margin-top:2rem; font-size:0.85rem; color:var(--text-dim);">New partner? <a
+                        href="index.php#pricing"
+                        style="color:var(--accent); text-decoration:none; font-weight:700;">Register business</a></div>
             </div>
         </div>
 
@@ -250,8 +531,11 @@ $accentGlow = $rgb ? "rgba({$rgb[0]}, {$rgb[1]}, {$rgb[2]}, 0.4)" : "rgba(99, 10
         <div class="staff-split">
             <div class="staff-left">
                 <div style="position:relative; z-index:2;">
-                    <p id="txt-adv-mgmt" style="color:var(--accent); font-weight:800; text-transform:uppercase; letter-spacing:2px; font-size:0.7rem; margin-bottom:8px;">Advanced Management</p>
-                    <h2 id="txt-staff-portal-title" style="font-size:2.8rem; font-weight:900; line-height:1; letter-spacing:-1px;">Staff Portal</h2>
+                    <p id="txt-adv-mgmt"
+                        style="color:var(--accent); font-weight:800; text-transform:uppercase; letter-spacing:2px; font-size:0.7rem; margin-bottom:8px;">
+                        Advanced Management</p>
+                    <h2 id="txt-staff-portal-title"
+                        style="font-size:2.8rem; font-weight:900; line-height:1; letter-spacing:-1px;">Staff Portal</h2>
                 </div>
             </div>
             <div class="staff-right">
@@ -267,26 +551,43 @@ $accentGlow = $rgb ? "rgba({$rgb[0]}, {$rgb[1]}, {$rgb[2]}, 0.4)" : "rgba(99, 10
                 </div>
 
                 <div class="shop-brand">
-                    <?php if ($shop_logo): ?><img src="<?php echo htmlspecialchars($shop_logo); ?>"><?php else: ?><div class="logo-alt"><?php echo $shop_name ? mb_substr($shop_name, 0, 1) : 'A'; ?></div><?php endif; ?>
+                    <?php if ($shop_logo): ?><img src="<?php echo htmlspecialchars($shop_logo); ?>"><?php else: ?>
+                        <div class="logo-alt"><?php echo $shop_name ? mb_substr($shop_name, 0, 1) : 'A'; ?></div><?php endif; ?>
                     <span><?php echo htmlspecialchars($shop_name ?: 'Workshop'); ?></span>
                 </div>
                 <div style="margin-bottom: 1.5rem;">
-                    <h1 id="txt-signin-title" style="font-size: 2rem; font-weight: 900; margin-bottom: 5px; letter-spacing:-1px;">Sign In to Portal</h1>
-                    <p id="txt-signin-sub" style="color: var(--text-dim); font-size:0.9rem;">Enter details to access workshop console.</p>
+                    <h1 id="txt-signin-title"
+                        style="font-size: 2rem; font-weight: 900; margin-bottom: 5px; letter-spacing:-1px;">Sign In to
+                        Portal</h1>
+                    <p id="txt-signin-sub" style="color: var(--text-dim); font-size:0.9rem;">Enter details to access
+                        workshop console.</p>
                 </div>
                 <form id="loginForm">
                     <div style="margin-bottom:1.2rem;">
-                        <label id="lbl-staff-email" style="display:block; font-size:0.75rem; font-weight:800; color:var(--text-dim); margin-bottom:8px; text-transform:uppercase;">Staff Email</label>
-                        <div class="input-wrapper"><i class="far fa-envelope"></i><input type="text" id="username" placeholder="name@workshop.com" required></div>
+                        <label id="lbl-staff-email"
+                            style="display:block; font-size:0.75rem; font-weight:800; color:var(--text-dim); margin-bottom:8px; text-transform:uppercase;">Staff
+                            Email</label>
+                        <div class="input-wrapper"><i class="far fa-envelope"></i><input type="text" id="username"
+                                placeholder="name@workshop.com" required></div>
                     </div>
                     <div style="margin-bottom:1.5rem;">
-                        <label id="lbl-security-key" style="display:block; font-size:0.75rem; font-weight:800; color:var(--text-dim); margin-bottom:8px; text-transform:uppercase;">Security Key</label>
-                        <div class="input-wrapper"><i class="fas fa-key"></i><input type="password" id="password" placeholder="••••••••" required><i class="far fa-eye password-toggle"></i></div>
+                        <label id="lbl-security-key"
+                            style="display:block; font-size:0.75rem; font-weight:800; color:var(--text-dim); margin-bottom:8px; text-transform:uppercase;">Security
+                            Key</label>
+                        <div class="input-wrapper"><i class="fas fa-key"></i><input type="password" id="password"
+                                placeholder="••••••••" required><i class="far fa-eye password-toggle"></i></div>
                     </div>
-                    <button type="submit" class="btn-main" id="loginBtn"><span id="btn-text-signin">Sign In</span><div id="spinner-staff" style="display:none; width:20px; height:20px; border:2px solid rgba(255,255,255,0.3); border-top:2px solid white; border-radius:50%; animation:spin 0.8s linear infinite; margin: 0 auto;"></div></button>
+                    <button type="submit" class="btn-main" id="loginBtn"><span id="btn-text-signin">Sign In</span>
+                        <div id="spinner-staff"
+                            style="display:none; width:20px; height:20px; border:2px solid rgba(255,255,255,0.3); border-top:2px solid white; border-radius:50%; animation:spin 0.8s linear infinite; margin: 0 auto;">
+                        </div>
+                    </button>
                 </form>
                 <div style="text-align:center; margin-top:2rem; font-size:0.9rem; color:var(--text-dim);">
-                    <span id="txt-forgot">Forgot credentials?</span> <a href="javascript:void(0)" onclick="showToast(currentLang === 'ph' ? 'Kontakin ang Manager' : 'Contact Manager')" style="color:var(--accent); text-decoration:none; font-weight:800;" id="lnk-recover">Recover Access</a>
+                    <span id="txt-forgot">Forgot credentials?</span> <a href="javascript:void(0)"
+                        onclick="showToast(currentLang === 'ph' ? 'Kontakin ang Manager' : 'Contact Manager')"
+                        style="color:var(--accent); text-decoration:none; font-weight:800;" id="lnk-recover">Recover
+                        Access</a>
                 </div>
             </div>
         </div>
@@ -304,7 +605,7 @@ $accentGlow = $rgb ? "rgba({$rgb[0]}, {$rgb[1]}, {$rgb[2]}, 0.4)" : "rgba(99, 10
         function setLanguage(lang) {
             currentLang = lang; const t = translations[lang];
             const el = document.getElementById('txt-adv-mgmt');
-            if(el) {
+            if (el) {
                 el.innerText = t.adv_mgmt; document.getElementById('txt-staff-portal-title').innerText = t.staff_portal;
                 document.getElementById('txt-signin-title').innerText = t.signin_title; document.getElementById('txt-signin-sub').innerText = t.signin_sub;
                 document.getElementById('lbl-staff-email').innerText = t.lbl_email; document.getElementById('lbl-security-key').innerText = t.lbl_key;
@@ -317,31 +618,31 @@ $accentGlow = $rgb ? "rgba({$rgb[0]}, {$rgb[1]}, {$rgb[2]}, 0.4)" : "rgba(99, 10
         if (localStorage.getItem('portal_lang')) setLanguage(localStorage.getItem('portal_lang'));
 
         document.querySelectorAll('.password-toggle').forEach(el => {
-            el.addEventListener('click', function() {
+            el.addEventListener('click', function () {
                 const input = this.previousElementSibling;
                 input.type = input.type === 'password' ? 'text' : 'password';
                 this.classList.toggle('fa-eye-slash');
             });
         });
 
-        document.getElementById('loginForm').addEventListener('submit', function(e) {
+        document.getElementById('loginForm').addEventListener('submit', function (e) {
             e.preventDefault();
             const btn = document.getElementById('loginBtn');
             const text = btn.querySelector('span');
             const spinner = btn.querySelector('.spinner') || btn.querySelector('div[id*="spinner"]');
-            if(text) text.style.display = 'none'; spinner.style.display = 'block'; btn.style.pointerEvents = 'none';
+            if (text) text.style.display = 'none'; spinner.style.display = 'block'; btn.style.pointerEvents = 'none';
 
             const formData = new FormData();
             formData.append('username', document.getElementById('username').value);
             formData.append('password', document.getElementById('password').value);
             const params = new URLSearchParams(window.location.search);
-            fetch(`login.php?action=login&from=${params.get('from')||''}&tid=${params.get('tid')||''}`, { method: 'POST', body: formData })
-            .then(r => r.json())
-            .then(data => {
-                if (data.status === 'success') { window.location.href = data.redirect; }
-                else { showToast(data.message); if(text) text.style.display = 'inline-block'; spinner.style.display = 'none'; btn.style.pointerEvents = 'all'; }
-            })
-            .catch(err => { showToast('Connection error.'); if(text) text.style.display = 'inline-block'; spinner.style.display = 'none'; btn.style.pointerEvents = 'all'; });
+            fetch(`login.php?action=login&from=${params.get('from') || ''}&tid=${params.get('tid') || ''}`, { method: 'POST', body: formData })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status === 'success') { window.location.href = data.redirect; }
+                    else { showToast(data.message); if (text) text.style.display = 'inline-block'; spinner.style.display = 'none'; btn.style.pointerEvents = 'all'; }
+                })
+                .catch(err => { showToast('Connection error.'); if (text) text.style.display = 'inline-block'; spinner.style.display = 'none'; btn.style.pointerEvents = 'all'; });
         });
 
         // Handle URL errors
@@ -361,6 +662,13 @@ $accentGlow = $rgb ? "rgba({$rgb[0]}, {$rgb[1]}, {$rgb[2]}, 0.4)" : "rgba(99, 10
             setTimeout(() => { t.style.opacity = '0'; t.style.transform = 'translateX(-50%) translateY(0)'; }, 3000);
         }
     </script>
-    <style> @keyframes spin { to { transform: rotate(360deg); } } </style>
+    <style>
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
 </body>
+
 </html>

@@ -1,4 +1,7 @@
 <?php
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+session_start();
 $shop_name = $_POST['shop_name'] ?? 'Your Shop';
 $owner_name = $_POST['owner_name'] ?? 'Owner';
 $email = $_POST['email'] ?? 'owner@email.com';
@@ -16,10 +19,23 @@ $error = '';
 try {
     $db = getDB();
     
-    // Auto-migrate column (do this before transaction as DDL causes implicit commit)
-    try {
-        $db->exec("ALTER TABLE tenants ADD COLUMN slug VARCHAR(100) DEFAULT NULL AFTER status");
-    } catch (PDOException $e) {}
+    // Auto-migrate columns (do this before transaction as DDL causes implicit commit)
+    $migrations = [
+        "ALTER TABLE tenants ADD COLUMN slug VARCHAR(100) DEFAULT NULL AFTER status",
+        "ALTER TABLE tenants ADD COLUMN id_type VARCHAR(50) DEFAULT NULL AFTER slug",
+        "ALTER TABLE tenants ADD COLUMN business_proof_url VARCHAR(255) DEFAULT NULL AFTER id_type",
+        "ALTER TABLE tenants ADD COLUMN id_photo_url VARCHAR(255) DEFAULT NULL AFTER business_proof_url"
+    ];
+    foreach ($migrations as $sql) {
+        try { $db->exec($sql); } catch (PDOException $e) {}
+    }
+
+    // 0. Check if email already exists to avoid duplicate entry error
+    $checkStmt = $db->prepare("SELECT tenant_id FROM tenants WHERE email = ? LIMIT 1");
+    $checkStmt->execute([$email]);
+    if ($checkStmt->fetch()) {
+        throw new Exception("This email is already registered as a shop owner. Please use a different email or log in.");
+    }
 
     $db->beginTransaction();
     

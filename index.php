@@ -1208,7 +1208,7 @@ try {
         .form-group select {
             width: 100%;
             padding: 1.1rem;
-            background: rgba(0, 0, 0, 0.05);
+            background-color: rgba(0, 0, 0, 0.05);
             border: 1px solid var(--glass-border);
             border-radius: 16px;
             color: var(--text-main);
@@ -1220,7 +1220,7 @@ try {
 
         [data-theme="dark"] .form-group input,
         [data-theme="dark"] .form-group select {
-            background: rgba(255, 255, 255, 0.03);
+            background-color: rgba(255, 255, 255, 0.03);
         }
 
         .form-group select {
@@ -1252,13 +1252,34 @@ try {
         .form-group input:focus,
         .form-group select:focus {
             border-color: var(--accent);
-            background: white;
+            background-color: white;
             box-shadow: 0 0 0 4px var(--accent-glow);
         }
 
         [data-theme="dark"] .form-group input:focus,
         [data-theme="dark"] .form-group select:focus {
-            background: rgba(255, 255, 255, 0.08);
+            background-color: rgba(255, 255, 255, 0.08);
+        }
+
+        /* Password Wrapper for Toggle */
+        .password-wrapper {
+            position: relative;
+            display: flex;
+            align-items: center;
+            width: 100%;
+        }
+
+        .toggle-password {
+            position: absolute;
+            right: 1.2rem;
+            color: var(--text-dim);
+            cursor: pointer;
+            z-index: 5;
+            transition: 0.3s;
+        }
+
+        .toggle-password:hover {
+            color: var(--accent);
         }
 
         .btn-close-modal {
@@ -1789,11 +1810,17 @@ try {
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
                     <div class="form-group">
                         <label>Create Password</label>
-                        <input type="password" name="password" placeholder="Min. 8 characters" required>
+                        <div class="password-wrapper">
+                            <input type="password" name="password" id="regPassword" placeholder="Min. 8 characters" required>
+                            <i class="fas fa-eye toggle-password" onclick="togglePasswordVisibility('regPassword', this)"></i>
+                        </div>
                     </div>
                     <div class="form-group">
                         <label>Confirm Password</label>
-                        <input type="password" name="confirm_password" placeholder="Re-type password" required>
+                        <div class="password-wrapper">
+                            <input type="password" name="confirm_password" id="regConfirmPassword" placeholder="Re-type password" required>
+                            <i class="fas fa-eye toggle-password" onclick="togglePasswordVisibility('regConfirmPassword', this)"></i>
+                        </div>
                     </div>
                 </div>
 
@@ -1870,6 +1897,18 @@ try {
     </div>
 
     <script>
+        // Password Toggle Function
+        function togglePasswordVisibility(inputId, icon) {
+            const input = document.getElementById(inputId);
+            if (input.type === 'password') {
+                input.type = 'text';
+                icon.classList.replace('fa-eye', 'fa-eye-slash');
+            } else {
+                input.type = 'password';
+                icon.classList.replace('fa-eye-slash', 'fa-eye');
+            }
+        }
+
         const basePlans = <?php echo json_encode($plans); ?>;
         window.currentBilling = 'monthly'; // Track active cycle globally
 

@@ -139,7 +139,18 @@ try {
         }
     }
 
-    echo "<h3>2. Establishing Foreign Key Relationships...</h3>";
+    // 2. Establishing Foreign Key Relationships...
+    
+    // SPECIFIC FIX: Ensure users.tenant_id is NULLABLE (for Super Admins)
+    if (columnExists($db, 'users', 'tenant_id')) {
+        try {
+            $db->exec("ALTER TABLE users MODIFY tenant_id INT NULL");
+            $db->exec("UPDATE users SET tenant_id = NULL WHERE tenant_id = 0");
+            echo "<li>[OK] Normalized <b>users.tenant_id</b> (Nullable + fixed zeros).</li>";
+        } catch (Exception $e) {
+            echo "<li>[ERROR] Could not normalize users.tenant_id: " . $e->getMessage() . "</li>";
+        }
+    }
 
     // 2.1 TENANT PAYMENTS & SUBSCRIPTIONS
     addSafeForeignKey($db, 'tenant_payments', 'tenant_id', 'tenants', 'tenant_id', 'CASCADE');

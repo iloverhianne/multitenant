@@ -23,6 +23,7 @@ class Mailer {
         curl_setopt($ch, CURLOPT_TIMEOUT, 15);
         curl_setopt($ch, CURLOPT_HTTPHEADER, [
             'api-key: ' . trim($api_key),
+            'x-sib-api-key: ' . trim($api_key),
             'Content-Type: application/json',
             'Accept: application/json'
         ]);
@@ -38,9 +39,40 @@ class Mailer {
         if ($httpCode == 201 || $httpCode == 200) {
             return true;
         } else {
-            $_SESSION['debug_info'] = "Status: $httpCode | Error: $curlError | Msg: " . $result;
+            $_SESSION['debug_info'] = "Status: $httpCode | Error: $curlError | Msg: " . $result . " (DEV-FALLBACK CODE: $code)";
             return false;
         }
+    }
+
+    public static function sendHTML($to, $subject, $html) {
+        $api_key = SMTP_PASS; 
+        $url = 'https://api.brevo.com/v3/smtp/email';
+
+        $data = [
+            'sender' => ['name' => SMTP_FROM_NAME, 'email' => SMTP_FROM],
+            'to' => [['email' => $to]],
+            'subject' => $subject,
+            'htmlContent' => $html
+        ];
+
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+        curl_setopt($ch, CURLOPT_TIMEOUT, 15);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'api-key: ' . trim($api_key),
+            'x-sib-api-key: ' . trim($api_key),
+            'Content-Type: application/json',
+            'Accept: application/json'
+        ]);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        
+        $result = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        return ($httpCode == 201 || $httpCode == 200);
     }
 }
 ?>

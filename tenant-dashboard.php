@@ -247,7 +247,7 @@ try {
   // Calculate Low Stock Count for Sidebar Badge
   $low_stock_count = 0;
   try {
-    $stmt = $db->prepare("SELECT COUNT(*) FROM inventory WHERE tenant_id = ? AND quantity <= stock_threshold");
+    $stmt = $db->prepare("SELECT COUNT(*) FROM inventory WHERE tenant_id = ? AND quantity < 5");
     $stmt->execute([$tenant_id]);
     $low_stock_count = intval($stmt->fetchColumn());
   } catch (Exception $e) {
@@ -458,9 +458,71 @@ try {
       $msg = trim($_POST['message'] ?? '');
       if (empty($msg))
         throw new Exception("Message cannot be empty.");
-      $db->prepare("INSERT INTO support_messages (tenant_id, sender_role, sender_id, message) VALUES (?, 'TENANT', ?, ?)")
-        ->execute([$tenant_id, $_SESSION['user_id'], $msg]);
-      echo json_encode(['status' => 'success']);
+      
+      $now = date('Y-m-d H:i:s');
+      $db->prepare("INSERT INTO support_messages (tenant_id, sender_role, sender_id, message, created_at) VALUES (?, 'TENANT', ?, ?, ?)")
+        ->execute([$tenant_id, $_SESSION['user_id'], $msg, $now]);
+
+      // --- AUTO-REPLY LOGIC ---
+      $sentAuto = false;
+      try {
+        $sendAutoReply = false;
+        
+        // Fetch last two messages in the chat.
+        // The first one [0] is the message we just inserted.
+        // The second one [1] is the previous message in the chat history.
+        $stmtLastTwo = $db->prepare("SELECT sender_role, message, created_at FROM support_messages WHERE tenant_id = ? ORDER BY message_id DESC LIMIT 2");
+        $stmtLastTwo->execute([$tenant_id]);
+        $lastTwo = $stmtLastTwo->fetchAll(PDO::FETCH_ASSOC);
+        
+        if (count($lastTwo) < 2) {
+          // No previous messages at all
+          $sendAutoReply = true;
+        } else {
+          $prevMsg = $lastTwo[1];
+          // If the last message prior to this was already from ADMIN (like another auto-reply), do not trigger another one
+          if ($prevMsg['sender_role'] !== 'ADMIN') {
+            // Find the most recent admin message anywhere in the chat
+            $stmtLastAdmin = $db->prepare("SELECT created_at, message FROM support_messages WHERE tenant_id = ? AND sender_role = 'ADMIN' ORDER BY message_id DESC LIMIT 1");
+            $stmtLastAdmin->execute([$tenant_id]);
+            $lastAdmin = $stmtLastAdmin->fetch(PDO::FETCH_ASSOC);
+            
+            if (!$lastAdmin) {
+              $sendAutoReply = true;
+            } else {
+              // Send auto-reply only if the last admin message was more than 30 minutes ago
+              $timeDiff = time() - strtotime($lastAdmin['created_at']);
+              if ($timeDiff > 1800) {
+                $sendAutoReply = true;
+              }
+            }
+          }
+        }
+        
+        // Rate-limit auto-replies to once every 5 minutes to prevent spam
+        if ($sendAutoReply) {
+          $stmtRecentAuto = $db->prepare("SELECT created_at FROM support_messages WHERE tenant_id = ? AND sender_role = 'ADMIN' AND message LIKE '%[Auto-Reply]%' ORDER BY message_id DESC LIMIT 1");
+          $stmtRecentAuto->execute([$tenant_id]);
+          $lastAutoTime = $stmtRecentAuto->fetchColumn();
+          if ($lastAutoTime) {
+            $autoTimeDiff = time() - strtotime($lastAutoTime);
+            if ($autoTimeDiff < 300) {
+              $sendAutoReply = false;
+            }
+          }
+        }
+        
+        if ($sendAutoReply) {
+          $autoMsg = "🤖 [Auto-Reply] Hello! Thank you for reaching out to AutoFix Hub Support. Our administrators are currently offline or attending to other requests. We have received your message and will get back to you as soon as possible. Thank you for your patience!";
+          $db->prepare("INSERT INTO support_messages (tenant_id, sender_role, sender_id, message, is_read, created_at) VALUES (?, 'ADMIN', 0, ?, 0, ?)")
+            ->execute([$tenant_id, $autoMsg, $now]);
+          $sentAuto = true;
+        }
+      } catch (Exception $autoErr) {
+        // Silently fail if auto-reply fails so it doesn't block the user's message
+      }
+
+      echo json_encode(['status' => 'success', 'auto_reply' => $sentAuto]);
     } catch (Exception $e) {
       echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
     }
@@ -470,7 +532,16 @@ try {
   if (isset($_GET['action']) && $_GET['action'] === 'fetch_support_messages') {
     header('Content-Type: application/json');
     try {
-      $msgs = $db->prepare("SELECT * FROM support_messages WHERE tenant_id = ? ORDER BY created_at ASC");
+      $msgs = $db->prepare("SELECT sm.*, t.logo_url, 
+                            CASE 
+                                WHEN sm.sender_role = 'ADMIN' THEN COALESCE(u.avatar_url, u.profile_pic, (SELECT avatar_url FROM users WHERE role_id = 1 AND avatar_url IS NOT NULL LIMIT 1))
+                                ELSE COALESCE(u.avatar_url, u.profile_pic)
+                            END AS sender_avatar 
+                            FROM support_messages sm 
+                            LEFT JOIN tenants t ON sm.tenant_id = t.tenant_id 
+                            LEFT JOIN users u ON sm.sender_id = u.user_id 
+                            WHERE sm.tenant_id = ? 
+                            ORDER BY sm.created_at ASC");
       $msgs->execute([$tenant_id]);
       echo json_encode(['status' => 'success', 'messages' => $msgs->fetchAll()]);
     } catch (Exception $e) {
@@ -1148,6 +1219,42 @@ try {
         } catch (Exception $e) {
         }
 
+        // Inventory History/Logs Table Auto-Heal
+        $db->exec("CREATE TABLE IF NOT EXISTS inventory_history (
+          history_id INT AUTO_INCREMENT PRIMARY KEY,
+          tenant_id INT NOT NULL,
+          item_id INT NOT NULL,
+          item_name VARCHAR(100) NOT NULL,
+          transaction_type VARCHAR(20) NOT NULL,
+          quantity_changed INT NOT NULL,
+          new_quantity INT NOT NULL,
+          notes VARCHAR(255),
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )");
+
+        // Triggers for automatic logging
+        try {
+          $db->exec("DROP TRIGGER IF EXISTS after_inventory_update");
+          $db->exec("CREATE TRIGGER after_inventory_update AFTER UPDATE ON inventory FOR EACH ROW
+            BEGIN
+              IF OLD.quantity <> NEW.quantity THEN
+                INSERT INTO inventory_history (tenant_id, item_id, item_name, transaction_type, quantity_changed, new_quantity, notes)
+                VALUES (NEW.tenant_id, NEW.item_id, NEW.item_name, IF(NEW.quantity > OLD.quantity, 'ADD', 'SUBTRACT'), ABS(NEW.quantity - OLD.quantity), NEW.quantity, 'Stock level modified');
+              END IF;
+            END");
+        } catch (Exception $e) {}
+
+        try {
+          $db->exec("DROP TRIGGER IF EXISTS after_inventory_insert");
+          $db->exec("CREATE TRIGGER after_inventory_insert AFTER INSERT ON inventory FOR EACH ROW
+            BEGIN
+              IF NEW.quantity > 0 THEN
+                INSERT INTO inventory_history (tenant_id, item_id, item_name, transaction_type, quantity_changed, new_quantity, notes)
+                VALUES (NEW.tenant_id, NEW.item_id, NEW.item_name, 'ADD', NEW.quantity, NEW.quantity, 'Initial stock');
+              END IF;
+            END");
+        } catch (Exception $e) {}
+
         // Repair Parts Link (Inventory -> Job Order)
         $db->exec("CREATE TABLE IF NOT EXISTS repair_parts (
           rp_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -1329,8 +1436,8 @@ try {
                         LIMIT 1
                     ) AND v.plate_no IS NULL
                     LEFT JOIN services s ON j.service_id = s.service_id
-                    LEFT JOIN mechanics m ON j.mechanic_id = m.mechanic_id
-                    LEFT JOIN users u ON m.user_id = u.user_id
+                    LEFT JOIN mechanics m ON j.mechanic_id = m.mechanic_id AND m.tenant_id = j.tenant_id
+                    LEFT JOIN users u ON m.user_id = u.user_id AND u.tenant_id = j.tenant_id
                     LEFT JOIN customers c ON j.customer_id = c.customer_id";
 
           $currentRole = strtoupper($_SESSION['role'] ?? '');
@@ -1999,6 +2106,44 @@ try {
         exit;
       }
 
+      if ($_GET['action'] === 'update_mechanic_status' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        try {
+          $auth_role = strtoupper($_SESSION['role'] ?? '');
+          if ($auth_role !== 'OWNER' && $auth_role !== 'MANAGER') {
+            throw new Exception("Unauthorized: Only owners and managers can update mechanic availability.");
+          }
+
+          $id = intval($_POST['mechanic_id'] ?? 0);
+          $new_status = $_POST['status'] ?? 'AVAILABLE';
+          
+          if (!$id) {
+            throw new Exception("Mechanic ID is required.");
+          }
+          
+          if (!in_array($new_status, ['AVAILABLE', 'UNAVAILABLE'])) {
+            throw new Exception("Invalid status specified.");
+          }
+
+          $stmt = $db->prepare("UPDATE mechanics SET status = ? WHERE mechanic_id = ? AND tenant_id = ?");
+          $stmt->execute([$new_status, $id, $tenant_id]);
+
+          // Write activity log
+          try {
+            $stmtName = $db->prepare("SELECT CASE WHEN full_name IS NOT NULL AND full_name != '' THEN full_name ELSE 'Expert Mechanic' END FROM mechanics WHERE mechanic_id = ?");
+            $stmtName->execute([$id]);
+            $mech_name = $stmtName->fetchColumn() ?: "Mechanic #$id";
+            $log = $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'CRUD', ?)");
+            $log->execute([$tenant_id, $_SESSION['user_id'] ?? 0, "Updated mechanic ($mech_name) status to: $new_status"]);
+          } catch (Exception $logErr) {
+          }
+
+          echo json_encode(['status' => 'success', 'message' => 'Mechanic status updated successfully.']);
+        } catch (Exception $e) {
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
       if ($_GET['action'] === 'request_shift_change' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         try {
           $mechanic_user_id = $_SESSION['user_id'];
@@ -2074,13 +2219,12 @@ try {
           $brand = trim($_POST['brand'] ?? '');
           $qty = intval($_POST['quantity'] ?? 0);
           $price = floatval($_POST['price'] ?? 0);
-          $threshold = intval($_POST['stock_threshold'] ?? 5);
 
           if (empty($item_name))
             throw new Exception("Item name is required.");
 
-          $stmt = $db->prepare("INSERT INTO inventory (tenant_id, item_code, item_name, brand, quantity, price, stock_threshold, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'IN_STOCK')");
-          $stmt->execute([$tenant_id, $item_code, $item_name, $brand, $qty, $price, $threshold]);
+          $stmt = $db->prepare("INSERT INTO inventory (tenant_id, item_code, item_name, brand, quantity, price, stock_threshold, status) VALUES (?, ?, ?, ?, ?, ?, 5, 'IN_STOCK')");
+          $stmt->execute([$tenant_id, $item_code, $item_name, $brand, $qty, $price]);
 
           echo json_encode(['status' => 'success', 'message' => 'Item added to inventory.']);
         } catch (Exception $e) {
@@ -2315,10 +2459,9 @@ try {
           $itemId = intval($_POST['item_id'] ?? 0);
           $newQty = intval($_POST['quantity'] ?? 0);
           $newPrice = floatval($_POST['price'] ?? 0);
-          $newThreshold = intval($_POST['stock_threshold'] ?? 5);
 
-          $stmt = $db->prepare("UPDATE inventory SET quantity = ?, price = ?, stock_threshold = ? WHERE item_id = ? AND tenant_id = ?");
-          $stmt->execute([$newQty, $newPrice, $newThreshold, $itemId, $tenant_id]);
+          $stmt = $db->prepare("UPDATE inventory SET quantity = ?, price = ?, stock_threshold = 5 WHERE item_id = ? AND tenant_id = ?");
+          $stmt->execute([$newQty, $newPrice, $itemId, $tenant_id]);
 
           echo json_encode(['status' => 'success', 'message' => 'Stock adjusted successfully.']);
         } catch (Exception $e) {
@@ -2362,10 +2505,44 @@ try {
         exit;
       }
       if ($_GET['action'] === 'get_inventory_report') {
-        $stmt = $db->prepare("SELECT item_name, quantity FROM inventory WHERE tenant_id = ? AND quantity < 10 ORDER BY quantity ASC");
-        $stmt->execute([$tenant_id]);
-        $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        echo json_encode($results ?: []);
+        // 1. Low stock alerts
+        $stmt1 = $db->prepare("SELECT item_name, quantity FROM inventory WHERE tenant_id = ? AND quantity < 5 ORDER BY quantity ASC");
+        $stmt1->execute([$tenant_id]);
+        $low_stock = $stmt1->fetchAll(PDO::FETCH_ASSOC);
+
+        // 2. Stock movement history/log
+        $stmt2 = $db->prepare("SELECT item_name, transaction_type, quantity_changed, new_quantity, notes, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as date FROM inventory_history WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 50");
+        $stmt2->execute([$tenant_id]);
+        $movement_history = $stmt2->fetchAll(PDO::FETCH_ASSOC);
+
+        echo json_encode([
+          'low_stock' => $low_stock ?: [],
+          'history' => $movement_history ?: []
+        ]);
+        exit;
+      }
+      if ($_GET['action'] === 'get_mechanic_performance') {
+        try {
+          $stmt = $db->prepare("
+            SELECT 
+              m.full_name, 
+              COALESCE(m.specialization, 'General') as specialization, 
+              COUNT(j.job_id) as count, 
+              COALESCE(SUM(j.total_amount), 0) as total_revenue,
+              COALESCE(AVG(j.total_amount), 0) as avg_job_cost
+            FROM mechanics m
+            LEFT JOIN repair_jobs j ON j.mechanic_id = m.mechanic_id AND j.status IN ('COMPLETED', 'SETTLED') 
+            WHERE m.tenant_id = ?
+            GROUP BY m.mechanic_id, m.full_name, m.specialization 
+            ORDER BY count DESC, total_revenue DESC 
+            LIMIT 10
+          ");
+          $stmt->execute([$tenant_id]);
+          $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+          echo json_encode($results ?: []);
+        } catch (Exception $e) {
+          echo json_encode([]);
+        }
         exit;
       }
       if ($_GET['action'] === 'save_setting_item' && $_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -2443,12 +2620,22 @@ try {
             }
           }
 
-          // Audit Log
-          $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'INFO', 'Updated shop setting: $field')")
-            ->execute([$tenant_id, $_SESSION['user_id']]);
+          @ob_clean();
+          echo json_encode([
+            'status' => 'success',
+            'message' => 'Setting updated successfully!',
+            'field' => $field,
+            'value' => $value
+          ]);
 
-          echo json_encode(['status' => 'success', 'message' => 'Setting updated successfully!']);
+          // Audit log
+          try {
+            $db->prepare("INSERT INTO audit_logs (tenant_id, activity_type, description) VALUES (?, 'SETTINGS', ?)")
+              ->execute([$tenant_id, "Updated $field to $value"]);
+          } catch (Exception $le) {
+          }
         } catch (Exception $e) {
+          @ob_clean();
           echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
         }
         exit;
@@ -2722,11 +2909,13 @@ try {
             $params = array_merge($params, [$searchTerm, $searchTerm, $searchTerm, $searchTerm]);
           }
 
-          $stmt = $db->prepare("SELECT a.*, c.full_name as customer_name, 
+          $stmt = $db->prepare("SELECT GROUP_CONCAT(a.appointment_id) as appointment_id, 
+                      a.appointment_date, a.appointment_time, a.status, a.created_at,
+                      c.full_name as customer_name, 
                       COALESCE(v.plate_no, v2.plate_no) as plate_no,
                       COALESCE(v.make, v2.make) as make,
                       COALESCE(v.model, v2.model) as model,
-                      s.service_name, s.price as service_price,
+                      GROUP_CONCAT(s.service_name SEPARATOR ', ') as service_name,
                       m_assigned.full_name as assigned_mechanic_name,
                       m_requested.full_name as requested_mechanic_name
                       FROM appointments a 
@@ -2734,9 +2923,10 @@ try {
                       LEFT JOIN vehicles v ON a.vehicle_id = v.vehicle_id 
                       LEFT JOIN vehicles v2 ON a.customer_id = v2.customer_id AND v.vehicle_id IS NULL
                       LEFT JOIN services s ON a.service_id = s.service_id 
-                      LEFT JOIN mechanics m_assigned ON a.mechanic_id = m_assigned.mechanic_id
-                      LEFT JOIN mechanics m_requested ON a.requested_mechanic_id = m_requested.mechanic_id
+                      LEFT JOIN mechanics m_assigned ON a.mechanic_id = m_assigned.mechanic_id AND m_assigned.tenant_id = a.tenant_id
+                      LEFT JOIN mechanics m_requested ON a.requested_mechanic_id = m_requested.mechanic_id AND m_requested.tenant_id = a.tenant_id
                       WHERE a.tenant_id = ? AND a.status != 'COMPLETED' AND a.status != 'CANCELLED' $searchQuery
+                      GROUP BY a.customer_id, a.vehicle_id, a.appointment_date, a.appointment_time, a.status
                       ORDER BY $orderBy LIMIT 100");
           $stmt->execute($params);
           $data = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -2749,13 +2939,15 @@ try {
 
       if ($_GET['action'] === 'update_appointment_status' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         try {
-          $id = intval($_POST['appointment_id'] ?? 0);
+          $ids_raw = $_POST['appointment_id'] ?? '0';
+          $ids = array_map('intval', explode(',', $ids_raw));
+          $first_id = $ids[0];
           $status = $_POST['status'] ?? '';
           $mechanic_id = !empty($_POST['mechanic_id']) ? intval($_POST['mechanic_id']) : null;
           $bay_id = !empty($_POST['bay_id']) ? intval($_POST['bay_id']) : null;
 
-          if (!$id || !in_array($status, ['CONFIRMED', 'CANCELLED', 'COMPLETED', 'PENDING'])) {
-            throw new Exception("Parameters missing: ID=$id Status=$status");
+          if (!$first_id || !in_array($status, ['CONFIRMED', 'CANCELLED', 'COMPLETED', 'PENDING'])) {
+            throw new Exception("Parameters missing: ID=$ids_raw Status=$status");
           }
 
           // Validation: If assigning resources, check availability
@@ -2775,7 +2967,7 @@ try {
             if ($mInfo) {
               // Get appointment info
               $appInfo = $db->prepare("SELECT appointment_date, appointment_time FROM appointments WHERE appointment_id = ?");
-              $appInfo->execute([$id]);
+              $appInfo->execute([$first_id]);
               $a = $appInfo->fetch();
 
               if ($a) {
@@ -2787,8 +2979,8 @@ try {
                 }
 
                 // 2. Check Overlap (Existing Confirmed Appointments at same date/time)
-                $overlapCheck = $db->prepare("SELECT COUNT(*) FROM appointments WHERE mechanic_id = ? AND appointment_date = ? AND appointment_time = ? AND status = 'CONFIRMED' AND appointment_id != ?");
-                $overlapCheck->execute([$mechanic_id, $a['appointment_date'], $aTime, $id]);
+                $overlapCheck = $db->prepare("SELECT COUNT(*) FROM appointments WHERE mechanic_id = ? AND appointment_date = ? AND appointment_time = ? AND status = 'CONFIRMED' AND appointment_id NOT IN ($ids_raw)");
+                $overlapCheck->execute([$mechanic_id, $a['appointment_date'], $aTime]);
                 if ($overlapCheck->fetchColumn() > 0) {
                   throw new Exception("Collision Error: Mechanic {$mInfo['full_name']} already has a confirmed appointment at this time.");
                 }
@@ -2797,8 +2989,8 @@ try {
           }
 
           // 1. Basic Status Update
-          $stmt = $db->prepare("UPDATE appointments SET status = ?, mechanic_id = ?, bay_id = ? WHERE appointment_id = ? AND tenant_id = ?");
-          $stmt->execute([$status, $mechanic_id, $bay_id, $id, $tenant_id]);
+          $stmt = $db->prepare("UPDATE appointments SET status = ?, mechanic_id = ?, bay_id = ? WHERE appointment_id IN ($ids_raw) AND tenant_id = ?");
+          $stmt->execute([$status, $mechanic_id, $bay_id, $tenant_id]);
 
           // 2. Confirmation logic: Decoupled from Job Creation
           if ($status === 'CONFIRMED') {
@@ -2821,15 +3013,17 @@ try {
 
       if ($_GET['action'] === 'start_repair' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         try {
-          $id = intval($_POST['appointment_id'] ?? 0);
-          if (!$id)
+          $ids_raw = $_POST['appointment_id'] ?? '0';
+          $ids = array_map('intval', explode(',', $ids_raw));
+          $first_id = $ids[0];
+          if (!$first_id)
             throw new Exception("Invalid Appointment ID");
 
           $db->beginTransaction();
 
-          // 1. Fetch appointment details
+          // 1. Fetch first appointment details for base Job Order
           $apptQ = $db->prepare("SELECT * FROM appointments WHERE appointment_id = ? AND tenant_id = ?");
-          $apptQ->execute([$id, $tenant_id]);
+          $apptQ->execute([$first_id, $tenant_id]);
           $appt = $apptQ->fetch(PDO::FETCH_ASSOC);
 
           if (!$appt)
@@ -2837,7 +3031,7 @@ try {
           if ($appt['status'] === 'COMPLETED')
             throw new Exception("Already started or completed.");
 
-          // 2. Create Job Order
+          // 2. Create Job Order (Pick first service as main)
           $price = $appt['total_estimate'] ?? 0;
           $jobStmt = $db->prepare("INSERT INTO repair_jobs (tenant_id, customer_id, vehicle_id, service_id, appointment_id, mechanic_id, bay_id, status, total_amount) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)");
           $jobStmt->execute([
@@ -2845,15 +3039,15 @@ try {
             $appt['customer_id'],
             $appt['vehicle_id'],
             $appt['service_id'],
-            $id,
+            $first_id,
             $appt['mechanic_id'],
             $appt['bay_id'],
             $price
           ]);
           $newJobId = $db->lastInsertId();
 
-          // 3. Mark Appointment as COMPLETED (or STARTED/ARCHIVED) so it disappears from active list or stays as history
-          $db->prepare("UPDATE appointments SET status = 'COMPLETED' WHERE appointment_id = ?")->execute([$id]);
+          // 3. Mark ALL grouped appointments as COMPLETED
+          $db->prepare("UPDATE appointments SET status = 'COMPLETED' WHERE appointment_id IN ($ids_raw)")->execute();
 
           // 4. Initial Timeline
           $db->prepare("INSERT INTO repair_timeline (job_id, status_update, remarks, tenant_id, user_id) VALUES (?, 'PENDING', 'Repairs initialized from manual check-in.', ?, ?)")
@@ -2874,18 +3068,19 @@ try {
           $prefMechId = intval($_GET['current_mechanic_id'] ?? 0);
           $prefBayId = intval($_GET['preferred_id'] ?? 0);
 
-          // Consolidated resource fetching: Show only mechanics with 0 IN_PROGRESS jobs (plus the current one)
+          // Consolidated resource fetching: Show only mechanics with 0 IN_PROGRESS jobs (plus the current one) and who are NOT UNAVAILABLE (unless currently assigned)
           $mechanicQuery = "SELECT m.mechanic_id, COALESCE(m.full_name, u.name, 'Expert Mechanic') as full_name, m.shift_start, m.shift_end, m.shift_days
                             FROM mechanics m 
                             LEFT JOIN users u ON m.user_id = u.user_id
                             WHERE m.tenant_id = ? 
+                            AND (m.status != 'UNAVAILABLE' OR m.mechanic_id = ?)
                             AND (
                                 (SELECT COUNT(*) FROM repair_jobs WHERE mechanic_id = m.mechanic_id AND status = 'IN_PROGRESS' AND tenant_id = m.tenant_id) = 0
                                 OR m.mechanic_id = ?
                             )
                             ORDER BY m.full_name ASC";
           $mStmt = $db->prepare($mechanicQuery);
-          $mStmt->execute([$tenant_id, $prefMechId]);
+          $mStmt->execute([$tenant_id, $prefMechId, $prefMechId]);
 
           // Filter out OCCUPIED bays, but keep the current/preferred one selectable
           $bayQuery = "SELECT bay_id, bay_name, status FROM service_bays WHERE tenant_id = ? AND (status = 'AVAILABLE' OR bay_id = ?) ORDER BY bay_id ASC";
@@ -3828,6 +4023,10 @@ try {
 
     window.navToView = function (viewId) {
       console.log("[NAV] Switching to view:", viewId);
+
+      // Auto-close any open modals when switching tabs
+      if (typeof window.closeAllModals === 'function') window.closeAllModals();
+
       const sections = document.querySelectorAll('.view-section');
       sections.forEach(s => { s.classList.remove('active'); s.style.display = 'none'; });
       const target = document.getElementById(viewId);
@@ -3924,17 +4123,17 @@ try {
                 </div>
                 <div>
                     <h4 style="margin:0 0 10px; color:var(--accent); font-size:0.8rem; text-transform:uppercase; letter-spacing:1px;">Shift Details</h4>
-                    <div style="display:flex; justify-content:space-between; margin-bottom:20px; background:rgba(255,255,255,0.03); padding:10px; border-radius:12px;">
-                        <span style="font-size:0.85rem;"><i class="fas fa-clock" style="color:var(--accent);"></i> ${m.shift_start} - ${m.shift_end}</span>
-                        <span style="font-size:0.85rem;"><i class="fas fa-calendar-alt" style="color:var(--accent);"></i> ${m.shift_days}</span>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:20px; background:var(--input-bg); padding:10px; border-radius:12px; border:1px solid var(--glass-border);">
+                        <span style="font-size:0.85rem; color:var(--text-main);"><i class="fas fa-clock" style="color:var(--accent);"></i> ${m.shift_start} - ${m.shift_end}</span>
+                        <span style="font-size:0.85rem; color:var(--text-main);"><i class="fas fa-calendar-alt" style="color:var(--accent);"></i> ${m.shift_days}</span>
                     </div>
 
                     <h4 style="margin:0 0 10px; color:var(--accent); font-size:0.8rem; text-transform:uppercase; letter-spacing:1px;">Recent Assignments</h4>
-                    <div style="max-height:180px; overflow-y:auto; border-radius:12px; background:rgba(0,0,0,0.2);">
+                    <div style="max-height:180px; overflow-y:auto; border-radius:12px; background:var(--input-bg); border:1px solid var(--glass-border);">
                         ${history.length ? history.map(h => `
-                            <div style="padding:12px; border-bottom:1px solid rgba(255,255,255,0.05); display:flex; justify-content:space-between; align-items:center;">
+                            <div style="padding:12px; border-bottom:1px solid var(--glass-border); display:flex; justify-content:space-between; align-items:center;">
                                 <div>
-                                    <div style="font-weight:bold; font-size:0.85rem;">${h.plate_no}</div>
+                                    <div style="font-weight:bold; font-size:0.85rem; color:var(--text-main);">${h.plate_no}</div>
                                     <div style="color:var(--text-dim); font-size:0.75rem;">${h.service_name}</div>
                                 </div>
                                 <span style="font-size:0.7rem; padding:2px 8px; border-radius:20px; background:${h.status === 'COMPLETED' ? 'rgba(16,185,129,0.1)' : 'rgba(245,158,11,0.1)'}; color:${h.status === 'COMPLETED' ? '#10b981' : '#f59e0b'}; border:1px solid currentColor;">${h.status}</span>
@@ -4285,9 +4484,9 @@ try {
             const itemTotal = parseFloat(p.total_price) || 0;
             const itemUnit = parseFloat(p.unit_price) || 0;
             total += itemTotal;
-            return `<div style="display:flex; justify-content:space-between; align-items:center; background:rgba(255,255,255,0.03); padding:10px 15px; border-radius:12px; border:1px solid rgba(255,255,255,0.05); margin-bottom:8px;">
+            return `<div style="display:flex; justify-content:space-between; align-items:center; background:var(--input-bg); padding:10px 15px; border-radius:12px; border:1px solid var(--glass-border); margin-bottom:8px;">
                       <div style="flex:1;">
-                        <div style="font-weight:700; font-size:0.85rem; color:white;">${p.item_name}</div>
+                        <div style="font-weight:700; font-size:0.85rem; color:var(--text-main);">${p.item_name}</div>
                         <div style="font-size:0.7rem; color:var(--text-dim);">${p.service_id ? 'Labor / Service' : `${p.quantity} units @ ₱${itemUnit.toLocaleString()}`}</div>
                       </div>
                       <div style="display:flex; align-items:center; gap:12px;">
@@ -4307,9 +4506,14 @@ try {
     };
 
     window.addPartToJob = function () {
-      const jid = document.getElementById('status_job_id').value;
-      const iid = document.getElementById('selectedPartId').value;
-      const qty = document.getElementById('partQty').value;
+      const jidEl = document.getElementById('status_job_id');
+      const iidEl = document.getElementById('selectedPartId');
+      const qtyEl = document.getElementById('partQty');
+      if (!jidEl || !iidEl || !qtyEl) return;
+      
+      const jid = jidEl.value;
+      const iid = iidEl.value;
+      const qty = qtyEl.value;
       if (!jid || !iid || !qty) return alert("Please select a part and quantity");
       const fd = new FormData();
       fd.append('job_id', jid);
@@ -4432,8 +4636,12 @@ try {
     };
 
     window.addServiceToJob = function () {
-      const jid = document.getElementById('status_job_id').value;
-      const sid = document.getElementById('selectedServiceId').value;
+      const jidEl = document.getElementById('status_job_id');
+      const sidEl = document.getElementById('selectedServiceId');
+      if (!jidEl || !sidEl) return;
+      
+      const jid = jidEl.value;
+      const sid = sidEl.value;
       if (!jid || !sid) return alert("Please select a service first.");
       const fd = new FormData();
       fd.append('job_id', jid);
@@ -4510,38 +4718,61 @@ try {
       }
     };
 
-    window.saveSingleSetting = function (field) {
+    window.saveSingleSetting = function (field, btn) {
+      console.log("[SETTINGS] Saving field:", field);
       const input = document.getElementById('setting_' + field);
-      if (!input) return;
+      if (!input) { console.error("Input not found for", field); return; }
       const value = input.value;
-      const btn = event.currentTarget;
+      
+      if (!btn) btn = event ? (event.currentTarget || event.target) : null;
+      if (!btn) { console.error("Button element not found"); return; }
+      
       const originalHtml = btn.innerHTML;
       btn.classList.add('saving');
       btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
       const fd = new FormData();
       fd.append('field', field);
       fd.append('value', value);
+      
       fetch('tenant-dashboard.php?action=save_setting_item', { method: 'POST', body: fd })
-        .then(r => r.json()).then(data => {
+        .then(async r => {
+          const text = await r.text();
+          try {
+            return JSON.parse(text);
+          } catch(e) {
+            console.error("Server returned non-JSON:", text);
+            throw new Error("Server Error: Invalid response format.");
+          }
+        }).then(data => {
           if (data.status === 'success') {
             showToast("Feature updated successfully!");
-            if (['primary_color', 'secondary_color', 'ui_style', 'border_radius', 'logo_url', 'banner_url', 'shop_name'].includes(field)) {
+            // Fields that require a live preview refresh
+            const visualFields = [
+              'primary_color', 'secondary_color', 'ui_style', 'border_radius', 
+              'logo_url', 'banner_url', 'shop_name', 'hero_title', 
+              'hero_subtitle', 'about_text', 'description'
+            ];
+            if (visualFields.includes(field)) {
               const frame = document.getElementById('livePreviewFrame');
-              if (frame) frame.src = frame.src;
+              if (frame) frame.src = frame.src + '&v=' + Date.now();
             }
           } else showToast(data.message, 'error');
-        }).catch(err => showToast("Connection error", "error"))
+        }).catch(err => {
+          console.error("Save Error:", err);
+          showToast(err.message || "Connection error", "error");
+        })
         .finally(() => {
           btn.classList.remove('saving');
           btn.innerHTML = originalHtml;
         });
     };
 
-    window.saveSettingWithFile = function (field) {
+    window.saveSettingWithFile = function (field, btn) {
       const input = document.getElementById('setting_' + field);
       if (!input || !input.files[0]) return showToast("Please select a file first", "error");
-      const btn = event.currentTarget;
-      const originalHtml = btn.innerHTML;
+      
+      if (!btn) btn = event ? (event.currentTarget || event.target) : null;
+      const originalHtml = btn ? btn.innerHTML : '';
       btn.classList.add('saving');
       btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Uploading...';
       const fd = new FormData();
@@ -4552,9 +4783,9 @@ try {
           if (data.status === 'success') {
             showToast("File uploaded and saved!");
             const urlInput = document.getElementById('setting_' + field.replace('_file', '_url'));
-            if (urlInput) urlInput.value = data.new_url;
+            if (urlInput) urlInput.value = data.url;
             const frame = document.getElementById('livePreviewFrame');
-            if (frame) frame.src = frame.src;
+            if (frame) frame.src = frame.src + '&v=' + Date.now();
           } else showToast(data.message, 'error');
         }).catch(err => showToast("Upload error", "error"))
         .finally(() => {
@@ -4711,7 +4942,7 @@ try {
           body.innerHTML = data.map(p => `
             <tr>
               <td>${p.payment_date}</td>
-              <td><code style="background:rgba(255,255,255,0.05); padding:2px 6px; border-radius:4px;">${p.transaction_reference}</code></td>
+              <td><code style="background:var(--input-bg); padding:2px 6px; border-radius:4px; color:var(--text-main);">${p.transaction_reference}</code></td>
               <td>₱${parseFloat(p.amount).toLocaleString()}</td>
               <td><span class="badge" style="background:rgba(16,185,129,0.1); color:var(--success); border:1px solid rgba(16,185,129,0.2);">${p.payment_status}</span></td>
             </tr>`).join('');
@@ -4741,14 +4972,14 @@ try {
             if (l.activity_type === 'SUBSCRIPTION') { badgeClass = 'badge-active'; icon = 'fa-rocket'; }
 
             return `
-              <tr class="hover-bright" style="border-bottom:1px solid rgba(255,255,255,0.03);">
+              <tr class="hover-bright" style="border-bottom:1px solid var(--glass-border);">
                 <td style="font-size:0.85rem; color:var(--text-dim); font-weight:700;">${new Date(l.created_at).toLocaleString()}</td>
                 <td>
                   <div style="display:flex; align-items:center; gap:10px;">
-                    <div style="width:28px; height:28px; border-radius:50%; background:rgba(255,255,255,0.05); display:flex; align-items:center; justify-content:center; font-size:0.75rem; color:var(--accent);">
+                    <div style="width:28px; height:28px; border-radius:50%; background:var(--input-bg); display:flex; align-items:center; justify-content:center; font-size:0.75rem; color:var(--accent);">
                       <i class="fas fa-user-circle"></i>
                     </div>
-                    <span style="font-weight:700; color:white;">${actor}</span>
+                    <span style="font-weight:700; color:var(--text-main);">${actor}</span>
                   </div>
                 </td>
                 <td>
@@ -4986,7 +5217,7 @@ try {
               return `
           <tr style="border-bottom:1px solid rgba(255,255,255,0.03);">
             <td>
-              <div style="font-weight:800; color:white; font-size:0.9rem;">${displayDate}</div>
+              <div style="font-weight:800; color:var(--text-main); font-size:0.9rem;">${displayDate}</div>
               <div style="font-size:0.75rem; color:var(--accent); font-weight:700;"><i class="far fa-clock"></i> ${displayTime}</div>
             </td>
             <td><strong>${a.customer_name}</strong></td>
@@ -5064,6 +5295,15 @@ try {
       if (el) el.style.display = 'none';
     }
     window.closeModal = closeModal;
+
+    // Close ALL open modals at once (used when switching sidebar tabs)
+    window.closeAllModals = function () {
+      document.querySelectorAll('[id$="Modal"]').forEach(el => {
+        if (el.style.display === 'flex' || el.style.display === 'block') {
+          el.style.display = 'none';
+        }
+      });
+    };
 
     function closeNotiModal() {
       const m = document.getElementById('notificationModal');
@@ -5143,7 +5383,7 @@ try {
             return `
               <tr style="border-bottom:1px solid rgba(255,255,255,0.03);">
                 <td style="padding:${isStaff ? '10px 15px' : '15px 20px'};">
-                  <div style="font-weight:700; color:#fff;">${req.full_name}</div>
+                  <div style="font-weight:700; color:var(--text-main);">${req.full_name}</div>
                   ${isStaff ? '' : `<div style="font-size:0.75rem; color:var(--text-dim);">Mechanic ID: #${req.mechanic_id}</div>`}
                 </td>
                 <td style="padding:${isStaff ? '10px 15px' : '15px 20px'};">
@@ -5202,23 +5442,14 @@ try {
     }
 
     :root {
-      --bg-deep:
-        <?php echo $tenant_custom['secondary_color'] ?: '#030712'; ?> !important;
-      --accent:
-        <?php echo $tenant_custom['primary_color'] ?: '#10b981'; ?> !important;
-      --accent-rgb:
-        <?php
+      --bg-deep: <?php echo $tenant_custom['secondary_color'] ?: '#030712'; ?>;
+      --accent: <?php echo $tenant_custom['primary_color'] ?: '#10b981'; ?>;
+      --accent-rgb: <?php
         $hex = ($tenant_custom['primary_color'] ?? '') ?: '#10b981';
         $rgb = sscanf($hex, "#%02x%02x%02x");
-        if ($rgb) {
-          list($r, $g, $b) = $rgb;
-        } else {
-          $r = 16;
-          $g = 185;
-          $b = 129;
-        }
+        if ($rgb) { list($r, $g, $b) = $rgb; } else { $r = 16; $g = 185; $b = 129; }
         echo "$r, $g, $b";
-        ?> !important;
+        ?>;
       --accent-glow: rgba(var(--accent-rgb), 0.4);
       --radius: <?php echo $tenant_custom['border_radius'] ?: '24px'; ?>;
       --glass: <?php echo ($tenant_custom['ui_style'] === 'SOLID') ? 'rgba(15, 23, 42, 0.95)' : 'rgba(255, 255, 255, 0.03)'; ?>;
@@ -5230,6 +5461,101 @@ try {
       --danger: #ef4444;
       --warning: #f59e0b;
       --card-bg: rgba(255, 255, 255, 0.03);
+      --input-bg: rgba(255, 255, 255, 0.05);
+    }
+
+    [data-theme="light"] {
+      --bg-deep: #f1f5f9;
+      --text-main: #0f172a;
+      --text-dim: #64748b;
+      --glass: rgba(255, 255, 255, 0.8);
+      --glass-border: rgba(0, 0, 0, 0.1);
+      --glass-blur: blur(20px);
+      --card-bg: #ffffff;
+      --input-bg: #ffffff;
+      --accent-glow: rgba(var(--accent-rgb), 0.15);
+    }
+
+    [data-theme="light"] .modern-input,
+    [data-theme="light"] select {
+      background-color: var(--input-bg) !important;
+      color: var(--text-main) !important;
+      border-color: var(--glass-border) !important;
+    }
+
+    [data-theme="light"] select {
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%230f172a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E") !important;
+    }
+
+    [data-theme="light"] .glass-panel,
+    [data-theme="light"] .view-section,
+    [data-theme="light"] .stat-card,
+    [data-theme="light"] .modal-content,
+    [data-theme="light"] .sidebar,
+    [data-theme="light"] .card,
+    [data-theme="light"] .glass-card {
+      background: var(--glass) !important;
+      color: var(--text-main) !important;
+      border-color: var(--glass-border) !important;
+    }
+
+    [data-theme="light"] .glass-panel h1,
+    [data-theme="light"] .glass-panel h2,
+    [data-theme="light"] .glass-panel h3,
+    [data-theme="light"] .glass-panel h4,
+    [data-theme="light"] .glass-panel strong,
+    [data-theme="light"] .view-section h1,
+    [data-theme="light"] .view-section h2,
+    [data-theme="light"] .view-section h3,
+    [data-theme="light"] .view-section h4,
+    [data-theme="light"] .view-section strong,
+    [data-theme="light"] .modal-content h1,
+    [data-theme="light"] .modal-content h2,
+    [data-theme="light"] .modal-content h3,
+    [data-theme="light"] .modal-content h4,
+    [data-theme="light"] .modal-content strong,
+    [data-theme="light"] .data-table td,
+    [data-theme="light"] .data-table td strong {
+      color: var(--text-main) !important;
+    }
+
+    [data-theme="light"] .data-table th {
+      background: rgba(0, 0, 0, 0.03) !important;
+      color: var(--text-dim) !important;
+    }
+
+    [data-theme="light"] .data-table tr:hover {
+      background: rgba(0, 0, 0, 0.01) !important;
+    }
+
+    [data-theme="light"] .nav-item:not(.active) {
+      color: var(--text-dim);
+    }
+
+    [data-theme="light"] .nav-group-title {
+      color: var(--text-dim);
+      opacity: 0.7;
+    }
+
+    [data-theme="light"] .brand {
+      color: var(--text-main);
+    }
+
+    [data-theme="light"] .brand-icon {
+      background: white;
+      color: var(--accent);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+    }
+
+    [data-theme="light"] #themeToggle,
+    [data-theme="light"] a[href="?logout=1"] {
+      background: rgba(0, 0, 0, 0.05) !important;
+      border: 1px solid rgba(0, 0, 0, 0.05) !important;
+    }
+
+    [data-theme="light"] ::placeholder {
+      color: var(--text-dim) !important;
+      opacity: 0.5;
     }
 
     [data-theme="light"] {
@@ -5301,11 +5627,11 @@ try {
     /* Modern input styling for all textareas/inputs */
     .modern-input {
       width: 100%;
-      background: rgba(255, 255, 255, 0.05);
+      background: var(--input-bg);
       border: 1px solid var(--glass-border);
       border-radius: 12px;
       padding: 1rem 1.25rem;
-      color: #fff !important;
+      color: var(--text-main) !important;
       font-size: 0.95rem;
       outline: none;
       transition: 0.3s;
@@ -5328,7 +5654,7 @@ try {
       -moz-appearance: none !important;
       appearance: none !important;
       width: 100% !important;
-      background-color: rgba(255, 255, 255, 0.05) !important;
+      background-color: var(--input-bg) !important;
       background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E") !important;
       background-repeat: no-repeat !important;
       background-position: right 1.2rem center !important;
@@ -5943,7 +6269,7 @@ try {
     .stat-value {
       font-size: 2rem;
       font-weight: 800;
-      color: white;
+      color: var(--text-main);
       display: flex;
       justify-content: space-between;
       align-items: flex-end;
@@ -6059,11 +6385,11 @@ try {
     .search-input {
       width: 100%;
       max-width: 400px;
-      background: rgba(0, 0, 0, 0.2);
+      background: var(--input-bg);
       border: 1px solid var(--glass-border);
       padding: 0.9rem 1.25rem;
       border-radius: 15px;
-      color: white;
+      color: var(--text-main);
       outline: none;
       transition: 0.3s;
       margin-bottom: 1.5rem;
@@ -6679,8 +7005,15 @@ try {
         }
         body.innerHTML = data.map(m => {
           const isBusy = (parseInt(m.active_jobs_count) > 0);
-          const statusLabel = isBusy ? 'BUSY' : 'AVAILABLE';
-          const badgeClass = isBusy ? 'badge-warning' : 'badge-active';
+          let statusLabel = 'AVAILABLE';
+          let badgeClass = 'badge-active';
+          if (m.status === 'UNAVAILABLE') {
+            statusLabel = 'UNAVAILABLE';
+            badgeClass = 'badge-danger';
+          } else if (isBusy) {
+            statusLabel = 'BUSY';
+            badgeClass = 'badge-warning';
+          }
 
           const formatT = (t) => {
             if (!t) return '08:00 AM';
@@ -6691,7 +7024,11 @@ try {
             return `${h}:${min} ${ampm}`;
           };
           const shiftDaysStr = m.shift_days ? m.shift_days.split(',').join(' · ') : 'Mon · Tue · Wed · Thu · Fri · Sat';
-          const shiftStr = `<div style="line-height:1.6;"><span style="font-size:0.8rem; color:white; font-weight:600;"><i class="far fa-clock" style="color:var(--accent); margin-right:4px;"></i>${formatT(m.shift_start)} – ${formatT(m.shift_end)}</span><br><span style="font-size:0.7rem; color:var(--text-dim);">${shiftDaysStr}</span></div>`;
+          const shiftStr = `<div style="line-height:1.6;"><span style="font-size:0.8rem; color:var(--text-main); font-weight:600;"><i class="far fa-clock" style="color:var(--accent); margin-right:4px;"></i>${formatT(m.shift_start)} – ${formatT(m.shift_end)}</span><br><span style="font-size:0.7rem; color:var(--text-dim);">${shiftDaysStr}</span></div>`;
+
+          const toggleBtn = m.status === 'UNAVAILABLE' 
+            ? `<button type="button" class="btn-outline" style="padding:6px 12px; font-size:0.75rem; border-color:#10b981; color:#10b981; cursor:pointer; position:relative; z-index:10; pointer-events:auto !important;" onclick="window.toggleMechanicStatus(${m.mechanic_id}, 'AVAILABLE')">Set Available</button>`
+            : `<button type="button" class="btn-outline" style="padding:6px 12px; font-size:0.75rem; border-color:#ef4444; color:#ef4444; cursor:pointer; position:relative; z-index:10; pointer-events:auto !important;" onclick="window.toggleMechanicStatus(${m.mechanic_id}, 'UNAVAILABLE')">Set Unavailable</button>`;
 
           return `
           <tr>
@@ -6704,11 +7041,38 @@ try {
                 <button type="button" class="btn-outline" style="padding:6px 12px; font-size:0.75rem; border-color:var(--accent); color:var(--text-main); cursor:pointer; position:relative; z-index:10; pointer-events:auto !important;" onclick="window.openMechanicProfile(${m.mechanic_id})">View Profile</button>
                 <?php if (strtoupper($role) === 'OWNER' || strtoupper($role) === 'MANAGER'): ?>
                 <button type="button" class="btn-outline" style="padding:6px 12px; font-size:0.75rem; border-color:var(--accent); color:var(--text-main); cursor:pointer; position:relative; z-index:10; pointer-events:auto !important;" onclick="window.openEditShiftModal(${m.mechanic_id}, '${m.shift_start}', '${m.shift_end}', '${m.display_name.replace(/'/g, "\\'")}', '${m.shift_days || 'Mon,Tue,Wed,Thu,Fri,Sat'}')">Edit Shift</button>
+                ${toggleBtn}
                 <?php endif; ?>
               </div>
             </td>
           </tr>`;
         }).join('');
+      });
+    };
+
+    window.toggleMechanicStatus = function (mechanicId, newStatus) {
+      if (!confirm(`Are you sure you want to set this mechanic as ${newStatus.toLowerCase()}?`)) return;
+
+      const fd = new FormData();
+      fd.append('mechanic_id', mechanicId);
+      fd.append('status', newStatus);
+
+      fetch('tenant-dashboard.php?action=update_mechanic_status', {
+        method: 'POST',
+        body: fd
+      })
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'success') {
+          showToast(data.message, 'success');
+          window.refreshMechanicsList();
+        } else {
+          showToast(data.message || 'Failed to update mechanic status.', 'error');
+        }
+      })
+      .catch(err => {
+        console.error("Status Sync Error:", err);
+        showToast('Network error updating status.', 'error');
       });
     };
 
@@ -6893,9 +7257,7 @@ try {
         let statusText = 'IN STOCK';
         let statusClass = 'badge-active';
         const qty = parseInt(i.quantity);
-        const threshold = parseInt(i.stock_threshold || 5);
-
-        if (qty <= threshold) {
+        if (qty < 5) {
           statusText = qty <= 0 ? 'OUT OF STOCK' : 'LOW STOCK';
           statusClass = 'badge-danger';
         }
@@ -7146,10 +7508,13 @@ try {
     </div>
 
     <div style="margin-top:auto; padding: 0 1.5rem 1.5rem; display:flex; flex-direction:column; gap:10px;">
-      <a onclick="window.toggleTheme()" class="nav-item" id="theme-toggle-btn"
-        style="border-radius: 12px; background:rgba(255,255,255,0.05); justify-content:center; cursor:pointer;">
-        <i class="fas fa-moon"></i> <span class="nav-label">Switch Mode</span>
-      </a>
+      <div class="nav-item" id="themeToggle" onclick="window.toggleTheme()"
+        style="border-radius: 12px; background:rgba(255,255,255,0.05); justify-content:center; cursor:pointer;"
+        onmouseenter="this.style.background='rgba(255,255,255,0.1)'"
+        onmouseleave="this.style.background='rgba(255,255,255,0.05)'">
+        <i class="fas fa-moon"></i> <span class="nav-label">Dark Mode</span>
+      </div>
+
       <a href="?logout=1" class="nav-item"
         style="color:var(--danger); border-radius: 12px; background:rgba(239,68,68,0.05); justify-content:center; cursor:pointer;"
         onmouseenter="this.style.background='rgba(239,68,68,0.1)'"
@@ -7177,6 +7542,10 @@ try {
         style="width:55px; height:55px; border-radius:15px; background:rgba(var(--accent-rgb), 0.1); color:var(--accent); display:flex; align-items:center; justify-content:center; font-size:1.6rem;">
         <i class="fas fa-satellite-dish"></i>
       </div>
+    </div>
+    <div class="header-section" style="margin-bottom: 2rem;">
+      <h1><i class="fas fa-magic"></i> Shop Customization</h1>
+      <p style="color:var(--text-dim);">Personalize your shop's digital identity and customer experience.</p>
     </div>
     <div id="annList" style="max-height: 400px; overflow-y: auto; padding-right: 10px;">
       <?php if (empty($all_announcements)): ?>
@@ -7471,9 +7840,9 @@ try {
             </thead>
             <tbody id="shiftRequestsBody">
               <?php foreach ($pending_shift_requests_list as $req): ?>
-              <tr style="border-bottom:1px solid rgba(255,255,255,0.03);">
+              <tr style="border-bottom:1px solid var(--glass-border);">
                 <td style="padding:15px 20px;">
-                  <div style="font-weight:700; color:#fff;">
+                  <div style="font-weight:700; color:var(--text-main);">
                     <?php echo htmlspecialchars($req['full_name']); ?>
                   </div>
                   <div style="font-size:0.75rem; color:var(--text-dim);">Mechanic ID:
@@ -8386,9 +8755,8 @@ try {
     <div id="reports" class="view-section">
       <div class="glass-panel">
         <h3>Business Analytics & Reports</h3>
-        <p style="color:var(--text-dim); margin-bottom: 2rem;">Generate insights on revenue, performance,
-          and
-          inventory.</p>
+        <p style="color:var(--text-dim); margin-bottom: 2rem;">Generate insights on revenue, service performance,
+          inventory, and mechanic rankings.</p>
         <div class="stats-grid">
           <div class="stat-card" style="cursor:pointer; text-align:center;" onclick="showReport('revenue')">
             <i class="fas fa-coins" style="font-size:2rem; color:var(--accent); margin-bottom:1rem;"></i>
@@ -8402,6 +8770,10 @@ try {
             <i class="fas fa-boxes" style="font-size:2rem; color:var(--accent); margin-bottom:1rem;"></i>
             <h4>Inventory Report</h4>
           </div>
+          <div class="stat-card" style="cursor:pointer; text-align:center;" onclick="showReport('mechanic')">
+            <i class="fas fa-user-cog" style="font-size:2rem; color:var(--accent); margin-bottom:1rem;"></i>
+            <h4>Mechanic Performance Reports</h4>
+          </div>
         </div>
       </div>
     </div>
@@ -8412,10 +8784,15 @@ try {
       <div
         style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:850px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem;">
-          <h3 id="reportTitle" style="margin:0; font-size:1.6rem; font-weight:800; letter-spacing:-0.5px;">Report
-            Details</h3>
-          <button onclick="closeModal('reportModal')"
-            style="background:rgba(255,255,255,0.05); border:none; color:white; width:40px; height:40px; border-radius:12px; font-size:1.5rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">&times;</button>
+          <h3 id="reportTitle" style="margin:0; font-size:1.6rem; font-weight:800; letter-spacing:-0.5px;">Report Details</h3>
+          <div style="display:flex; align-items:center; gap:12px;">
+            <button id="btnExportPDF" onclick="exportReportPDF()"
+              style="background:var(--accent); border:none; color:white; padding:0.6rem 1.2rem; border-radius:12px; font-weight:700; font-size:0.85rem; cursor:pointer; display:flex; align-items:center; gap:8px; transition:0.2s; box-shadow:0 4px 15px rgba(0,0,0,0.2);">
+              <i class="fas fa-file-pdf"></i> Export PDF
+            </button>
+            <button onclick="closeModal('reportModal')"
+              style="background:rgba(255,255,255,0.05); border:none; color:white; width:40px; height:40px; border-radius:12px; font-size:1.5rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">&times;</button>
+          </div>
         </div>
 
         <!-- Chart Area (Hidden by default) -->
@@ -8488,7 +8865,7 @@ try {
               <input type="text" name="shop_name" id="setting_shop_name"
                 value="<?php echo htmlspecialchars($shop_name); ?>" placeholder="e.g. AutoFix Pro"
                 onfocus="highlightInPreview('shop_name')">
-              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('shop_name')">
+              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('shop_name', this)">
                 <i class="fas fa-save"></i> Save Shop Name
               </button>
             </div>
@@ -8496,7 +8873,7 @@ try {
               <label>Business Description</label>
               <textarea name="description" id="setting_description" placeholder="Short tagline for your business..."
                 onfocus="highlightInPreview('description')"><?php echo htmlspecialchars($tenant_custom['description'] ?? ''); ?></textarea>
-              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('description')">
+              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('description', this)">
                 <i class="fas fa-save"></i> Save Description
               </button>
             </div>
@@ -8505,7 +8882,7 @@ try {
               <input type="text" name="hero_title" id="setting_hero_title"
                 value="<?php echo htmlspecialchars($tenant_custom['hero_title'] ?? ''); ?>"
                 placeholder="e.g. Expert Service at Your Fingertips" onfocus="highlightInPreview('hero_title')">
-              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('hero_title')">
+              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('hero_title', this)">
                 <i class="fas fa-save"></i> Save Headline
               </button>
             </div>
@@ -8514,17 +8891,17 @@ try {
               <textarea name="hero_subtitle" id="setting_hero_subtitle"
                 placeholder="A short welcoming message below your headline..." style="min-height:50px;"
                 onfocus="highlightInPreview('hero_subtitle')"><?php echo htmlspecialchars($tenant_custom['hero_subtitle'] ?? ''); ?></textarea>
-              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('hero_subtitle')">
+              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('hero_subtitle', this)">
                 <i class="fas fa-save"></i> Save Intro Text
               </button>
             </div>
             <div class="form-group" style="margin-bottom: 1.5rem;">
-              <label>About Us / History</label>
+              <label>Shop About Context</label>
               <textarea name="about_text" id="setting_about_text"
                 placeholder="Tell your customers about your shop history..." onfocus="highlightInPreview('about_text')"
                 style="min-height:80px;"><?php echo htmlspecialchars($tenant_custom['about_text'] ?? ''); ?></textarea>
-              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('about_text')">
-                <i class="fas fa-save"></i> Save History
+              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('about_text', this)">
+                <i class="fas fa-save"></i> Save About Text
               </button>
             </div>
 
@@ -8534,7 +8911,7 @@ try {
                 <input type="color" name="primary_color" id="setting_primary_color"
                   value="<?php echo htmlspecialchars($tenant_custom['primary_color'] ?: '#6366f1'); ?>"
                   onfocus="highlightInPreview('primary_color')">
-                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('primary_color')">
+                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('primary_color', this)">
                   <i class="fas fa-save"></i> Save Color
                 </button>
               </div>
@@ -8543,7 +8920,7 @@ try {
                 <input type="color" name="secondary_color" id="setting_secondary_color"
                   value="<?php echo htmlspecialchars($tenant_custom['secondary_color'] ?: '#030712'); ?>"
                   onfocus="highlightInPreview('secondary_color')">
-                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('secondary_color')">
+                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('secondary_color', this)">
                   <i class="fas fa-save"></i> Save Background
                 </button>
               </div>
@@ -8561,7 +8938,7 @@ try {
                 <option value="VIBRANT" <?php echo ($tenant_custom['ui_style'] === 'VIBRANT') ? 'selected' : ''; ?>>
                   Vibrant Tech</option>
               </select>
-              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('ui_style')">
+              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('ui_style', this)">
                 <i class="fas fa-save"></i> Save Theme
               </button>
             </div>
@@ -8571,7 +8948,7 @@ try {
               <input type="range" name="border_radius_val" id="setting_border_radius" min="0" max="50"
                 value="<?php echo str_replace('px', '', $tenant_custom['border_radius'] ?? '24'); ?>"
                 style="width:100%;" onfocus="highlightInPreview('border_radius')">
-              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('border_radius')">
+              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('border_radius', this)">
                 <i class="fas fa-save"></i> Save Radius
               </button>
             </div>
@@ -8584,7 +8961,7 @@ try {
                   style="background:rgba(0,0,0,0.2); padding:0.6rem; color:var(--text-dim); flex:1;"
                   onfocus="highlightInPreview('logo_url')">
                 <button type="button" class="feature-save-btn" style="margin-top:0;"
-                  onclick="saveSettingWithFile('logo_file')">
+                  onclick="saveSettingWithFile('logo_file', this)">
                   <i class="fas fa-upload"></i> Upload
                 </button>
               </div>
@@ -8594,7 +8971,7 @@ try {
                   placeholder="...or enter Image URL" style="font-size:0.8rem; flex:1;"
                   onfocus="highlightInPreview('logo_url')">
                 <button type="button" class="feature-save-btn" style="margin-top:0;"
-                  onclick="saveSingleSetting('logo_url')">
+                  onclick="saveSingleSetting('logo_url', this)">
                   <i class="fas fa-link"></i> Save URL
                 </button>
               </div>
@@ -8607,7 +8984,7 @@ try {
                   style="background:rgba(0,0,0,0.2); padding:0.6rem; color:var(--text-dim); flex:1;"
                   onfocus="highlightInPreview('banner_url')">
                 <button type="button" class="feature-save-btn" style="margin-top:0;"
-                  onclick="saveSettingWithFile('banner_file')">
+                  onclick="saveSettingWithFile('banner_file', this)">
                   <i class="fas fa-upload"></i> Upload
                 </button>
               </div>
@@ -8617,7 +8994,7 @@ try {
                   placeholder="...or enter Image URL" style="font-size:0.8rem; flex:1;"
                   onfocus="highlightInPreview('banner_url')">
                 <button type="button" class="feature-save-btn" style="margin-top:0;"
-                  onclick="saveSingleSetting('banner_url')">
+                  onclick="saveSingleSetting('banner_url', this)">
                   <i class="fas fa-link"></i> Save URL
                 </button>
               </div>
@@ -8634,7 +9011,7 @@ try {
                 <textarea name="staff_announcement" id="setting_staff_announcement" class="modern-input"
                   style="min-height:80px; resize:none; font-size:0.85rem;"
                   placeholder="e.g. Mandatory meeting this Saturday at 5PM. All mechanics present."><?php echo htmlspecialchars($tenant_custom['staff_announcement'] ?? ''); ?></textarea>
-                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('staff_announcement')">
+                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('staff_announcement', this)">
                   <i class="fas fa-satellite-dish"></i> Broadcast Update
                 </button>
                 <p style="font-size:0.7rem; color:var(--text-dim); margin-top:5px;">This message
@@ -8644,8 +9021,9 @@ try {
             </div>
 
             <div style="margin-top: 2rem; border-top: 1px solid var(--glass-border); padding-top: 1.5rem;">
-              <h4 <i class="fas fa-bullhorn"></i> Broadcast to Team
-                </button>
+               <h4 style="color:var(--accent); text-transform:uppercase; font-size:0.75rem; margin-bottom:1rem; letter-spacing:1px; font-weight:800;">
+                 <i class="fas fa-address-book"></i> Public Contact Info
+               </h4>
             </div>
 
             <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem;">
@@ -8654,7 +9032,7 @@ try {
                 <input type="text" name="phone" id="setting_phone"
                   value="<?php echo htmlspecialchars($tenant_custom['phone'] ?? ''); ?>" placeholder="e.g. 09123456789"
                   style="font-size:0.8rem;" onfocus="highlightInPreview('phone')">
-                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('phone')">
+                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('phone', this)">
                   <i class="fas fa-save"></i> Save Phone
                 </button>
               </div>
@@ -8664,7 +9042,7 @@ try {
                   value="<?php echo htmlspecialchars($tenant_custom['opening_hours'] ?? ''); ?>"
                   placeholder="e.g. Mon-Sat 8am-5pm" style="font-size:0.8rem;"
                   onfocus="highlightInPreview('opening_hours')">
-                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('opening_hours')">
+                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('opening_hours', this)">
                   <i class="fas fa-save"></i> Save Hours
                 </button>
               </div>
@@ -8675,7 +9053,7 @@ try {
               <textarea name="address" id="setting_address" placeholder="Full physical address of your shop..."
                 style="min-height:50px; font-size:0.8rem;"
                 onfocus="highlightInPreview('address')"><?php echo htmlspecialchars($tenant_custom['address'] ?? ''); ?></textarea>
-              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('address')">
+              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('address', this)">
                 <i class="fas fa-save"></i> Save Address
               </button>
             </div>
@@ -8686,7 +9064,7 @@ try {
                 <input type="text" name="facebook_url" id="setting_facebook_url"
                   value="<?php echo htmlspecialchars($tenant_custom['facebook_url'] ?? ''); ?>"
                   style="font-size:0.8rem;" onfocus="highlightInPreview('facebook_url')">
-                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('facebook_url')">
+                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('facebook_url', this)">
                   <i class="fas fa-save"></i> Save FB
                 </button>
               </div>
@@ -8695,7 +9073,7 @@ try {
                 <input type="text" name="instagram_url" id="setting_instagram_url"
                   value="<?php echo htmlspecialchars($tenant_custom['instagram_url'] ?? ''); ?>"
                   style="font-size:0.8rem;" onfocus="highlightInPreview('instagram_url')">
-                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('instagram_url')">
+                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('instagram_url', this)">
                   <i class="fas fa-save"></i> Save IG
                 </button>
               </div>
@@ -8885,27 +9263,27 @@ try {
                 // DYNAMIC MODAL (With Payment Selection)
                 const modalId = 'dynamicRenewModal_' + Date.now();
                 const modalHTML = `
-                                                                                                      <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.9); backdrop-filter:blur(15px); z-index:9999999; display:flex; align-items:center; justify-content:center; padding:20px;">
-                                                                                                        <div style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:32px; padding:3rem; width:100%; max-width:480px; text-align:center; box-shadow:0 30px 60px rgba(0,0,0,0.8);">
+                                                                                                      <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); backdrop-filter:blur(15px); z-index:9999999; display:flex; align-items:center; justify-content:center; padding:20px;">
+                                                                                                        <div style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:32px; padding:3rem; width:100%; max-width:480px; text-align:center; box-shadow:0 30px 60px rgba(0,0,0,0.5);">
                                                                                                           <div style="width:80px; height:80px; background:linear-gradient(135deg, #6366f1 0%, #a855f7 100%); border-radius:50%; display:flex; align-items:center; justify-content:center; margin:0 auto 2rem; color:white; font-size:2.5rem; box-shadow:0 10px 25px rgba(99, 102, 241, 0.4);">
                                                                                                             <i class="fas fa-credit-card"></i>
                                                                                                           </div>
-                                                                                                          <h2 style="color:white; margin-bottom:0.8rem; font-size:1.8rem; font-weight:800;">Renew Subscription</h2>
-                                                                                                          <p style="color:#94a3b8; margin-bottom:2rem; line-height:1.6;">${confirmMsg}</p>
+                                                                                                          <h2 style="color:var(--text-main); margin-bottom:0.8rem; font-size:1.8rem; font-weight:800;">Renew Subscription</h2>
+                                                                                                          <p style="color:var(--text-dim); margin-bottom:2rem; line-height:1.6;">${confirmMsg}</p>
                   
                                                                                                           <div style="text-align:left; margin-bottom:2.5rem;">
-                                                                                                            <label style="color:white; font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; display:block; opacity:0.7;">Payment Method</label>
-                                                                                                            <select id="payMethod_${modalId}">
-                                                                                                              <option value="GCASH" style="background:#111827;">GCash</option>
-                                                                                                              <option value="MAYA" style="background:#111827;">Maya</option>
-                                                                                                              <option value="BANK_TRANSFER" style="background:#111827;">Bank Transfer (BDO/BPI)</option>
-                                                                                                              <option value="CARD" style="background:#111827;">Credit/Debit Card</option>
+                                                                                                            <label style="color:var(--text-main); font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; display:block; opacity:0.7;">Payment Method</label>
+                                                                                                            <select id="payMethod_${modalId}" class="modern-input">
+                                                                                                              <option value="GCASH">GCash</option>
+                                                                                                              <option value="MAYA">Maya</option>
+                                                                                                              <option value="BANK_TRANSFER">Bank Transfer (BDO/BPI)</option>
+                                                                                                              <option value="CARD">Credit/Debit Card</option>
                                                                                                             </select>
                                                                                                           </div>
 
                                                                                                           <div style="display:flex; gap:15px; justify-content:center;">
                                                                                                             <button id="btnConfirm_${modalId}" style="flex:2; padding:16px; background:#6366f1; color:white; border:none; border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem; transition:0.3s; box-shadow:0 10px 20px rgba(99, 102, 241, 0.3);">Go to Payment</button>
-                                                                                                            <button id="btnCancel_${modalId}" style="flex:1; padding:16px; background:rgba(255,255,255,0.05); color:white; border:1px solid rgba(255,255,255,0.1); border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem;">Cancel</button>
+                                                                                                            <button id="btnCancel_${modalId}" style="flex:1; padding:16px; background:var(--input-bg); color:var(--text-main); border:1px solid var(--glass-border); border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem;">Cancel</button>
                                                                                                           </div>
                                                                                                         </div>
                                                                                                       </div>`;
@@ -8946,7 +9324,7 @@ try {
                 </div>
 
                 <h1
-                  style="font-size: 3.5rem; font-weight: 900; margin-bottom: 1rem; letter-spacing: -2px; background: linear-gradient(to right, #fff, var(--text-dim)); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
+                  style="font-size: 3.5rem; font-weight: 900; margin-bottom: 1rem; letter-spacing: -2px; background: linear-gradient(to right, var(--text-main), var(--text-dim)); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
                   <?php echo htmlspecialchars($active_subscription['plan_name'] ?? 'PRO'); ?>
                 </h1>
 
@@ -8967,13 +9345,13 @@ try {
                     </span>
                   </div>
                   <div
-                    style="width:100%; height:12px; background:rgba(255,255,255,0.05); border-radius:100px; overflow:hidden; border:1px solid rgba(255,255,255,0.05);">
+                    style="width:100%; height:12px; background:var(--input-bg); border-radius:100px; overflow:hidden; border:1px solid var(--glass-border);">
                     <div
                       style="width:<?php echo 100 - $percent; ?>%; height:100%; background:linear-gradient(to right, var(--accent), #a855f7); border-radius:100px; box-shadow: 0 0 15px var(--accent-glow);">
                     </div>
                   </div>
                   <p style="margin-top:1rem; color:var(--text-dim); font-size:0.95rem;">
-                    Renews on <strong style="color:white;" id="expiryDisplay">
+                    Renews on <strong style="color:var(--text-main);" id="expiryDisplay">
                       <?php echo date('F d, Y', strtotime($active_subscription['end_date'])); ?>
                     </strong>
                     (In
@@ -9689,7 +10067,7 @@ try {
             return;
           }
           body.innerHTML = data.map(i => {
-            const isLow = parseInt(i.quantity) <= parseInt(i.stock_threshold || 0);
+            const isLow = parseInt(i.quantity) < 5;
             const statusClass = isLow ? 'badge-danger' : 'badge-active';
             const statusText = isLow ? 'LOW STOCK' : 'IN STOCK';
             return `
@@ -9836,8 +10214,12 @@ try {
         const doc = frame.contentDocument || frame.contentWindow.document;
 
         // Sync Colors
-        const accent = document.getElementById('prev_accent').value;
-        const bg = document.getElementById('prev_bg').value;
+        const accentEl = document.getElementById('setting_primary_color');
+        const bgEl = document.getElementById('setting_secondary_color');
+        if (!accentEl || !bgEl) return;
+
+        const accent = accentEl.value;
+        const bg = bgEl.value;
         const accentRgb = hexToRgb(accent);
         const bgRgb = hexToRgb(bg);
 
@@ -9857,9 +10239,9 @@ try {
 
         // Sync Text Elements
         const map = {
-          'prev_shop_name': '.logo span',
-          'prev_hero_title': '.hero h1',
-          'prev_hero_sub': '.hero p'
+          'setting_shop_name': '.logo span',
+          'setting_hero_title': '.hero h1',
+          'setting_hero_subtitle': '.hero p'
         };
 
         Object.entries(map).forEach(([inputId, selector]) => {
@@ -9941,9 +10323,9 @@ try {
     <div
       style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2rem; width:100%; max-width:600px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6); max-height:80vh; overflow:hidden; display:flex; flex-direction:column;">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
-        <h3 style="margin:0; font-size:1.3rem;">My Work Updates</h3>
+        <h3 style="margin:0; font-size:1.3rem; color:var(--text-main);">My Work Updates</h3>
         <button onclick="closeModal('workLogModal')"
-          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+          style="background:none; border:none; color:var(--text-main); font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
       </div>
       <div id="workLogContainer" style="flex:1; overflow-y:auto; padding-right:10px;">
         <p style="text-align:center; color:var(--text-dim); padding:2rem;">Loading logs...</p>
@@ -9955,11 +10337,11 @@ try {
   <div id="serviceModal"
     style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
     <div
-      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:480px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
+      style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:24px; padding:2.5rem; width:100%; max-width:480px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
-        <h3 style="margin:0; font-size:1.3rem;">Add New Service</h3>
+        <h3 style="margin:0; font-size:1.3rem; color:var(--text-main);">Add New Service</h3>
         <button onclick="closeModal('serviceModal')"
-          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+          style="background:none; border:none; color:var(--text-main); font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
       </div>
       <form id="addServiceForm" method="POST" action="tenant-dashboard.php?action=add_service">
         <input type="hidden" name="service_action" value="add_service">
@@ -9968,7 +10350,7 @@ try {
             style="display:block; margin-bottom:6px; font-size:0.85rem; color:var(--accent); font-weight:700;">Standard
             Service (Admin Regulated)</label>
           <select name="master_id" onchange="window.syncMasterService(this, 'addServiceForm')"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid var(--accent); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+            style="width:100%; background:var(--input-bg); border:1px solid var(--accent); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
             <option value="">-- Custom / Not in List --</option>
             <?php
             try {
@@ -9986,18 +10368,18 @@ try {
         <div style="margin-bottom:1rem;">
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Service Name</label>
           <input type="text" name="service_name" required placeholder="e.g. Engine Oil Change"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <div style="margin-bottom:1rem;">
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Description</label>
           <textarea name="description" placeholder="What's included?"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; min-height:90px; resize:none; box-sizing:border-box;"></textarea>
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; min-height:90px; resize:none; box-sizing:border-box;"></textarea>
         </div>
         <div style="margin-bottom:1.5rem;">
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price
             (PHP)</label>
           <input type="number" step="0.01" name="price" required placeholder="0.00"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <button type="button" onclick="submitAddService()"
           style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1rem; border-radius:12px; font-size:1rem; font-weight:700; cursor:pointer;">Save
@@ -10010,11 +10392,11 @@ try {
   <div id="editServiceModal"
     style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
     <div
-      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:480px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
+      style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:24px; padding:2.5rem; width:100%; max-width:480px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
-        <h3 style="margin:0; font-size:1.3rem;">Edit Service</h3>
+        <h3 style="margin:0; font-size:1.3rem; color:var(--text-main);">Edit Service</h3>
         <button onclick="closeModal('editServiceModal')"
-          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+          style="background:none; border:none; color:var(--text-main); font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
       </div>
       <form id="editServiceForm">
         <input type="hidden" name="service_id" id="edit_service_id">
@@ -10023,18 +10405,18 @@ try {
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Service
             Name</label>
           <input type="text" name="service_name" id="edit_service_name" required
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <div style="margin-bottom:1rem;">
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Description</label>
           <textarea name="description" id="edit_service_desc"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; min-height:90px; resize:none; box-sizing:border-box;"></textarea>
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; min-height:90px; resize:none; box-sizing:border-box;"></textarea>
         </div>
         <div style="margin-bottom:1.5rem;">
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price
             (PHP)</label>
           <input type="number" step="0.01" name="price" id="edit_service_price" required
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <button type="button" onclick="window.saveEditService()"
           style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1rem; border-radius:12px; font-size:1rem; font-weight:700; cursor:pointer;">Update
@@ -10047,11 +10429,11 @@ try {
   <div id="staffModal"
     style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
     <div
-      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:480px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
+      style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:24px; padding:2.5rem; width:100%; max-width:480px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
-        <h3 style="margin:0; font-size:1.3rem;">Create Staff Account</h3>
+        <h3 style="margin:0; font-size:1.3rem; color:var(--text-main);">Create Staff Account</h3>
         <button onclick="closeModal('staffModal')"
-          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+          style="background:none; border:none; color:var(--text-main); font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
       </div>
       <div id="staffMsg" style="display:none; padding:10px; border-radius:8px; margin-bottom:1rem; font-size:0.85rem;">
       </div>
@@ -10060,26 +10442,26 @@ try {
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Full
             Name</label>
           <input type="text" name="staff_name" required placeholder="e.g. Juan dela Cruz"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <div style="margin-bottom:1rem;">
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Email
             Address
             (Login)</label>
           <input type="email" name="email" required placeholder="juan@autoshop.com"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <div style="margin-bottom:1rem;">
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Temporary
             Password</label>
           <input type="text" name="password" required placeholder="TempPass123"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <div style="margin-bottom:1rem; display:grid; grid-template-columns:1fr 1fr; gap:10px;">
           <div>
             <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Mobile #</label>
             <input type="text" name="mobile" required placeholder="0912..."
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
           </div>
           <div>
             <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Role</label>
@@ -10106,7 +10488,7 @@ try {
         <div style="margin-bottom:1rem;">
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Complete Address</label>
           <input type="text" name="address" required placeholder="Street, City, Province"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <div style="margin-bottom:1rem; display:grid; grid-template-columns:1fr 1.2fr; gap:10px;">
           <div>
@@ -10218,11 +10600,11 @@ try {
   <div id="bayModal"
     style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
     <div
-      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:400px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
+      style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:24px; padding:2.5rem; width:100%; max-width:400px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
-        <h3 style="margin:0; font-size:1.3rem;">Register New Bay</h3>
+        <h3 style="margin:0; font-size:1.3rem; color:var(--text-main);">Register New Bay</h3>
         <button onclick="closeModal('bayModal')"
-          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+          style="background:none; border:none; color:var(--text-main); font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
       </div>
       <form id="addBayForm">
         <div style="margin-bottom:1.5rem;">
@@ -10230,7 +10612,7 @@ try {
             Name /
             Number</label>
           <input type="text" name="bay_name" required placeholder="e.g. Bay 3"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <button type="submit"
           style="width:100%; background:var(--accent); color:white; border:none; padding:1rem; border-radius:12px; font-size:1rem; font-weight:700; cursor:pointer; box-shadow:0 4px 15px var(--accent-glow);">Save
@@ -10272,12 +10654,12 @@ try {
             <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Full
               Name</label>
             <input type="text" name="mechanic_name" required placeholder="e.g. Cardo Dalisay"
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
           <div>
             <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Specialization</label>
             <input type="text" name="specialization" required placeholder="Engine / Paint"
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
         </div>
 
@@ -10576,10 +10958,15 @@ try {
 
   <script>
     window.openEditShiftModal = function (id, start, end, name, daysStr) {
-      document.getElementById('editShiftId').value = id;
-      document.getElementById('editShiftStart').value = start;
-      document.getElementById('editShiftEnd').value = end;
-      document.getElementById('editShiftName').innerText = name;
+      const idEl = document.getElementById('editShiftId');
+      const startEl = document.getElementById('editShiftStart');
+      const endEl = document.getElementById('editShiftEnd');
+      const nameEl = document.getElementById('editShiftName');
+      
+      if (idEl) idEl.value = id;
+      if (startEl) startEl.value = start;
+      if (endEl) endEl.value = end;
+      if (nameEl) nameEl.innerText = name;
 
       const selectedDays = (daysStr || 'Mon,Tue,Wed,Thu,Fri,Sat').split(',');
       document.querySelectorAll('.edit-shift-day-cb').forEach(cb => {
@@ -10708,23 +11095,23 @@ try {
   <div id="inventoryModal"
     style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
     <div
-      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:520px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
+      style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:24px; padding:2.5rem; width:100%; max-width:520px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
-        <h3 style="margin:0; font-size:1.3rem;">Receive Inventory Delivery</h3>
+        <h3 style="margin:0; font-size:1.3rem; color:var(--text-main);">Receive Inventory Delivery</h3>
         <button onclick="closeModal('inventoryModal')"
-          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+          style="background:none; border:none; color:var(--text-main); font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
       </div>
       <form id="addInventoryForm" style="display:flex; flex-direction:column; gap:12px;">
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
           <div>
             <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Item Code</label>
             <input type="text" name="item_code" placeholder="SKU-123" required
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
           <div>
             <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Brand</label>
             <input type="text" name="brand" placeholder="e.g. Bosch" required
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
         </div>
         <div>
@@ -10736,18 +11123,17 @@ try {
           <div>
             <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Cost Price (₱)</label>
             <input type="number" step="0.01" name="price" placeholder="0.00" required
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
           <div>
             <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Initial Qty</label>
             <input type="number" name="quantity" value="1" required
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
         </div>
-        <div style="margin-bottom:10px;">
-          <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Low Stock Alert @</label>
-          <input type="number" name="stock_threshold" value="5" required
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+        <div style="font-size:0.75rem; color:var(--text-dim); display:flex; align-items:center; gap:6px; margin:0.5rem 0 1rem 0;">
+          <i class="fas fa-info-circle" style="color:var(--accent);"></i>
+          <span>Low stock alert is fixed at <strong>less than 5</strong> items.</span>
         </div>
         <button type="submit"
           style="width:100%; background:var(--accent); color:white; border:none; padding:1.2rem; border-radius:12px; font-size:1.1rem; font-weight:800; cursor:pointer; margin-top:10px; box-shadow:0 10px 25px var(--accent-glow); transition:0.3s;">
@@ -10761,11 +11147,11 @@ try {
   <div id="stockAdjustmentModal"
     style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
     <div
-      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:450px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
+      style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:24px; padding:2.5rem; width:100%; max-width:450px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
         <h3 id="adjItemName" style="margin:0; font-size:1.2rem; color:var(--accent);">Adjust Stock</h3>
         <button onclick="closeModal('stockAdjustmentModal')"
-          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+          style="background:none; border:none; color:var(--text-main); font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
       </div>
       <form id="stockAdjustmentForm" style="display:flex; flex-direction:column; gap:15px;">
         <input type="hidden" name="item_id" id="adj_item_id">
@@ -10773,7 +11159,7 @@ try {
         <div>
           <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Physical Qty on Hand</label>
           <input type="number" name="quantity" id="adj_quantity" required
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem; border-radius:12px; font-size:1.1rem; font-weight:800; outline:none; box-sizing:border-box;">
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem; border-radius:12px; font-size:1.1rem; font-weight:800; outline:none; box-sizing:border-box;">
           <p style="font-size:0.7rem; color:var(--text-dim); margin-top:5px;">Update this if the actual count in your
             shelf is different.</p>
         </div>
@@ -10781,14 +11167,11 @@ try {
         <div>
           <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Selling Price (₱)</label>
           <input type="number" step="0.01" name="price" id="adj_price" required
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem; border-radius:12px; font-size:1rem; outline:none; box-sizing:border-box;">
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem; border-radius:12px; font-size:1rem; outline:none; box-sizing:border-box;">
         </div>
-
-        <div>
-          <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Stock Alert
-            Threshold</label>
-          <input type="number" name="stock_threshold" id="adj_threshold" required
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem; border-radius:12px; font-size:1rem; outline:none; box-sizing:border-box;">
+        <div style="font-size:0.75rem; color:var(--text-dim); display:flex; align-items:center; gap:6px; margin:0.5rem 0 1rem 0;">
+          <i class="fas fa-info-circle" style="color:var(--accent);"></i>
+          <span>Low stock alert is fixed at <strong>less than 5</strong> items.</span>
         </div>
 
         <button type="submit"
@@ -10803,13 +11186,18 @@ try {
     window.openStockAdjustmentModal = function (itemId) {
       fetch(`tenant-dashboard.php?action=fetch_item_details&item_id=${itemId}`)
         .then(r => r.json()).then(item => {
-          if (!item) return;
-          document.getElementById('adjItemName').innerText = `Adjust: ${item.item_name}`;
-          document.getElementById('adj_item_id').value = item.item_id;
-          document.getElementById('adj_quantity').value = item.quantity;
-          document.getElementById('adj_price').value = item.price;
-          document.getElementById('adj_threshold').value = item.stock_threshold;
-          openModal('stockAdjustmentModal');
+          if (item) {
+            const idEl = document.getElementById('adj_item_id');
+            const qtyEl = document.getElementById('adj_quantity');
+            const prEl = document.getElementById('adj_price');
+            const nameEl = document.getElementById('adjItemName');
+
+            if (nameEl) nameEl.innerText = `Adjust: ${item.item_name}`;
+            if (idEl) idEl.value = item.item_id;
+            if (qtyEl) qtyEl.value = item.quantity;
+            if (prEl) prEl.value = item.price;
+            openModal('stockAdjustmentModal');
+          }
         });
     };
 
@@ -10848,11 +11236,11 @@ try {
   <div id="vehicleModal"
     style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
     <div
-      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:480px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
+      style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:24px; padding:2.5rem; width:100%; max-width:480px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
-        <h3 style="margin:0; font-size:1.3rem;">Register New Vehicle</h3>
+        <h3 style="margin:0; font-size:1.3rem; color:var(--text-main);">Register New Vehicle</h3>
         <button onclick="closeModal('vehicleModal')"
-          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+          style="background:none; border:none; color:var(--text-main); font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
       </div>
       <form id="addVehicleForm">
         <div style="margin-bottom:1rem;">
@@ -10881,18 +11269,18 @@ try {
             <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Make
               (Brand)</label>
             <input type="text" name="make" required placeholder="Toyota"
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
           </div>
           <div>
             <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Model</label>
             <input type="text" name="model" placeholder="Vios"
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
           </div>
         </div>
         <div style="margin-bottom:1.5rem;">
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Year</label>
           <input type="number" name="year" value="<?php echo date('Y'); ?>"
-            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <button type="submit"
           style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1rem; border-radius:12px; font-weight:700; cursor:pointer;">Register
@@ -10903,13 +11291,13 @@ try {
   <div id="customerProfileModal"
     style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
     <div
-      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:850px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
+      style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:24px; padding:2.5rem; width:100%; max-width:850px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
       <div
         style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem; border-bottom:1px solid var(--glass-border); padding-bottom:1rem;">
         <h3 style="margin:0; font-size:1.5rem;"><i class="fas fa-user-circle"></i> Customer
           Profile</h3>
         <button onclick="closeModal('customerProfileModal')"
-          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+          style="background:none; border:none; color:var(--text-main); font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
       </div>
       <div id="profileModalContent">
         <!-- Data loaded via AJAX -->
@@ -10919,13 +11307,13 @@ try {
   <div id="bayProfileModal"
     style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:9999; align-items:center; justify-content:center;">
     <div
-      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:850px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
+      style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:24px; padding:2.5rem; width:100%; max-width:850px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
       <div
         style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem; border-bottom:1px solid var(--glass-border); padding-bottom:1rem;">
         <h3 style="margin:0; font-size:1.5rem;"><i class="fas fa-warehouse"></i> Bay Information
         </h3>
         <button onclick="closeModal('bayProfileModal')"
-          style="background:none; border:none; color:white; font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
+          style="background:none; border:none; color:var(--text-main); font-size:1.8rem; cursor:pointer; line-height:1;">&times;</button>
       </div>
       <div id="bayProfileModalContent">
         <!-- Data loaded via AJAX -->
@@ -11560,11 +11948,11 @@ try {
             return `
                 <tr>
                   <td>
-                    <div style="font-weight:800; color:#fff;">${dateStr}</div>
+                    <div style="font-weight:800; color:var(--text-main);">${dateStr}</div>
                     <div style="font-size:0.8rem; color:var(--accent); font-weight:700;"><i class="far fa-clock"></i> ${timeStr}</div>
                   </td>
                   <td>
-                    <div style="font-weight:700; color:#fff;">${a.customer_name}</div>
+                    <div style="font-weight:700; color:var(--text-main);">${a.customer_name}</div>
                     <div style="font-size:0.75rem; color:var(--text-dim);">Customer ID: #${a.customer_id}</div>
                   </td>
                   <td>
@@ -11939,7 +12327,7 @@ try {
         .then(res => {
           let html = '';
           res.forEach(item => {
-            const low = parseInt(item.quantity) < 10;
+            const low = parseInt(item.quantity) < 5;
             html += `<tr class="inventory-lookup-row">
               <td style="font-weight:700;">${item.item_name}</td>
               <td>${item.brand || '-'}</td>
@@ -11981,7 +12369,9 @@ try {
     }
 
     function saveStaffAnnEdit() {
-      const val = document.getElementById('staffAnnInput').value;
+      const inputEl = document.getElementById('staffAnnInput');
+      if (!inputEl) return;
+      const val = inputEl.value;
       if (!val.trim()) return alert("Please type an announcement.");
 
       const fd = new FormData();
@@ -12249,7 +12639,37 @@ try {
           icon.className = 'fas fa-chevron-left';
         }
       }
+      localStorage.setItem('sidebarCollapsed', document.body.classList.contains('sidebar-collapsed'));
     };
+
+    window.toggleTheme = function () {
+      const current = document.documentElement.getAttribute('data-theme') || 'dark';
+      const target = current === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', target);
+      localStorage.setItem('tenant_theme', target);
+      updateThemeUI();
+    };
+
+    function updateThemeUI() {
+      const theme = document.documentElement.getAttribute('data-theme') || 'dark';
+      const btn = document.getElementById('themeToggle');
+      if (btn) {
+        const icon = btn.querySelector('i');
+        const label = btn.querySelector('.nav-label');
+        if (theme === 'light') {
+          icon.className = 'fas fa-sun';
+          label.innerText = 'Light Mode';
+        } else {
+          icon.className = 'fas fa-moon';
+          label.innerText = 'Dark Mode';
+        }
+      }
+    }
+
+    // Initialize Theme
+    const savedTheme = localStorage.getItem('tenant_theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', savedTheme);
+    document.addEventListener('DOMContentLoaded', updateThemeUI);
 
     // Initialize View on Load
     document.addEventListener('DOMContentLoaded', () => {
@@ -12354,11 +12774,11 @@ try {
             const displayModel = (j.make || j.model) ? `${j.make} ${j.model}`.trim() : 'Manual Entry';
             return `
               <tr class="hover-bright">
-                <td style="padding: 1.2rem 1rem;"><span style="background:rgba(255,255,255,0.05); padding:6px 12px; border-radius:8px; border:1px solid rgba(255,255,255,0.1); font-family:monospace; color:var(--accent); font-weight:800; font-size:0.85rem; letter-spacing:1px;">${j.plate_no}</span></td>
-                <td style="padding: 1.2rem 1rem;"><div style="font-weight:700; font-size:0.95rem; margin-bottom:4px; color:#fff;">${displayModel}</div><div style="opacity:0.6; font-size:0.75rem; display:flex; align-items:center; gap:5px;"><i class="fas fa-user-circle"></i> ${j.customer_name}</div></td>
-                <td style="padding: 1.2rem 1rem;"><span style="color:var(--text-dim); font-size:0.85rem; background:rgba(255,255,255,0.02); padding:4px 8px; border-radius:6px;">${j.service_name}</span></td>
+                <td style="padding: 1.2rem 1rem;"><span style="background:var(--glass); padding:6px 12px; border-radius:8px; border:1px solid var(--glass-border); font-family:monospace; color:var(--accent); font-weight:800; font-size:0.85rem; letter-spacing:1px;">${j.plate_no}</span></td>
+                <td style="padding: 1.2rem 1rem;"><div style="font-weight:700; font-size:0.95rem; margin-bottom:4px; color:var(--text-main);">${displayModel}</div><div style="opacity:0.6; font-size:0.75rem; display:flex; align-items:center; gap:5px;"><i class="fas fa-user-circle"></i> ${j.customer_name}</div></td>
+                <td style="padding: 1.2rem 1rem;"><span style="color:var(--text-dim); font-size:0.85rem; background:var(--glass); padding:4px 8px; border-radius:6px;">${j.service_name}</span></td>
                 <td style="padding: 1.2rem 1rem;"><small style="color:var(--text-dim);"><i class="far fa-clock"></i> ${new Date(j.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</small></td>
-                <td style="padding: 1.2rem 1rem; font-weight:800; color:white; font-size:1.1rem;">₱${parseFloat(j.total_amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                <td style="padding: 1.2rem 1rem; font-weight:800; color:var(--text-main); font-size:1.1rem;">₱${parseFloat(j.total_amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
                 <td style="padding: 1.2rem 1rem;"><span class="badge ${statusClass}" style="padding: 6px 12px; font-size: 0.7rem; font-weight: 800;">${j.status}</span></td>
                 <td style="padding: 1.2rem 1rem;">
                   <button class="btn-action" style="padding:8px 16px; font-size:0.75rem; background:rgba(var(--accent-rgb), 0.1); color:var(--accent); border:1px solid rgba(var(--accent-rgb), 0.2); border-radius:10px; cursor:pointer; font-weight:700; transition:0.3s;" 
@@ -12441,19 +12861,19 @@ try {
 
           const c = data.customer;
           const vehiclesHtml = data.vehicles.length ? data.vehicles.map(v => `
-                <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); padding:1rem; border-radius:15px; margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
+                <div style="background:var(--input-bg); border:1px solid var(--glass-border); padding:1rem; border-radius:15px; margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
                   <div>
                     <div style="font-weight:800; color:var(--text-main); font-size:1.1rem;">${v.plate_no}</div>
-                    <div style="font-size:0.85rem; opacity:0.7;">${v.make} ${v.model} (${v.year || ''})</div>
+                    <div style="font-size:0.85rem; color:var(--text-dim); opacity:0.8;">${v.make} ${v.model} (${v.year || ''})</div>
                   </div>
                   <button class="btn-outline" style="padding:4px 10px; font-size:0.7rem;" onclick="window.openVehicleProfile(${v.vehicle_id})">View History</button>
                 </div>
               `).join('') : '<div style="text-align:center; padding:1rem; opacity:0.5; border:1px dashed rgba(255,255,255,0.1); border-radius:10px;">No vehicles found</div>';
 
           const apptsHtml = data.appointments.length ? data.appointments.map(a => `
-                <div style="padding:1rem; border-bottom:1px solid rgba(255,255,255,0.05); display:flex; justify-content:space-between; align-items:center;">
+                <div style="padding:1rem; border-bottom:1px solid var(--glass-border); display:flex; justify-content:space-between; align-items:center;">
                   <div>
-                    <div style="font-size:0.95rem; font-weight:700;">${a.service_name || 'Repair Job'}</div>
+                    <div style="font-size:0.95rem; font-weight:700; color:var(--text-main);">${a.service_name || 'Repair Job'}</div>
                     <div style="font-size:0.75rem; color:var(--text-dim);">${new Date(a.appointment_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</div>
                   </div>
                   <span class="badge badge-active" style="font-size:0.7rem;">${a.status}</span>
@@ -12462,17 +12882,17 @@ try {
 
           body.innerHTML = `
                 <div style="display:grid; grid-template-columns:320px 1fr; gap:2.5rem;">
-                  <div style="background:rgba(255,255,255,0.02); padding:2rem; border-radius:20px; border:1px solid rgba(255,255,255,0.05);">
-                    <div style="width:100px; height:100px; border-radius:25px; background:var(--accent); margin:0 auto 1.5rem; display:flex; align-items:center; justify-content:center; font-size:3rem; font-weight:900; color:white; box-shadow:0 10px 20px rgba(0,0,0,0.3);">
+                  <div style="background:var(--input-bg); padding:2rem; border-radius:20px; border:1px solid var(--glass-border);">
+                    <div style="width:100px; height:100px; border-radius:25px; background:var(--accent); margin:0 auto 1.5rem; display:flex; align-items:center; justify-content:center; font-size:3rem; font-weight:900; color:white; box-shadow:0 10px 20px rgba(0,0,0,0.1);">
                       ${c.full_name.charAt(0).toUpperCase()}
                     </div>
-                    <h3 style="text-align:center; margin-bottom:0.5rem; font-size:1.5rem;">${c.full_name}</h3>
+                    <h3 style="text-align:center; margin-bottom:0.5rem; font-size:1.5rem; color:var(--text-main);">${c.full_name}</h3>
                     <div style="text-align:center; margin-bottom:2rem;"><span class="badge badge-active">LIFETIME CUSTOMER</span></div>
                     
                     <div style="display:flex; flex-direction:column; gap:15px;">
-                      <div style="display:flex; align-items:center; gap:10px;"><i class="fas fa-envelope" style="width:20px; color:var(--accent);"></i> <span style="font-size:0.9rem;">${c.email || 'No email set'}</span></div>
-                      <div style="display:flex; align-items:center; gap:10px;"><i class="fas fa-phone" style="width:20px; color:var(--accent);"></i> <span style="font-size:0.9rem; font-weight:700;">${c.mobile}</span></div>
-                      <div style="display:flex; align-items:center; gap:10px;"><i class="fas fa-map-marker-alt" style="width:20px; color:var(--accent);"></i> <span style="font-size:0.85rem; opacity:0.8;">${c.address || 'Address not provided'}</span></div>
+                      <div style="display:flex; align-items:center; gap:10px;"><i class="fas fa-envelope" style="width:20px; color:var(--accent);"></i> <span style="font-size:0.9rem; color:var(--text-main);">${c.email || 'No email set'}</span></div>
+                      <div style="display:flex; align-items:center; gap:10px;"><i class="fas fa-phone" style="width:20px; color:var(--accent);"></i> <span style="font-size:0.9rem; font-weight:700; color:var(--text-main);">${c.mobile}</span></div>
+                      <div style="display:flex; align-items:center; gap:10px;"><i class="fas fa-map-marker-alt" style="width:20px; color:var(--accent);"></i> <span style="font-size:0.85rem; opacity:0.8; color:var(--text-main);">${c.address || 'Address not provided'}</span></div>
                     </div>
                     <div style="margin-top:2.5rem;">
                       <h4 style="font-size:0.8rem; text-transform:uppercase; letter-spacing:1px; color:var(--text-dim); margin-bottom:1rem;">Registered Vehicles</h4>
@@ -12484,7 +12904,7 @@ try {
                       <h4 style="margin:0; font-size:1.2rem; font-weight:800;"><i class="fas fa-calendar-check" style="color:var(--accent); margin-right:8px;"></i> Recent Activities</h4>
                       <div style="font-size:0.8rem; color:var(--text-dim);">Total Visits: <span style="color:var(--accent); font-weight:800;">${c.total_visits || 0}</span></div>
                     </div>
-                    <div style="background:rgba(0,0,0,0.2); border-radius:20px; border:1px solid rgba(255,255,255,0.05); min-height:400px; max-height:500px; overflow-y:auto;">
+                    <div style="background:var(--input-bg); border-radius:20px; border:1px solid var(--glass-border); min-height:400px; max-height:500px; overflow-y:auto;">
                       ${apptsHtml}
                     </div>
                   </div>
@@ -12511,9 +12931,9 @@ try {
           }
           const v = data[0];
           const historyHtml = data.map(h => `
-                <div style="padding:1rem; border-bottom:1px solid rgba(255,255,255,0.05); display:flex; justify-content:space-between; align-items:center;">
+                <div style="padding:1rem; border-bottom:1px solid var(--glass-border); display:flex; justify-content:space-between; align-items:center;">
                   <div>
-                    <div style="font-size:0.95rem; font-weight:700;">${h.service_name || 'Repair Job'}</div>
+                    <div style="font-size:0.95rem; font-weight:700; color:var(--text-main);">${h.service_name || 'Repair Job'}</div>
                     <div style="font-size:0.75rem; color:var(--text-dim);">${new Date(h.created_at).toLocaleDateString()} - Mechanic: ${h.mechanic_name}</div>
                   </div>
                   <span class="badge badge-active">${h.status}</span>
@@ -12735,57 +13155,103 @@ try {
   </div>
   </div>
 
-  <!-- Chat Support Sidebar Panel -->
-  <div id="chatOverlay" onclick="toggleChat()"
-    style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9998; transition:opacity 0.3s;">
+  <!-- Chat Support Centered Modal -->
+  <div id="chatOverlay" onclick="toggleChat()" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.65); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); z-index:9998; transition:opacity 0.3s ease;">
   </div>
-  <div id="supportChatWidget"
-    style="position:fixed; top:0; right:-420px; width:400px; height:100vh; z-index:9999; background:var(--bg-deep); border-left:1px solid var(--glass-border); box-shadow:-10px 0 40px rgba(0,0,0,0.5); display:flex; flex-direction:column; transition:right 0.3s ease;">
+  <div id="supportChatWidget" style="position:fixed; top:50%; left:50%; width:90%; max-width:650px; height:80vh; max-height:680px; z-index:9999; background:rgba(18,18,24,0.92); backdrop-filter:blur(25px); -webkit-backdrop-filter:blur(25px); border:1px solid var(--glass-border); border-radius:24px; box-shadow:0 25px 60px rgba(0,0,0,0.65); display:flex; flex-direction:column; transform:translate(-50%, -50%) scale(0.92); opacity:0; pointer-events:none; visibility:hidden; transition:all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);">
     <style>
-      @keyframes chatPulse {
-        0% {
-          transform: scale(1);
-          box-shadow: 0 0 0 0 rgba(255, 71, 87, 0.7);
-        }
-
-        70% {
-          transform: scale(1.1);
-          box-shadow: 0 0 0 10px rgba(255, 71, 87, 0);
-        }
-
-        100% {
-          transform: scale(1);
-          box-shadow: 0 0 0 0 rgba(255, 71, 87, 0);
-        }
+      :root {
+        --accent: #6366f1;
+        --bg-dark: rgba(0,0,0,0.4);
+        --glass-bg: rgba(255,255,255,0.08);
+        --glass-border: rgba(255,255,255,0.12);
+        --text-primary: #fff;
+        --text-dim: #cbd5e1;
       }
+      .chat-header {
+        background: var(--accent);
+        padding: 1.6rem 2rem;
+        color: var(--text-primary);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-top-left-radius: 24px;
+        border-top-right-radius: 24px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+      }
+      .chat-header h4 {
+        margin:0; font-size:1.15rem; font-weight:800; display:flex; align-items:center; gap:10px;
+      }
+      .chat-header span {
+        font-size:0.78rem; opacity:0.85; letter-spacing:0.5px;
+      }
+      .chat-close {
+        width:38px; height:38px; border-radius:50%;
+        background:rgba(255,255,255,0.12);
+        display:flex; align-items:center; justify-content:center;
+        cursor:pointer; transition:background 0.2s;
+      }
+      .chat-close:hover {background:rgba(255,255,255,0.25);}
+      .chat-messages {
+        flex:1; padding:1.6rem; overflow-y:auto;
+        display:flex; flex-direction:column; gap:14px;
+        background:rgba(0,0,0,0.15);
+      }
+      .chat-msg {
+        display:flex; align-items:flex-start; gap:12px; animation:fadeIn 0.3s ease;
+      }
+      .chat-msg.me {flex-direction:row-reverse;}
+      .avatar {
+        width:36px; height:36px; border-radius:50%;
+        overflow:hidden; box-shadow:0 3px 10px rgba(0,0,0,0.25);
+        background:var(--glass-bg);
+        flex-shrink:0; display:flex; align-items:center; justify-content:center;
+      }
+      .avatar img {width:100%; height:100%; object-fit:cover;}
+      .msg-bubble {
+        max-width:70%; padding:0.85rem 1.2rem;
+        border-radius:16px; background:var(--glass-bg);
+        color:var(--text-primary); font-size:0.92rem;
+        box-shadow:inset 0 2px 8px rgba(0,0,0,0.2);
+      }
+      .msg-bubble.me {background:linear-gradient(135deg, #6366f1, #4f46e5); color:#fff;}
+      .chat-input {
+        padding:1.5rem 1.9rem; border-top:1px solid var(--glass-border);
+        display:flex; align-items:center; gap:14px; background:rgba(0,0,0,0.1);
+        border-bottom-left-radius:24px; border-bottom-right-radius:24px;
+      }
+      #chatInput {
+        flex:1; background:rgba(255,255,255,0.05); border:1px solid var(--glass-border);
+        border-radius:14px; padding:0.85rem 1.2rem; color:var(--text-primary);
+        font-size:0.92rem; outline:none; resize:none; min-height:46px; max-height:120px;
+        transition:0.2s; box-shadow:inset 0 2px 8px rgba(0,0,0,0.2);
+      }
+      .send-btn {
+        background:var(--accent); border:none; width:46px; height:46px; border-radius:14px;
+        color:#fff; cursor:pointer; transition:transform 0.2s ease-out; display:flex; align-items:center; justify-content:center;
+        box-shadow:0 4px 15px rgba(0,0,0,0.2);
+      }
+      .send-btn:hover {transform:scale(1.08);}
+      @keyframes fadeIn {0%{opacity:0;transform:translateY(6px);}100%{opacity:1;transform:translateY(0);}}
     </style>
-
     <!-- Header -->
-    <div
-      style="background:var(--accent); padding:1.5rem; color:white; display:flex; justify-content:space-between; align-items:center; flex-shrink:0;">
+    <div class="chat-header">
       <div>
-        <h4 style="margin:0; font-size:1.1rem; font-weight:800;"><i class="fas fa-headset"
-            style="margin-right:8px;"></i>Support Chat</h4>
-        <span style="font-size:0.7rem; opacity:0.8;">Platform Administrator</span>
+        <h4><i class="fas fa-headset"></i>Support Center</h4>
+        <span>AutoFix Hub Platform Assistance</span>
       </div>
-      <i class="fas fa-times" onclick="toggleChat()" style="cursor:pointer; opacity:0.7; font-size:1.2rem;"></i>
+      <div class="chat-close" onclick="toggleChat()"><i class="fas fa-times" style="font-size:1.1rem; color:white;"></i></div>
     </div>
     <!-- Messages -->
-    <div id="chatMessages"
-      style="flex:1; padding:1.2rem; overflow-y:auto; display:flex; flex-direction:column; gap:12px; background:rgba(0,0,0,0.2);">
-      <div style="text-align:center; padding:2rem; color:var(--text-dim); font-size:0.8rem;">
+    <div id="chatMessages" class="chat-messages">
+      <div class="msg-placeholder" style="text-align:center; padding:2rem; color:var(--text-dim); font-size:0.8rem;">
         How can we help you today?
       </div>
     </div>
     <!-- Input -->
-    <div
-      style="padding:1.2rem; border-top:1px solid var(--glass-border); display:flex; align-items:flex-end; gap:10px; flex-shrink:0;">
-      <textarea id="chatInput" placeholder="Type a message..." rows="1"
-        style="flex:1; background:rgba(255,255,255,0.05); border:1px solid var(--glass-border); border-radius:12px; padding:0.8rem; color:white; font-size:0.9rem; outline:none; resize:none; font-family:inherit; min-height:45px; max-height:120px;"></textarea>
-      <button onclick="sendMessage()"
-        style="background:var(--accent); border:none; width:45px; height:45px; border-radius:12px; color:white; cursor:pointer; transition:0.3s; flex-shrink:0;">
-        <i class="fas fa-paper-plane"></i>
-      </button>
+    <div class="chat-input">
+      <textarea id="chatInput" placeholder="Type your message here..." rows="1"></textarea>
+      <button class="send-btn" onclick="sendMessage()"><i class="fas fa-paper-plane" style="font-size:1.1rem;"></i></button>
     </div>
     <!-- Hidden badge for JS compatibility -->
     <span id="tenantChatBadge" style="display:none;">0</span>
@@ -12799,9 +13265,17 @@ try {
       chatOpen = !chatOpen;
       const panel = document.getElementById('supportChatWidget');
       const overlay = document.getElementById('chatOverlay');
-      panel.style.right = chatOpen ? '0' : '-420px';
-      overlay.style.display = chatOpen ? 'block' : 'none';
+      
       if (chatOpen) {
+        overlay.style.display = 'block';
+        setTimeout(() => {
+          overlay.style.opacity = '1';
+          panel.style.opacity = '1';
+          panel.style.visibility = 'visible';
+          panel.style.pointerEvents = 'auto';
+          panel.style.transform = 'translate(-50%, -50%) scale(1)';
+        }, 10);
+        
         fetch('tenant-dashboard.php?action=mark_support_read'); // Mark as read on open
         document.getElementById('tenantChatBadge').style.display = 'none';
         const sBadge = document.getElementById('sidebarChatBadge');
@@ -12812,6 +13286,15 @@ try {
           box.scrollTop = box.scrollHeight;
           document.getElementById('chatInput').focus();
         }, 100);
+      } else {
+        panel.style.opacity = '0';
+        panel.style.visibility = 'hidden';
+        panel.style.pointerEvents = 'none';
+        panel.style.transform = 'translate(-50%, -50%) scale(0.92)';
+        overlay.style.opacity = '0';
+        setTimeout(() => {
+          overlay.style.display = 'none';
+        }, 300);
       }
     }
 
@@ -12842,28 +13325,198 @@ try {
     // Background polling every 10 seconds for notifications
     setInterval(fetchMessages, 10000);
 
+    function formatChatTime(dateStr) {
+      if (!dateStr) {
+        const now = new Date();
+        return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      }
+      const date = new Date(dateStr.replace(/-/g, '/'));
+      if (isNaN(date.getTime())) {
+        const now = new Date();
+        return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      }
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+
     function renderMessages(msgs) {
       const box = document.getElementById('chatMessages');
       const wasAtBottom = box.scrollHeight - box.clientHeight <= box.scrollTop + 10;
 
       box.innerHTML = msgs.length === 0 ? '<div style="text-align:center; padding:2rem; color:var(--text-dim); font-size:0.8rem;">How can we help you today?</div>' : '';
 
-      msgs.forEach(m => {
+      msgs.forEach((m, idx) => {
         const isMe = m.sender_role === 'TENANT';
-        const div = document.createElement('div');
-        div.style.alignSelf = isMe ? 'flex-end' : 'flex-start';
-        div.style.maxWidth = '80%';
-        div.style.padding = '10px 14px';
-        div.style.borderRadius = isMe ? '16px 16px 0 16px' : '16px 16px 16px 0';
-        div.style.background = isMe ? 'var(--accent)' : 'rgba(255,255,255,0.08)';
-        div.style.color = 'white';
-        div.style.fontSize = '0.85rem';
-        div.style.boxShadow = '0 5px 15px rgba(0,0,0,0.1)';
-        div.innerText = m.message;
-        box.appendChild(div);
+        const isRobot = !isMe && m.message.includes('[Auto-Reply]');
+        
+        // Time Gap Divider (30 minutes or more since last message)
+        if (idx > 0) {
+          const currentVal = new Date(m.created_at.replace(/-/g, '/'));
+          const prevVal = new Date(msgs[idx - 1].created_at.replace(/-/g, '/'));
+          if (!isNaN(currentVal.getTime()) && !isNaN(prevVal.getTime())) {
+            const diffMins = (currentVal - prevVal) / 60000;
+            if (diffMins >= 30) {
+              const divider = document.createElement('div');
+              divider.style.display = 'flex';
+              divider.style.alignItems = 'center';
+              divider.style.width = '100%';
+              divider.style.margin = '20px 0';
+              divider.style.color = 'rgba(255,255,255,0.25)';
+              divider.style.fontSize = '0.72rem';
+              divider.innerHTML = `
+                <div style="flex:1; height:1px; background:linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);"></div>
+                <span style="padding:0 12px; font-weight:600; letter-spacing:0.5px; color:rgba(255,255,255,0.45);">${formatChatTime(m.created_at)}</span>
+                <div style="flex:1; height:1px; background:linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);"></div>
+              `;
+              box.appendChild(divider);
+            }
+          }
+        }
+
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.flexDirection = isMe ? 'row-reverse' : 'row';
+        row.style.alignItems = 'flex-start';
+        row.style.gap = '10px';
+        row.style.marginBottom = '15px';
+        row.style.width = '100%';
+
+        const avatar = document.createElement('div');
+        avatar.style.width = '32px';
+        avatar.style.height = '32px';
+        avatar.style.borderRadius = '50%';
+        avatar.style.display = 'flex';
+        avatar.style.alignItems = 'center';
+        avatar.style.justifyContent = 'center';
+        avatar.style.flexShrink = '0';
+        avatar.style.boxShadow = '0 3px 10px rgba(0,0,0,0.15)';
+        avatar.style.overflow = 'hidden';
+        
+        if (isMe) {
+          const myPfp = m.sender_avatar || m.logo_url;
+          if (myPfp) {
+            avatar.style.background = 'transparent';
+            avatar.innerHTML = `<img src="${myPfp}" style="width:100%; height:100%; object-fit:cover; border-radius:50%;">`;
+          } else {
+            avatar.style.background = 'linear-gradient(135deg, #3b82f6, #1d4ed8)';
+            avatar.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px; height:14px; color:white;"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v-2"></path><circle cx="12" cy="7" r="4"></circle></svg>`;
+          }
+        } else if (isRobot) {
+          avatar.style.background = 'linear-gradient(135deg, #10b981, #047857)';
+          avatar.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px; height:14px; color:white;"><rect x="3" y="11" width="18" height="10" rx="2"></rect><circle cx="12" cy="5" r="2"></circle><path d="M12 7v4M8 16h.01M16 16h.01"></path></svg>`;
+        } else {
+          const adminPfp = m.sender_avatar;
+          if (adminPfp) {
+            avatar.style.background = 'transparent';
+            avatar.innerHTML = `<img src="${adminPfp}" style="width:100%; height:100%; object-fit:cover; border-radius:50%;">`;
+          } else {
+            avatar.style.background = 'linear-gradient(135deg, #6366f1, #4f46e5)';
+            avatar.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px; height:14px; color:white;"><path d="M3 18v-6a9 9 0 0 1 18 0v6"></path><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"></path></svg>`;
+          }
+        }
+
+        const contentContainer = document.createElement('div');
+        contentContainer.style.display = 'flex';
+        contentContainer.style.flexDirection = 'column';
+        contentContainer.style.alignItems = isMe ? 'flex-end' : 'flex-start';
+        contentContainer.style.maxWidth = '75%';
+
+        const bubble = document.createElement('div');
+        bubble.style.padding = '10px 14px';
+        bubble.style.borderRadius = isMe ? '16px 16px 0 16px' : '16px 16px 16px 0';
+        bubble.style.background = isMe ? 'var(--accent)' : 'rgba(255,255,255,0.08)';
+        bubble.style.color = 'white';
+        bubble.style.fontSize = '0.85rem';
+        bubble.style.boxShadow = '0 5px 15px rgba(0,0,0,0.1)';
+        bubble.style.lineHeight = '1.4';
+        bubble.innerText = isRobot ? m.message.replace(/🤖\s*\[Auto-Reply\]\s*/i, '') : m.message;
+
+        const timeVal = formatChatTime(m.created_at);
+        const timeSpan = document.createElement('span');
+        timeSpan.style.fontSize = '0.7rem';
+        timeSpan.style.color = 'rgba(255,255,255,0.4)';
+        timeSpan.style.marginTop = '4px';
+        timeSpan.style.padding = '0 4px';
+        timeSpan.innerText = isRobot ? `🤖 Auto-Reply • ${timeVal}` : timeVal;
+
+        contentContainer.appendChild(bubble);
+        contentContainer.appendChild(timeSpan);
+        row.appendChild(avatar);
+        row.appendChild(contentContainer);
+        box.appendChild(row);
       });
 
       if (wasAtBottom) box.scrollTop = box.scrollHeight;
+    }
+
+    // Inject typing indicator CSS
+    if (!document.getElementById('typingIndicatorStyles')) {
+      const style = document.createElement('style');
+      style.id = 'typingIndicatorStyles';
+      style.innerHTML = `
+        @keyframes typingBlink {
+          0% { opacity: 0.2; }
+          20% { opacity: 1; }
+          100% { opacity: 0.2; }
+        }
+        .typing-dot {
+          font-weight: bold;
+          font-size: 1.2rem;
+          line-height: 0.8;
+        }
+      `;
+      document.head.appendChild(style);
+    }
+
+    function showTypingIndicator() {
+      const box = document.getElementById('chatMessages');
+      if (document.getElementById('chatTypingIndicator')) return;
+      
+      const row = document.createElement('div');
+      row.id = 'chatTypingIndicator';
+      row.style.display = 'flex';
+      row.style.flexDirection = 'row';
+      row.style.alignItems = 'flex-start';
+      row.style.gap = '10px';
+      row.style.marginBottom = '15px';
+      row.style.width = '100%';
+
+      const avatar = document.createElement('div');
+      avatar.style.width = '32px';
+      avatar.style.height = '32px';
+      avatar.style.borderRadius = '50%';
+      avatar.style.display = 'flex';
+      avatar.style.alignItems = 'center';
+      avatar.style.justifyContent = 'center';
+      avatar.style.flexShrink = '0';
+      avatar.style.background = 'linear-gradient(135deg, #6366f1, #4f46e5)';
+      avatar.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px; height:14px; color:white;"><path d="M3 18v-6a9 9 0 0 1 18 0v6"></path><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"></path></svg>`;
+
+      const bubble = document.createElement('div');
+      bubble.style.padding = '10px 14px';
+      bubble.style.borderRadius = '16px 16px 16px 0';
+      bubble.style.background = 'rgba(255,255,255,0.08)';
+      bubble.style.color = 'rgba(255,255,255,0.6)';
+      bubble.style.fontSize = '0.85rem';
+      bubble.style.boxShadow = '0 5px 15px rgba(0,0,0,0.1)';
+      bubble.style.display = 'flex';
+      bubble.style.alignItems = 'center';
+      bubble.style.gap = '5px';
+      bubble.innerHTML = `
+        <span>Support is typing</span>
+        <span class="typing-dot" style="animation: typingBlink 1.4s infinite both; animation-delay: 0s;">.</span>
+        <span class="typing-dot" style="animation: typingBlink 1.4s infinite both; animation-delay: 0.2s;">.</span>
+        <span class="typing-dot" style="animation: typingBlink 1.4s infinite both; animation-delay: 0.4s;">.</span>
+      `;
+
+      row.appendChild(avatar);
+      row.appendChild(bubble);
+      box.appendChild(row);
+      box.scrollTop = box.scrollHeight;
+    }
+
+    function removeTypingIndicator() {
+      const el = document.getElementById('chatTypingIndicator');
+      if (el) el.remove();
     }
 
     document.getElementById('chatInput').onkeypress = (e) => {
@@ -12889,17 +13542,86 @@ try {
       const fd = new FormData();
       fd.append('message', msg);
 
+      // Optimistic Render: add tenant's message immediately
+      const box = document.getElementById('chatMessages');
+      
+      const row = document.createElement('div');
+      row.style.display = 'flex';
+      row.style.flexDirection = 'row-reverse';
+      row.style.alignItems = 'flex-start';
+      row.style.gap = '10px';
+      row.style.marginBottom = '15px';
+      row.style.width = '100%';
+
+      const avatar = document.createElement('div');
+      avatar.style.width = '32px';
+      avatar.style.height = '32px';
+      avatar.style.borderRadius = '50%';
+      avatar.style.display = 'flex';
+      avatar.style.alignItems = 'center';
+      avatar.style.justifyContent = 'center';
+      avatar.style.flexShrink = '0';
+      avatar.style.background = 'linear-gradient(135deg, #3b82f6, #1d4ed8)';
+      avatar.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px; height:14px; color:white;"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v-2"></path><circle cx="12" cy="7" r="4"></circle></svg>`;
+
+      const contentContainer = document.createElement('div');
+      contentContainer.style.display = 'flex';
+      contentContainer.style.flexDirection = 'column';
+      contentContainer.style.alignItems = 'flex-end';
+      contentContainer.style.maxWidth = '75%';
+
+      const bubble = document.createElement('div');
+      bubble.style.padding = '10px 14px';
+      bubble.style.borderRadius = '16px 16px 0 16px';
+      bubble.style.background = 'var(--accent)';
+      bubble.style.color = 'white';
+      bubble.style.fontSize = '0.85rem';
+      bubble.style.boxShadow = '0 5px 15px rgba(0,0,0,0.1)';
+      bubble.innerText = msg;
+
+      const timeVal = formatChatTime(null);
+      const timeSpan = document.createElement('span');
+      timeSpan.style.fontSize = '0.7rem';
+      timeSpan.style.color = 'rgba(255,255,255,0.4)';
+      timeSpan.style.marginTop = '4px';
+      timeSpan.style.padding = '0 4px';
+      timeSpan.innerText = timeVal;
+
+      contentContainer.appendChild(bubble);
+      contentContainer.appendChild(timeSpan);
+      row.appendChild(avatar);
+      row.appendChild(contentContainer);
+
+      if (box.innerHTML.includes('How can we help you today?')) {
+        box.innerHTML = '';
+      }
+      
+      box.appendChild(row);
+      box.scrollTop = box.scrollHeight;
+
       input.value = '';
       input.style.height = '45px'; // Reset height
+      
       fetch('tenant-dashboard.php?action=send_support_message', { method: 'POST', body: fd })
         .then(r => r.json())
         .then(data => {
-          if (data.status === 'success') fetchMessages();
-          else alert(data.message);
+          if (data.status === 'success') {
+            if (data.auto_reply) {
+              setTimeout(() => {
+                showTypingIndicator();
+                setTimeout(() => {
+                  removeTypingIndicator();
+                  fetchMessages();
+                }, 1500);
+              }, 400);
+            } else {
+              fetchMessages();
+            }
+          } else {
+            alert(data.message);
+          }
         });
     }
-
-    document.getElementById('chatInput').onkeypress = (e) => { if (e.key === 'Enter') sendMessage(); };
 
     // Handle external triggers (e.g. from shop.php suspension)
     window.addEventListener('load', () => {
@@ -12969,6 +13691,306 @@ try {
 
   <script>
     window.revenueChartInstance = null;
+    window.globalShopName = "<?php echo addslashes($shop_name ?? 'AutoFix Hub Shop'); ?>";
+    window.currentReportType = null;
+    window.currentReportData = null;
+
+    window.exportReportPDF = function () {
+      const type = window.currentReportType;
+      const data = window.currentReportData;
+      if (!data) {
+        alert("No data available to export.");
+        return;
+      }
+
+      const shopName = window.globalShopName || "AutoFix Hub Shop";
+
+      if (typeof html2pdf === 'undefined') {
+        const btn = document.getElementById('btnExportPDF');
+        const origText = btn.innerHTML;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading PDF Engine...';
+        btn.disabled = true;
+
+        const script = document.createElement('script');
+        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js';
+        script.onload = () => {
+          btn.innerHTML = origText;
+          btn.disabled = false;
+          runExport();
+        };
+        script.onerror = () => {
+          btn.innerHTML = origText;
+          btn.disabled = false;
+          alert("Failed to load PDF engine. Please check your internet connection.");
+        };
+        document.head.appendChild(script);
+      } else {
+        runExport();
+      }
+
+      function runExport() {
+        const printDiv = document.createElement('div');
+        printDiv.style.padding = '40px';
+        printDiv.style.fontFamily = "'Inter', sans-serif";
+        printDiv.style.color = '#1e293b';
+        printDiv.style.background = '#ffffff';
+
+        let reportTitle = '';
+        if (type === 'revenue') reportTitle = '7-Day Revenue Analytics';
+        else if (type === 'performance') reportTitle = 'Service Performance Report';
+        else if (type === 'inventory') reportTitle = 'Inventory Status & Stock Log';
+        else if (type === 'mechanic') reportTitle = 'Mechanic Performance Report';
+
+        let html = `
+          <div style="border-bottom: 2px solid #3b82f6; padding-bottom: 20px; margin-bottom: 30px; display: flex; justify-content: space-between; align-items: flex-end;">
+            <div>
+              <h1 style="margin: 0; font-size: 24px; font-weight: 800; color: #1e3a8a; text-transform: uppercase; font-family:'Inter', sans-serif;">${reportTitle}</h1>
+              <p style="margin: 5px 0 0 0; font-size: 14px; color: #64748b;">Business Intelligence & Performance Report</p>
+            </div>
+            <div style="text-align: right;">
+              <h3 style="margin: 0; font-size: 16px; font-weight: 700; color: #1e293b; font-family:'Inter', sans-serif;">${shopName}</h3>
+              <p style="margin: 5px 0 0 0; font-size: 12px; color: #64748b;">Generated: ${new Date().toLocaleString()}</p>
+            </div>
+          </div>
+        `;
+
+        if (type === 'revenue' && window.revenueChartInstance) {
+          try {
+            const canvas = document.createElement('canvas');
+            canvas.width = 600;
+            canvas.height = 250;
+            canvas.style.display = 'none';
+            document.body.appendChild(canvas);
+            
+            const tempCtx = canvas.getContext('2d');
+            const tempChart = new Chart(tempCtx, {
+              type: 'line',
+              data: {
+                labels: data.map(row => row.date),
+                datasets: [{
+                  label: 'Daily Revenue (₱)',
+                  data: data.map(row => row.total),
+                  borderColor: '#1d4ed8',
+                  backgroundColor: 'rgba(29, 78, 216, 0.05)',
+                  borderWidth: 3,
+                  fill: true,
+                  tension: 0.4,
+                  pointBackgroundColor: '#1d4ed8',
+                  pointRadius: 4
+                }]
+              },
+              options: {
+                responsive: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                  y: { grid: { color: '#f1f5f9' }, ticks: { color: '#475569' } },
+                  x: { grid: { display: false }, ticks: { color: '#475569' } }
+                }
+              }
+            });
+
+            const chartImg = tempChart.toBase64Image();
+            tempChart.destroy();
+            canvas.remove();
+
+            html += `
+              <div style="margin-bottom: 30px; text-align: center;">
+                <h3 style="font-size: 14px; font-weight: 700; color: #334155; margin-bottom: 15px; text-align: left; font-family:'Inter', sans-serif;">Revenue Trend (Last 7 Days)</h3>
+                <img src="${chartImg}" style="width: 100%; max-height: 250px; border: 1px solid #e2e8f0; border-radius: 12px; padding: 10px;" />
+              </div>
+            `;
+          } catch (e) {
+            console.error("Failed to generate PDF chart:", e);
+          }
+        }
+
+        if (type !== 'inventory') {
+          html += `
+            <h3 style="font-size: 14px; font-weight: 700; color: #334155; margin-bottom: 15px; font-family:'Inter', sans-serif;">Report Data Table</h3>
+            <table style="width: 100%; border-collapse: collapse; margin-bottom: 30px; font-size: 13px; font-family:'Inter', sans-serif;">
+              <thead>
+                <tr style="background-color: #f8fafc; border-bottom: 2px solid #e2e8f0; text-align: left;">
+          `;
+
+          if (type === 'revenue') {
+            html += `
+                  <th style="padding: 12px; color: #475569; font-weight: 700;">Date</th>
+                  <th style="padding: 12px; color: #475569; font-weight: 700; text-align: right;">Total Revenue</th>
+                </tr>
+              </thead>
+              <tbody>
+            `;
+            let grandTotal = 0;
+            data.forEach(row => {
+              const val = parseFloat(row.total || 0);
+              grandTotal += val;
+              html += `
+                <tr style="border-bottom: 1px solid #f1f5f9;">
+                  <td style="padding: 12px; color: #334155;">${row.date}</td>
+                  <td style="padding: 12px; color: #1e3a8a; font-weight: 700; text-align: right;">₱${val.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+                </tr>
+              `;
+            });
+            html += `
+                <tr style="background-color: #f8fafc; border-top: 2px solid #e2e8f0; font-weight: 800;">
+                  <td style="padding: 12px; color: #1e293b;">Grand Total</td>
+                  <td style="padding: 12px; color: #1e3a8a; text-align: right; font-size: 15px;">₱${grandTotal.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+                </tr>
+            `;
+          } else if (type === 'performance') {
+            html += `
+                  <th style="padding: 12px; color: #475569; font-weight: 700;">Service Name</th>
+                  <th style="padding: 12px; color: #475569; font-weight: 700; text-align: right;">Total Jobs Completed</th>
+                </tr>
+              </thead>
+              <tbody>
+            `;
+            data.forEach(row => {
+              html += `
+                <tr style="border-bottom: 1px solid #f1f5f9;">
+                  <td style="padding: 12px; color: #334155;">${row.service_name || 'Unknown'}</td>
+                  <td style="padding: 12px; color: #334155; font-weight: 700; text-align: right;">${row.count || 0} jobs</td>
+                </tr>
+              `;
+            });
+          } else if (type === 'mechanic') {
+            html += `
+                  <th style="padding: 12px; color: #475569; font-weight: 700; width: 60px;">Rank</th>
+                  <th style="padding: 12px; color: #475569; font-weight: 700;">Mechanic Name</th>
+                  <th style="padding: 12px; color: #475569; font-weight: 700;">Specialization</th>
+                  <th style="padding: 12px; color: #475569; font-weight: 700; text-align: right;">Completed Jobs</th>
+                  <th style="padding: 12px; color: #475569; font-weight: 700; text-align: right;">Revenue Generated</th>
+                  <th style="padding: 12px; color: #475569; font-weight: 700; text-align: right;">Avg / Job</th>
+                </tr>
+              </thead>
+              <tbody>
+            `;
+            let totalJobs = 0, totalRev = 0;
+            data.forEach((row, index) => {
+              const medal = index === 0 ? '🥇 ' : (index === 1 ? '🥈 ' : (index === 2 ? '🥉 ' : ''));
+              const jobs = parseInt(row.count || 0);
+              const rev = parseFloat(row.total_revenue || 0);
+              const avg = parseFloat(row.avg_job_cost || 0);
+              totalJobs += jobs;
+              totalRev += rev;
+              html += `
+                <tr style="border-bottom: 1px solid #f1f5f9;">
+                  <td style="padding: 12px; color: #64748b; font-weight: 600;">#${index + 1}</td>
+                  <td style="padding: 12px; color: #334155; font-weight: 700;">${medal}${row.full_name}</td>
+                  <td style="padding: 12px; color: #64748b; font-style: italic;">${row.specialization || 'General'}</td>
+                  <td style="padding: 12px; color: #1e3a8a; font-weight: 700; text-align: right;">${jobs}</td>
+                  <td style="padding: 12px; color: #166534; font-weight: 700; text-align: right;">₱${rev.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+                  <td style="padding: 12px; color: #475569; text-align: right;">₱${avg.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+                </tr>
+              `;
+            });
+            html += `
+                <tr style="background-color: #f8fafc; border-top: 2px solid #e2e8f0; font-weight: 800;">
+                  <td colspan="3" style="padding: 12px; color: #1e293b;">Team Totals</td>
+                  <td style="padding: 12px; color: #1e3a8a; text-align: right;">${totalJobs} jobs</td>
+                  <td style="padding: 12px; color: #166534; text-align: right;">₱${totalRev.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+                  <td style="padding: 12px; color: #475569; text-align: right;">₱${totalJobs > 0 ? (totalRev/totalJobs).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2}) : '0.00'}</td>
+                </tr>
+            `;
+          }
+          html += `
+              </tbody>
+            </table>
+          `;
+        } else {
+          const lowStock = data.low_stock || [];
+          const history = data.history || [];
+
+          html += `
+            <h3 style="font-size: 14px; font-weight: 700; color: #dc2626; margin-bottom: 15px; font-family:'Inter', sans-serif;">Low Stock Alerts (Stock < 5)</h3>
+            <table style="width: 100%; border-collapse: collapse; margin-bottom: 30px; font-size: 13px; font-family:'Inter', sans-serif;">
+              <thead>
+                <tr style="background-color: #fef2f2; border-bottom: 2px solid #fca5a5; text-align: left;">
+                  <th style="padding: 12px; color: #991b1b; font-weight: 700;">Item Name</th>
+                  <th style="padding: 12px; color: #991b1b; font-weight: 700; text-align: right;">Remaining Qty</th>
+                </tr>
+              </thead>
+              <tbody>
+          `;
+
+          if (lowStock.length === 0) {
+            html += `<tr><td colspan="2" style="padding: 12px; color: #64748b; text-align: center;">All stock levels are healthy!</td></tr>`;
+          } else {
+            lowStock.forEach(row => {
+              html += `
+                <tr style="border-bottom: 1px solid #fee2e2;">
+                  <td style="padding: 12px; color: #334155;">${row.item_name}</td>
+                  <td style="padding: 12px; color: #b91c1c; font-weight: 700; text-align: right;">${row.quantity} units left</td>
+                </tr>
+              `;
+            });
+          }
+
+          html += `
+              </tbody>
+            </table>
+
+            <h3 style="font-size: 14px; font-weight: 700; color: #1e3a8a; margin-bottom: 15px; margin-top: 30px; font-family:'Inter', sans-serif;">Stock Movement Log (Additions & Subtractions)</h3>
+            <table style="width: 100%; border-collapse: collapse; margin-bottom: 30px; font-size: 13px; font-family:'Inter', sans-serif;">
+              <thead>
+                <tr style="background-color: #f0fdf4; border-bottom: 2px solid #bbf7d0; text-align: left;">
+                  <th style="padding: 12px; color: #166534; font-weight: 700;">Date</th>
+                  <th style="padding: 12px; color: #166534; font-weight: 700;">Item Name</th>
+                  <th style="padding: 12px; color: #166534; font-weight: 700;">Action</th>
+                  <th style="padding: 12px; color: #166534; font-weight: 700; text-align: right;">New Stock Level</th>
+                </tr>
+              </thead>
+              <tbody>
+          `;
+
+          if (history.length === 0) {
+            html += `<tr><td colspan="4" style="padding: 12px; color: #64748b; text-align: center;">No stock movements recorded yet.</td></tr>`;
+          } else {
+            history.forEach(row => {
+              const actionSign = row.transaction_type === 'ADD' ? '+' : '-';
+              const actionColor = row.transaction_type === 'ADD' ? '#16a34a' : '#dc2626';
+              const actionText = row.transaction_type === 'ADD' ? 'Added' : 'Subtracted';
+
+              html += `
+                <tr style="border-bottom: 1px solid #f1f5f9;">
+                  <td style="padding: 12px; color: #64748b; font-size: 12px;">${row.date}</td>
+                  <td style="padding: 12px; color: #334155;">${row.item_name}</td>
+                  <td style="padding: 12px; color: ${actionColor}; font-weight: 700;">
+                    ${actionSign}${row.quantity_changed} (${row.notes || actionText})
+                  </td>
+                  <td style="padding: 12px; color: #334155; font-weight: 600; text-align: right;">${row.new_quantity}</td>
+                </tr>
+              `;
+            });
+          }
+
+          html += `
+              </tbody>
+            </table>
+          `;
+        }
+
+        html += `
+          <div style="border-top: 1px solid #e2e8f0; padding-top: 15px; margin-top: 40px; text-align: center; font-size: 11px; color: #94a3b8;">
+            This document is an official system-generated business intelligence report for ${shopName}. All figures are audited and live.
+          </div>
+        `;
+
+        printDiv.innerHTML = html;
+
+        const opt = {
+          margin:       0.5,
+          filename:     `${reportTitle.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${new Date().toISOString().slice(0,10)}.pdf`,
+          image:        { type: 'jpeg', quality: 0.98 },
+          html2canvas:  { scale: 2, useCORS: true },
+          jsPDF:        { unit: 'in', format: 'letter', orientation: 'portrait' }
+        };
+
+        html2pdf().set(opt).from(printDiv).save().then(() => {
+          printDiv.remove();
+        });
+      }
+    };
 
     window.showReport = function (type) {
       console.log("SHOW REPORT CALLED:", type);
@@ -12999,21 +14021,34 @@ try {
       let action = '';
       if (type === 'revenue') { action = 'get_revenue_report'; titleEl.innerText = '7-Day Revenue Analytics'; }
       if (type === 'performance') { action = 'get_service_performance'; titleEl.innerText = 'Service Performance (Top 5)'; }
-      if (type === 'inventory') { action = 'get_inventory_report'; titleEl.innerText = 'Low Stock Alert (Stock < 10)'; }
+      if (type === 'inventory') { action = 'get_inventory_report'; titleEl.innerText = 'Inventory Status & Stock Log'; }
+      if (type === 'mechanic') { action = 'get_mechanic_performance'; titleEl.innerText = 'Mechanic Performance Report'; }
 
       fetch('tenant-dashboard.php?action=' + action)
         .then(res => res.json())
         .then(data => {
-          if (!Array.isArray(data) || data.length === 0) {
+          const hasData = (type === 'inventory') 
+            ? (data.low_stock && data.low_stock.length > 0 || data.history && data.history.length > 0)
+            : (Array.isArray(data) && data.length > 0);
+
+          if (!hasData) {
             contentEl.innerHTML = '<p style="text-align:center; padding:3rem; color:var(--text-dim);">No data available for this report.</p>';
             return;
           }
+
+          // Cache report info for PDF export
+          window.currentReportType = type;
+          window.currentReportData = data;
 
           if (type === 'revenue') {
             chartContainer.style.display = 'block';
             const ctx = document.getElementById('revenueChart').getContext('2d');
 
             if (typeof Chart !== 'undefined') {
+              const theme = document.documentElement.getAttribute('data-theme') || 'dark';
+              const gridColor = theme === 'light' ? 'rgba(0,0,0,0.05)' : 'rgba(255,255,255,0.05)';
+              const textColor = theme === 'light' ? '#64748b' : 'rgba(255,255,255,0.5)';
+
               window.revenueChartInstance = new Chart(ctx, {
                 type: 'line',
                 data: {
@@ -13021,12 +14056,12 @@ try {
                   datasets: [{
                     label: 'Daily Revenue (₱)',
                     data: data.map(row => row.total),
-                    borderColor: '#6366f1',
-                    backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                    borderColor: 'var(--accent)',
+                    backgroundColor: 'rgba(var(--accent-rgb), 0.1)',
                     borderWidth: 3,
                     fill: true,
                     tension: 0.4,
-                    pointBackgroundColor: '#6366f1',
+                    pointBackgroundColor: 'var(--accent)',
                     pointRadius: 5
                   }]
                 },
@@ -13035,8 +14070,8 @@ try {
                   maintainAspectRatio: false,
                   plugins: { legend: { display: false } },
                   scales: {
-                    y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: 'rgba(255,255,255,0.5)' } },
-                    x: { grid: { display: false }, ticks: { color: 'rgba(255,255,255,0.5)' } }
+                    y: { grid: { color: gridColor }, ticks: { color: textColor } },
+                    x: { grid: { display: false }, ticks: { color: textColor } }
                   }
                 }
               });
@@ -13045,24 +14080,150 @@ try {
             }
           }
 
-          let html = '<table class="data-table"><thead><tr>';
+          let html = '';
           if (type === 'revenue') {
-            html += '<th>Date</th><th>Total Revenue</th></tr></thead><tbody>';
+            html += '<table class="data-table"><thead><tr><th>Date</th><th>Total Revenue</th></tr></thead><tbody>';
             data.forEach(row => {
               html += `<tr><td>${row.date}</td><td style="font-weight:800; color:var(--accent);">₱${parseFloat(row.total || 0).toLocaleString()}</td></tr>`;
             });
+            html += '</tbody></table>';
           } else if (type === 'performance') {
-            html += '<th>Service Name</th><th>Total Jobs</th></tr></thead><tbody>';
+            html += '<table class="data-table"><thead><tr><th>Service Name</th><th>Total Jobs</th></tr></thead><tbody>';
             data.forEach(row => {
               html += `<tr><td>${row.service_name || 'Unknown'}</td><td>${row.count || 0} jobs</td></tr>`;
             });
-          } else if (type === 'inventory') {
-            html += '<th>Item Name</th><th>Remaining Qty</th></tr></thead><tbody>';
-            data.forEach(row => {
-              html += `<tr><td>${row.item_name}</td><td style="color:var(--danger);">${row.quantity} units left</td></tr>`;
+            html += '</tbody></table>';
+          } else if (type === 'mechanic') {
+            // Summary stat cards
+            let totalJobs = 0, totalRev = 0;
+            data.forEach(r => { totalJobs += parseInt(r.count || 0); totalRev += parseFloat(r.total_revenue || 0); });
+            const topMech = data.length > 0 ? data[0].full_name : 'N/A';
+
+            html = `
+              <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-bottom: 2rem;">
+                <div style="background:rgba(var(--accent-rgb),0.08); border:1px solid rgba(var(--accent-rgb),0.2); border-radius:16px; padding:1.2rem; text-align:center;">
+                  <div style="font-size:0.7rem; text-transform:uppercase; letter-spacing:1px; color:var(--text-dim); margin-bottom:6px;">Top Mechanic</div>
+                  <div style="font-size:1.3rem; font-weight:900; color:var(--accent);">🥇 ${topMech}</div>
+                </div>
+                <div style="background:rgba(16,185,129,0.08); border:1px solid rgba(16,185,129,0.2); border-radius:16px; padding:1.2rem; text-align:center;">
+                  <div style="font-size:0.7rem; text-transform:uppercase; letter-spacing:1px; color:var(--text-dim); margin-bottom:6px;">Total Jobs Done</div>
+                  <div style="font-size:1.3rem; font-weight:900; color:#10b981;">${totalJobs}</div>
+                </div>
+                <div style="background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.2); border-radius:16px; padding:1.2rem; text-align:center;">
+                  <div style="font-size:0.7rem; text-transform:uppercase; letter-spacing:1px; color:var(--text-dim); margin-bottom:6px;">Total Revenue</div>
+                  <div style="font-size:1.3rem; font-weight:900; color:#3b82f6;">₱${totalRev.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</div>
+                </div>
+              </div>
+
+              <h4 style="margin: 0 0 1rem 0; font-size: 1.1rem; color: var(--accent); display: flex; align-items: center; gap: 8px;">
+                <i class="fas fa-trophy"></i> Performance Leaderboard
+              </h4>
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Rank</th>
+                    <th>Mechanic</th>
+                    <th>Specialization</th>
+                    <th style="text-align: right;">Jobs</th>
+                    <th style="text-align: right;">Revenue</th>
+                    <th style="text-align: right;">Avg/Job</th>
+                  </tr>
+                </thead>
+                <tbody>
+            `;
+            data.forEach((row, index) => {
+              const medal = index === 0 ? '🥇 ' : (index === 1 ? '🥈 ' : (index === 2 ? '🥉 ' : ''));
+              const jobs = parseInt(row.count || 0);
+              const rev = parseFloat(row.total_revenue || 0);
+              const avg = parseFloat(row.avg_job_cost || 0);
+              const rowBg = index < 3 ? 'background:rgba(var(--accent-rgb),0.03);' : '';
+              html += `
+                <tr style="${rowBg}">
+                  <td style="font-weight:700; color:var(--text-dim);">#${index + 1}</td>
+                  <td><strong>${medal}${row.full_name}</strong></td>
+                  <td style="opacity:0.7; font-style:italic;">${row.specialization || 'General'}</td>
+                  <td style="color:var(--accent); font-weight:800; text-align:right;">${jobs}</td>
+                  <td style="color:#10b981; font-weight:700; text-align:right;">₱${rev.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+                  <td style="color:var(--text-dim); text-align:right;">₱${avg.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+                </tr>
+              `;
             });
+            html += '</tbody></table>';
+          } else if (type === 'inventory') {
+            const lowStock = data.low_stock || [];
+            const history = data.history || [];
+
+            html = `
+              <div style="margin-bottom: 2rem;">
+                <h4 style="margin: 0 0 1rem 0; font-size: 1.1rem; color: #f87171; display: flex; align-items: center; gap: 8px;">
+                  <i class="fas fa-exclamation-triangle"></i> Low Stock Alerts (Stock < 5)
+                </h4>
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Item Name</th>
+                      <th style="text-align: right;">Remaining Qty</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+            `;
+
+            if (lowStock.length === 0) {
+              html += `<tr><td colspan="2" style="text-align:center; opacity:0.6; padding:1.5rem;">All stock levels are healthy!</td></tr>`;
+            } else {
+              lowStock.forEach(row => {
+                html += `<tr><td>${row.item_name}</td><td style="color:var(--danger); font-weight:700; text-align: right;">${row.quantity} units left</td></tr>`;
+              });
+            }
+
+            html += `
+                  </tbody>
+                </table>
+              </div>
+
+              <div>
+                <h4 style="margin: 2.5rem 0 1rem 0; font-size: 1.1rem; color: var(--accent); display: flex; align-items: center; gap: 8px;">
+                  <i class="fas fa-history"></i> Stock Movement Log
+                </h4>
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Date</th>
+                      <th>Item Name</th>
+                      <th>Action</th>
+                      <th style="text-align: right;">New Stock</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+            `;
+
+            if (history.length === 0) {
+              html += `<tr><td colspan="4" style="text-align:center; opacity:0.6; padding:1.5rem;">No stock movements recorded yet.</td></tr>`;
+            } else {
+              history.forEach(row => {
+                const actionColor = row.transaction_type === 'ADD' ? '#10b981' : '#f87171';
+                const actionSign = row.transaction_type === 'ADD' ? '+' : '-';
+                const actionText = row.transaction_type === 'ADD' ? 'Added' : 'Subtracted';
+                
+                html += `
+                  <tr>
+                    <td style="font-size: 0.85rem; opacity: 0.7;">${row.date}</td>
+                    <td>${row.item_name}</td>
+                    <td style="color:${actionColor}; font-weight:700;">
+                      ${actionSign}${row.quantity_changed} (${row.notes || actionText})
+                    </td>
+                    <td style="text-align: right; font-weight:600;">${row.new_quantity}</td>
+                  </tr>
+                `;
+              });
+            }
+
+            html += `
+                  </tbody>
+                </table>
+              </div>
+            `;
           }
-          html += '</tbody></table>';
           contentEl.innerHTML = html;
         })
         .catch(err => {

@@ -9,6 +9,90 @@ date_default_timezone_set('Asia/Manila');
 require_once 'db-config.php';
 require_once 'mailer-service.php';
 
+/**
+ * Generates a full database backup SQL file
+ */
+function generateBackup($db, $type = 'MANUAL')
+{
+    try {
+        $backupDir = __DIR__ . DIRECTORY_SEPARATOR . 'backups' . DIRECTORY_SEPARATOR;
+        if (!is_dir($backupDir)) {
+            if (!mkdir($backupDir, 0755, true)) {
+                throw new Exception("Failed to create backup directory: " . $backupDir);
+            }
+        }
+
+        $tables = [];
+        $result = $db->query("SHOW TABLES");
+        while ($row = $result->fetch(PDO::FETCH_NUM)) {
+            $tables[] = $row[0];
+        }
+
+        if (empty($tables)) {
+            throw new Exception("No tables found in database to backup.");
+        }
+
+        $sql = "-- AutoFix Hub Database Backup ($type)\n";
+        $sql .= "-- Generated: " . date('Y-m-d H:i:s') . "\n\n";
+        $sql .= "SET FOREIGN_KEY_CHECKS=0;\n\n";
+
+        foreach ($tables as $table) {
+            $row2 = $db->query("SHOW CREATE TABLE $table")->fetch(PDO::FETCH_NUM);
+            $sql .= "\n\n" . $row2[1] . ";\n\n";
+
+            $result = $db->query("SELECT * FROM $table");
+            while ($row = $result->fetch(PDO::FETCH_NUM)) {
+                $sql .= "INSERT INTO $table VALUES(";
+                for ($j = 0; $j < count($row); $j++) {
+                    if (isset($row[$j])) {
+                        $val = addslashes($row[$j]);
+                        $val = str_replace("\n", "\\n", $val);
+                        $sql .= '"' . $val . '"';
+                    } else {
+                        $sql .= 'NULL';
+                    }
+                    if ($j < (count($row) - 1)) {
+                        $sql .= ',';
+                    }
+                }
+                $sql .= ");\n";
+            }
+        }
+        $sql .= "\nSET FOREIGN_KEY_CHECKS=1;";
+
+        $filename = 'backup_' . ($type === 'AUTO_LOGIN' ? 'login_' : '') . date('Y-m-d_His') . '.sql';
+        $filepath = $backupDir . $filename;
+        if (file_put_contents($filepath, $sql) === false) {
+            throw new Exception("Failed to write backup file: " . $filepath);
+        }
+        $filesize = filesize($filepath);
+
+        $now = date('Y-m-d H:i:s');
+        $stmt = $db->prepare("INSERT INTO backups (filename, file_size, status, created_at) VALUES (?, ?, 'SUCCESS', ?)");
+        $stmt->execute([$filename, $filesize, $now]);
+
+        // Log to audit trail
+        $sizeDisplay = ($filesize / 1024 > 1024) ? round($filesize / 1048576, 2) . ' MB' : round($filesize / 1024, 2) . ' KB';
+        $logMsg = ($type === 'AUTO_LOGIN' ? "Automatic login snapshot" : "Manual database snapshot") . " created: $filename ($sizeDisplay)";
+        $now = date('Y-m-d H:i:s');
+        $db->prepare("INSERT INTO audit_logs (activity_type, description, created_at) VALUES ('SYSTEM', ?, ?)")
+            ->execute([$logMsg, $now]);
+
+        return ['status' => 'success', 'filename' => $filename, 'message' => 'Backup created successfully'];
+    } catch (Exception $e) {
+        error_log("Backup Error ($type): " . $e->getMessage());
+        $now = date('Y-m-d H:i:s');
+        try {
+            $db->prepare("INSERT INTO backups (filename, file_size, status, created_at) VALUES (?, 0, 'FAILED', ?)")
+                ->execute(['ERROR: ' . substr($e->getMessage(), 0, 200), $now]);
+        } catch (Exception $e2) {
+        }
+        return ['status' => 'error', 'message' => $e->getMessage()];
+    }
+}
+
+
+
 try {
     $db = getDB();
     // Migrations / One-time Patches should be handled via a dedicated script or conditional check
@@ -25,6 +109,14 @@ if (!isset($_SESSION['isLoggedIn']) || strtoupper($_SESSION['role']) !== 'SUPER_
 
 $db = getDB();
 
+// Auto Backup on Login (Triggers exactly once per successful login event)
+if (isset($_SESSION['pending_auto_backup']) && $_SESSION['pending_auto_backup'] === true) {
+    generateBackup($db, 'AUTO_LOGIN');
+    unset($_SESSION['pending_auto_backup']);
+}
+
+
+
 // Auto-migrate: Add 'slug' and 'business_proof_url' columns to tenants table if they don't exist
 try {
     $db->exec("ALTER TABLE tenants ADD COLUMN slug VARCHAR(100) DEFAULT NULL AFTER status");
@@ -36,9 +128,25 @@ try {
 } catch (PDOException $e) {
 }
 
+try {
+    $db->exec("ALTER TABLE tenants ADD COLUMN id_type VARCHAR(100) DEFAULT NULL AFTER business_proof_url");
+} catch (PDOException $e) {
+}
+
+try {
+    $db->exec("ALTER TABLE tenants ADD COLUMN id_photo_url VARCHAR(255) DEFAULT NULL AFTER id_type");
+} catch (PDOException $e) {
+}
+
 // Auto-migrate: Add 'features' column to subscription_plans if missing
 try {
     $db->exec("ALTER TABLE subscription_plans ADD COLUMN features TEXT NULL");
+} catch (PDOException $e) {
+}
+
+// Auto-migrate: Add 'avatar_url' column to users table if missing
+try {
+    $db->exec("ALTER TABLE users ADD COLUMN avatar_url VARCHAR(255) DEFAULT NULL");
 } catch (PDOException $e) {
 }
 
@@ -91,7 +199,17 @@ try {
     */
 
     // 2. Status Sync: Always keep ACTIVE subscriptions for active tenants
-    $db->exec("UPDATE tenant_subscriptions s JOIN tenants t ON s.tenant_id = t.tenant_id SET s.status = 'ACTIVE' WHERE t.status = 'active'");
+    $db->exec("UPDATE tenant_subscriptions s JOIN tenants t ON s.tenant_id = t.tenant_id SET s.status = 'ACTIVE' WHERE t.status = 'active' OR t.status = 'ACTIVE'");
+
+    // 3. Subscription Heal: Ensure every active/pending tenant has at least a BASIC subscription if none exists
+    $db->exec("INSERT INTO tenant_subscriptions (tenant_id, plan_id, billing_cycle, start_date, end_date, status) 
+               SELECT t.tenant_id, 1, 'monthly', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 30 DAY), 'ACTIVE'
+               FROM tenants t
+               LEFT JOIN tenant_subscriptions s ON t.tenant_id = s.tenant_id
+               WHERE (UPPER(t.status) IN ('ACTIVE', 'PENDING')) AND s.subscription_id IS NULL");
+
+    // 4. Plan ID Heal: Fix any subscriptions with missing or invalid plan IDs (default to BASIC)
+    $db->exec("UPDATE tenant_subscriptions SET plan_id = 1 WHERE plan_id IS NULL OR plan_id = 0 OR plan_id NOT IN (SELECT plan_id FROM subscription_plans)");
 
     // 4. Ensure billing_cycle exists
     $db->exec("ALTER TABLE tenant_subscriptions ADD COLUMN IF NOT EXISTS billing_cycle VARCHAR(50) DEFAULT 'monthly'");
@@ -119,7 +237,7 @@ try {
         filename VARCHAR(255) NOT NULL,
         file_size BIGINT DEFAULT 0,
         status ENUM('SUCCESS', 'FAILED') DEFAULT 'SUCCESS',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at DATETIME NOT NULL
     )");
 
     // Seed defaults if empty
@@ -149,7 +267,7 @@ try {
     // Seed Master Services if empty or contains old data
     $checkOld = $db->query("SELECT COUNT(*) FROM master_services WHERE service_name = 'Car Wash & Wax'")->fetchColumn();
     $checkMs = $db->query("SELECT COUNT(*) FROM master_services")->fetchColumn();
-    
+
     if ($checkMs == 0 || $checkOld > 0) {
         // If old data exists, clear it to apply new professional standards
         if ($checkOld > 0) {
@@ -208,7 +326,9 @@ try {
             $id = $_POST['id'];
             $db->prepare("DELETE FROM master_services WHERE master_id = ?")->execute([$id]);
             echo json_encode(['status' => 'success']);
-        } catch (Exception $e) { echo json_encode(['status' => 'error', 'message' => $e->getMessage()]); }
+        } catch (Exception $e) {
+            echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
         exit;
     }
 
@@ -219,20 +339,13 @@ try {
         exit;
     }
 
-    // Backup Management Table Heal
-    $db->exec("CREATE TABLE IF NOT EXISTS system_backups (
-        backup_id INT AUTO_INCREMENT PRIMARY KEY,
-        backup_filename VARCHAR(255),
-        backup_type ENUM('FULL', 'DATABASE', 'FILES') DEFAULT 'FULL',
-        status ENUM('SUCCESS', 'FAILED') DEFAULT 'SUCCESS',
-        backup_size DECIMAL(10,2),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )");
+
 
     if (isset($_GET['action']) && $_GET['action'] === 'clear_logs_db') {
         header('Content-Type: application/json');
         $db->exec("DELETE FROM audit_logs");
-        $db->exec("INSERT INTO audit_logs (activity_type, description) VALUES ('SECURITY', 'Platform Audit Trail purged by Super Admin')");
+        $now = date('Y-m-d H:i:s');
+        $db->prepare("INSERT INTO audit_logs (activity_type, description, created_at) VALUES ('SECURITY', 'Platform Audit Trail purged by Super Admin', ?)")->execute([$now]);
         echo json_encode(['status' => 'success']);
         exit;
     }
@@ -250,33 +363,7 @@ try {
         exit;
     }
 
-    if (isset($_GET['action']) && $_GET['action'] === 'create_backup') {
-        header('Content-Type: application/json');
-        try {
-            $backupDir = __DIR__ . '/backups/';
-            if (!is_dir($backupDir))
-                mkdir($backupDir, 0755, true);
 
-            $filename = 'backup_' . date('Y-m-d_H-i-s') . '.sql';
-            $filepath = $backupDir . $filename;
-
-            // Mocking a physical backup file for now
-            $header = "-- AutoFix Hub System Backup\n-- Date: " . date('Y-m-d H:i:s') . "\n-- Version: 1.0\n\n";
-            file_put_contents($filepath, $header . "DROP TABLE IF EXISTS ...;\nCREATE TABLE ...;\nINSERT INTO ...;\n");
-
-            $size = round(filesize($filepath) / 1024, 2); // Size in KB for small mocks, or MB
-
-            $stmt = $db->prepare("INSERT INTO system_backups (backup_filename, backup_type, status, backup_size) VALUES (?, 'FULL', 'SUCCESS', ?)");
-            $stmt->execute([$filename, $size]);
-
-            $db->prepare("INSERT INTO audit_logs (activity_type, description) VALUES ('SYSTEM', 'Full system backup generated: $filename ($size KB)')")->execute();
-
-            echo json_encode(['status' => 'success', 'filename' => $filename]);
-        } catch (Exception $e) {
-            echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
-        }
-        exit;
-    }
 } catch (PDOException $e) {
 }
 
@@ -298,7 +385,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
         $db->prepare("UPDATE tenant_subscriptions SET status = 'ACTIVE' WHERE tenant_id = ?")->execute([$id]);
 
         // 3. Log Action
-        $db->prepare("INSERT INTO audit_logs (activity_type, description) VALUES ('CRUD', ?)")->execute(["Super Admin APPROVED tenant: " . $tenant['shop_name']]);
+        $now = date('Y-m-d H:i:s');
+        $db->prepare("INSERT INTO audit_logs (activity_type, description, created_at) VALUES ('CRUD', ?, ?)")->execute(["Super Admin APPROVED tenant: " . $tenant['shop_name'], $now]);
 
         $db->commit();
 
@@ -342,14 +430,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
     header('Content-Type: application/json');
     try {
         // DEBUG: Capture raw ID and any errors
-        $id = (int)$_POST['id'];
+        $id = (int) $_POST['id'];
         $reason = $_POST['reason'] ?? 'Documentation verification failed or incomplete.';
-        
+
         // 1. Get Tenant Info
         $stmt = $db->prepare("SELECT * FROM tenants WHERE tenant_id = ?");
         $stmt->execute([$id]);
         $tenant = $stmt->fetch();
-        
+
         if (!$tenant) {
             echo json_encode(['status' => 'error', 'message' => "Tenant ID $id not found in DB."]);
             exit;
@@ -358,22 +446,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
         // 2. Update Statuses
         $db->beginTransaction();
         try {
-            $id_int = (int)$id;
+            $id_int = (int) $id;
             $newName = "[REJECTED] " . $tenant['shop_name'];
             // Use 'suspended' as a fallback if 'rejected' is being blocked, plus the name prefix
             $q1 = $db->prepare("UPDATE tenants SET status = 'rejected', shop_name = ? WHERE tenant_id = ?");
             $ok1 = $q1->execute([$newName, $id_int]);
-            
+
             $db->prepare("UPDATE users SET status = 'DEACTIVATED' WHERE tenant_id = ?")->execute([$id_int]);
             $db->prepare("UPDATE tenant_subscriptions SET status = 'CANCELLED' WHERE tenant_id = ?")->execute([$id_int]);
-            
+
             if (!$ok1) {
                 $err = $q1->errorInfo();
                 throw new Exception("SQL Error: " . $err[2]);
             }
 
             // 3. Log Action
-            $db->prepare("INSERT INTO audit_logs (activity_type, description) VALUES ('CRUD', ?)")->execute(["Super Admin REJECTED tenant: " . $tenant['shop_name']]);
+            $now = date('Y-m-d H:i:s');
+            $db->prepare("INSERT INTO audit_logs (activity_type, description, created_at) VALUES ('CRUD', ?, ?)")->execute(["Super Admin REJECTED tenant: " . $tenant['shop_name'], $now]);
 
             $db->commit();
         } catch (Exception $dbErr) {
@@ -407,7 +496,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
 
         echo json_encode(['status' => 'success']);
     } catch (Exception $e) {
-        if (isset($db) && $db->inTransaction()) $db->rollBack();
+        if (isset($db) && $db->inTransaction())
+            $db->rollBack();
         echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
     }
     exit;
@@ -430,7 +520,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
             $stmt = $db->prepare("UPDATE subscription_plans SET plan_name = ?, price = ?, price_yearly = ?, max_users = ?, max_service_bays = ?, features = ? WHERE plan_id = ?");
             $stmt->execute([$name, $mPrice, $yPrice, $maxUsers, $maxBays, $features, $id]);
             $plan_affected_rows = $stmt->rowCount();
-            
+
             if ($plan_affected_rows === 0) {
                 // If no rows were affected, it means the ID wasn't found or data was identical
                 // We'll treat "identical data" as success, but let's log it for debugging
@@ -449,8 +539,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
         }
 
         // Audit Log for Super Admin
-        $stmt = $db->prepare("INSERT INTO audit_logs (activity_type, description) VALUES ('CRUD', ?)");
-        $stmt->execute([$activity]);
+        $now = date('Y-m-d H:i:s');
+        $stmt = $db->prepare("INSERT INTO audit_logs (activity_type, description, created_at) VALUES ('CRUD', ?, ?)");
+        $stmt->execute([$activity, $now]);
 
         echo json_encode(['status' => 'success', 'debug_id' => $final_id, 'affected_rows' => $plan_affected_rows]);
     } catch (Exception $e) {
@@ -479,9 +570,70 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
         $stmt = $db->prepare("DELETE FROM subscription_plans WHERE plan_id = ?");
         $stmt->execute([$id]);
 
-        $db->prepare("INSERT INTO audit_logs (activity_type, description) VALUES ('CRUD', ?)")
-            ->execute(["Super Admin deleted subscription tier ID: $id"]);
+        $now = date('Y-m-d H:i:s');
+        $db->prepare("INSERT INTO audit_logs (activity_type, description, created_at) VALUES ('CRUD', ?, ?)")
+            ->execute(["Super Admin deleted subscription tier ID: $id", $now]);
 
+        echo json_encode(['status' => 'success']);
+    } catch (Exception $e) {
+        echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+    }
+    exit;
+}
+
+// Action: Fetch Backup History
+if (isset($_GET['action']) && $_GET['action'] === 'fetch_backups') {
+    header('Content-Type: application/json');
+    try {
+        $stmt = $db->query("SELECT * FROM backups ORDER BY created_at DESC");
+        $backups = $stmt->fetchAll();
+        $totalSize = $db->query("SELECT SUM(file_size) FROM backups WHERE status='SUCCESS'")->fetchColumn() ?: 0;
+        $lastBackup = $db->query("SELECT created_at FROM backups WHERE status='SUCCESS' ORDER BY created_at DESC LIMIT 1")->fetchColumn() ?: 'None';
+
+        $backupDir = __DIR__ . DIRECTORY_SEPARATOR . 'backups';
+        $dirExists = is_dir($backupDir);
+        $isWritable = $dirExists ? is_writable($backupDir) : is_writable(__DIR__);
+
+        echo json_encode([
+            'status' => 'success',
+            'backups' => $backups,
+            'totalSize' => $totalSize,
+            'lastBackup' => $lastBackup,
+            'debug' => [
+                'dirExists' => $dirExists,
+                'isWritable' => $isWritable,
+                'path' => $backupDir
+            ]
+        ]);
+    } catch (Exception $e) {
+        echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+    }
+    exit;
+}
+
+// Action: Create Manual Backup
+if (isset($_GET['action']) && $_GET['action'] === 'create_backup') {
+    header('Content-Type: application/json');
+    $result = generateBackup($db, 'MANUAL');
+    echo json_encode($result);
+    exit;
+}
+
+// Action: Delete Backup
+if (isset($_GET['action']) && $_GET['action'] === 'delete_backup') {
+    header('Content-Type: application/json');
+    try {
+        $id = $_POST['id'] ?? 0;
+        $stmt = $db->prepare("SELECT filename FROM backups WHERE backup_id = ?");
+        $stmt->execute([$id]);
+        $filename = $stmt->fetchColumn();
+
+        if ($filename && file_exists('backups/' . $filename)) {
+            unlink('backups/' . $filename);
+        }
+
+        $stmt = $db->prepare("DELETE FROM backups WHERE backup_id = ?");
+        $stmt->execute([$id]);
         echo json_encode(['status' => 'success']);
     } catch (Exception $e) {
         echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
@@ -494,87 +646,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
     try {
         $db->beginTransaction();
         foreach ($_POST as $key => $val) {
-            if (in_array($key, ['admin_password', 'admin_password_confirm']))
+            if (in_array($key, ['admin_password', 'admin_password_confirm', 'admin_name', 'admin_email']))
                 continue;
             $stmt = $db->prepare("INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = ?");
             $stmt->execute([$key, $val, $val]);
         }
 
-    // Action: Fetch Backup History
-    if (isset($_GET['action']) && $_GET['action'] === 'fetch_backups') {
-        header('Content-Type: application/json');
-        try {
-            $stmt = $db->query("SELECT * FROM backups ORDER BY created_at DESC");
-            $backups = $stmt->fetchAll();
-            $totalSize = $db->query("SELECT SUM(file_size) FROM backups")->fetchColumn() ?: 0;
-            $lastBackup = $db->query("SELECT created_at FROM backups WHERE status='SUCCESS' ORDER BY created_at DESC LIMIT 1")->fetchColumn() ?: 'None';
-            echo json_encode(['status' => 'success', 'backups' => $backups, 'totalSize' => $totalSize, 'lastBackup' => $lastBackup]);
-        } catch (Exception $e) { echo json_encode(['status' => 'error', 'message' => $e->getMessage()]); }
-        exit;
-    }
+        // Handle Super Admin Profile update
+        $admin_id = $_SESSION['user_id'] ?? null;
+        if ($admin_id) {
+            $admin_name = trim($_POST['admin_name'] ?? '');
+            $admin_email = trim($_POST['admin_email'] ?? '');
+            
+            if (empty($admin_name) || empty($admin_email)) {
+                throw new Exception("Display Name and Email are required.");
+            }
 
-    // Action: Create Manual Backup
-    if (isset($_GET['action']) && $_GET['action'] === 'create_backup') {
-        header('Content-Type: application/json');
-        try {
-            $tables = [];
-            $result = $db->query("SHOW TABLES");
-            while ($row = $result->fetch(PDO::FETCH_NUM)) { $tables[] = $row[0]; }
+            // Check if email already used by another admin/staff
+            $checkEmail = $db->prepare("SELECT COUNT(*) FROM users WHERE email = ? AND user_id != ?");
+            $checkEmail->execute([$admin_email, $admin_id]);
+            if ($checkEmail->fetchColumn() > 0) {
+                throw new Exception("Email address is already in use.");
+            }
 
-            $sql = "-- AutoFix Hub Database Backup\n";
-            $sql .= "-- Generated: " . date('Y-m-d H:i:s') . "\n\n";
-            $sql .= "SET FOREIGN_KEY_CHECKS=0;\n\n";
-
-            foreach ($tables as $table) {
-                $row2 = $db->query("SHOW CREATE TABLE $table")->fetch(PDO::FETCH_NUM);
-                $sql .= "\n\n" . $row2[1] . ";\n\n";
-
-                $result = $db->query("SELECT * FROM $table");
-                while ($row = $result->fetch(PDO::FETCH_NUM)) {
-                    $sql .= "INSERT INTO $table VALUES(";
-                    for ($j = 0; $j < count($row); $j++) {
-                        $row[$j] = addslashes($row[$j] ?? '');
-                        $row[$j] = str_replace("\n", "\\n", $row[$j]);
-                        if (isset($row[$j])) { $sql .= '"' . $row[$j] . '"'; } else { $sql .= 'NULL'; }
-                        if ($j < (count($row) - 1)) { $sql .= ','; }
-                    }
-                    $sql .= ");\n";
+            // Handle Avatar File Upload
+            $avatar_url = null;
+            if (isset($_FILES['admin_avatar_file']) && $_FILES['admin_avatar_file']['error'] === UPLOAD_ERR_OK) {
+                $uploadDir = __DIR__ . DIRECTORY_SEPARATOR . 'uploads' . DIRECTORY_SEPARATOR;
+                if (!is_dir($uploadDir)) {
+                    mkdir($uploadDir, 0755, true);
+                }
+                $fileExt = pathinfo($_FILES['admin_avatar_file']['name'], PATHINFO_EXTENSION);
+                $fileName = 'avatar_admin_' . $admin_id . '_' . time() . '.' . $fileExt;
+                if (move_uploaded_file($_FILES['admin_avatar_file']['tmp_name'], $uploadDir . $fileName)) {
+                    $avatar_url = 'uploads/' . $fileName;
                 }
             }
-            $sql .= "\nSET FOREIGN_KEY_CHECKS=1;";
 
-            $filename = 'backup_' . date('Y-m-d_His') . '.sql';
-            $filepath = 'backups/' . $filename;
-            file_put_contents($filepath, $sql);
-            $filesize = filesize($filepath);
-
-            $stmt = $db->prepare("INSERT INTO backups (filename, file_size, status) VALUES (?, ?, 'SUCCESS')");
-            $stmt->execute([$filename, $filesize]);
-
-            echo json_encode(['status' => 'success', 'message' => 'Backup created successfully']);
-        } catch (Exception $e) { echo json_encode(['status' => 'error', 'message' => $e->getMessage()]); }
-        exit;
-    }
-
-    // Action: Delete Backup
-    if (isset($_GET['action']) && $_GET['action'] === 'delete_backup') {
-        header('Content-Type: application/json');
-        try {
-            $id = $_POST['id'] ?? 0;
-            $stmt = $db->prepare("SELECT filename FROM backups WHERE backup_id = ?");
-            $stmt->execute([$id]);
-            $filename = $stmt->fetchColumn();
-
-            if ($filename && file_exists('backups/' . $filename)) {
-                unlink('backups/' . $filename);
+            if ($avatar_url) {
+                $updUser = $db->prepare("UPDATE users SET name = ?, email = ?, avatar_url = ? WHERE user_id = ?");
+                $updUser->execute([$admin_name, $admin_email, $avatar_url, $admin_id]);
+            } else {
+                $updUser = $db->prepare("UPDATE users SET name = ?, email = ? WHERE user_id = ?");
+                $updUser->execute([$admin_name, $admin_email, $admin_id]);
             }
 
-            $stmt = $db->prepare("DELETE FROM backups WHERE backup_id = ?");
-            $stmt->execute([$id]);
-            echo json_encode(['status' => 'success']);
-        } catch (Exception $e) { echo json_encode(['status' => 'error', 'message' => $e->getMessage()]); }
-        exit;
-    }
+            // Sync active session variables
+            $_SESSION['name'] = $admin_name;
+        }
+
+
 
         // Handle Admin Password Change
         if (!empty($_POST['admin_password'])) {
@@ -592,14 +713,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
             $upd = $db->prepare("UPDATE users SET password_hash = ? WHERE user_id = ? OR email = 'superadmin'");
             $upd->execute([$hash, $admin_id]);
 
-            $db->prepare("INSERT INTO audit_logs (activity_type, description) VALUES ('SECURITY', 'Super Admin changed their account password')")->execute();
+            $now = date('Y-m-d H:i:s');
+            $db->prepare("INSERT INTO audit_logs (activity_type, description, created_at) VALUES ('SECURITY', 'Super Admin changed their account password', ?)")->execute([$now]);
         }
 
-        $db->prepare("INSERT INTO audit_logs (activity_type, description) VALUES ('INFO', 'Super Admin updated global system settings')")->execute();
+        $now = date('Y-m-d H:i:s');
+        $db->prepare("INSERT INTO audit_logs (activity_type, description, created_at) VALUES ('INFO', 'Super Admin updated global system settings', ?)")->execute([$now]);
         $db->commit();
         echo json_encode(['status' => 'success']);
     } catch (Exception $e) {
-        if ($db->inTransaction()) $db->rollBack();
+        if ($db->inTransaction())
+            $db->rollBack();
         echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
     }
     exit;
@@ -613,11 +737,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
         $email = $_POST['email'];
         $pass = $_POST['password'];
         $hash = password_hash($pass, PASSWORD_BCRYPT);
-        
+
         $db->prepare("INSERT INTO users (role_id, name, email, password_hash, status, tenant_id) VALUES (1, ?, ?, ?, 'ACTIVE', 0)")
-           ->execute([$name, $email, $hash]);
-           
-        $db->prepare("INSERT INTO audit_logs (activity_type, description) VALUES ('CRUD', 'Super Admin added a new management account: ' . ?)")->execute([$email]);
+            ->execute([$name, $email, $hash]);
+
+        $now = date('Y-m-d H:i:s');
+        $db->prepare("INSERT INTO audit_logs (activity_type, description, created_at) VALUES ('CRUD', ?, ?)")->execute(['Super Admin added a new management account: ' . $email, $now]);
         echo json_encode(['status' => 'success', 'message' => 'New Super Admin added!']);
     } catch (Exception $e) {
         echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
@@ -630,11 +755,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
     header('Content-Type: application/json');
     try {
         $id = $_POST['id'];
-        if ($id == ($_SESSION['user_id'] ?? '')) throw new Exception("You cannot delete yourself!");
-        
-        $email = $db->query("SELECT email FROM users WHERE user_id = " . (int)$id)->fetchColumn();
+        if ($id == ($_SESSION['user_id'] ?? ''))
+            throw new Exception("You cannot delete yourself!");
+
+        $email = $db->query("SELECT email FROM users WHERE user_id = " . (int) $id)->fetchColumn();
         $db->prepare("DELETE FROM users WHERE user_id = ? AND role_id = 1")->execute([$id]);
-        $db->prepare("INSERT INTO audit_logs (activity_type, description) VALUES ('CRUD', 'Super Admin removed management account: ' . ?)")->execute([$email]);
+        $now = date('Y-m-d H:i:s');
+        $db->prepare("INSERT INTO audit_logs (activity_type, description, created_at) VALUES ('CRUD', ?, ?)")->execute(['Super Admin removed management account: ' . $email, $now]);
         echo json_encode(['status' => 'success', 'message' => 'Admin removed.']);
     } catch (Exception $e) {
         echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
@@ -646,15 +773,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
 if (isset($_GET['action']) && $_GET['action'] === 'fetch_support_groups') {
     header('Content-Type: application/json');
     try {
-        $stmt = $db->query("SELECT t.tenant_id, t.shop_name, 
+        $stmt = $db->query("SELECT t.tenant_id, t.shop_name, t.logo_url, 
                             (SELECT message FROM support_messages sm WHERE sm.tenant_id = t.tenant_id ORDER BY created_at DESC LIMIT 1) as last_msg,
                             (SELECT COUNT(*) FROM support_messages sm WHERE sm.tenant_id = t.tenant_id AND sm.is_read = 0 AND sm.sender_role = 'TENANT') as unread_count,
-                            (SELECT MAX(created_at) FROM support_messages sm WHERE sm.tenant_id = t.tenant_id) as last_chat_time
+                            (SELECT MAX(created_at) FROM support_messages sm WHERE sm.tenant_id = t.tenant_id) as last_chat_time,
+                            (SELECT COALESCE(u.avatar_url, u.profile_pic) 
+                             FROM support_messages sm 
+                             JOIN users u ON sm.sender_id = u.user_id 
+                             WHERE sm.tenant_id = t.tenant_id AND sm.sender_role = 'TENANT' 
+                             ORDER BY sm.created_at DESC LIMIT 1) as tenant_avatar
                             FROM tenants t 
                             WHERE t.status IN ('ACTIVE', 'SUSPENDED')
                             ORDER BY last_chat_time DESC, t.shop_name ASC");
         echo json_encode(['status' => 'success', 'groups' => $stmt->fetchAll()]);
-    } catch (Exception $e) { echo json_encode(['status' => 'error', 'message' => $e->getMessage()]); }
+    } catch (Exception $e) {
+        echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+    }
     exit;
 }
 
@@ -664,10 +798,21 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch_tenant_chat') {
     try {
         $tid = $_GET['tenant_id'];
         $db->prepare("UPDATE support_messages SET is_read = 1 WHERE tenant_id = ? AND sender_role = 'TENANT'")->execute([$tid]);
-        $stmt = $db->prepare("SELECT * FROM support_messages WHERE tenant_id = ? ORDER BY created_at ASC");
+        $stmt = $db->prepare("SELECT sm.*, t.logo_url, 
+                            CASE 
+                                WHEN sm.sender_role = 'ADMIN' THEN COALESCE(u.avatar_url, u.profile_pic, (SELECT avatar_url FROM users WHERE role_id = 1 AND avatar_url IS NOT NULL LIMIT 1))
+                                ELSE COALESCE(u.avatar_url, u.profile_pic)
+                            END AS sender_avatar 
+                            FROM support_messages sm 
+                            LEFT JOIN tenants t ON sm.tenant_id = t.tenant_id 
+                            LEFT JOIN users u ON sm.sender_id = u.user_id 
+                            WHERE sm.tenant_id = ? 
+                            ORDER BY sm.created_at ASC");
         $stmt->execute([$tid]);
         echo json_encode(['status' => 'success', 'messages' => $stmt->fetchAll()]);
-    } catch (Exception $e) { echo json_encode(['status' => 'error', 'message' => $e->getMessage()]); }
+    } catch (Exception $e) {
+        echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+    }
     exit;
 }
 
@@ -677,11 +822,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
     try {
         $tid = $_POST['tenant_id'];
         $msg = trim($_POST['message'] ?? '');
-        if (empty($msg)) throw new Exception("Message empty");
-        $db->prepare("INSERT INTO support_messages (tenant_id, sender_role, sender_id, message) VALUES (?, 'ADMIN', ?, ?)")
-           ->execute([$tid, $_SESSION['user_id'], $msg]);
+        if (empty($msg))
+            throw new Exception("Message empty");
+        $now = date('Y-m-d H:i:s');
+        $db->prepare("INSERT INTO support_messages (tenant_id, sender_role, sender_id, message, created_at) VALUES (?, 'ADMIN', ?, ?, ?)")
+            ->execute([$tid, $_SESSION['user_id'], $msg, $now]);
         echo json_encode(['status' => 'success']);
-    } catch (Exception $e) { echo json_encode(['status' => 'error', 'message' => $e->getMessage()]); }
+    } catch (Exception $e) {
+        echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+    }
     exit;
 }
 
@@ -691,8 +840,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
     try {
         $type = $_POST['type'] ?? 'CRUD';
         $activity = $_POST['activity'];
-        $stmt = $db->prepare("INSERT INTO audit_logs (activity_type, description) VALUES (?, ?)");
-        $stmt->execute([$type, $activity]);
+        $now = date('Y-m-d H:i:s');
+        $stmt = $db->prepare("INSERT INTO audit_logs (activity_type, description, created_at) VALUES (?, ?, ?)");
+        $stmt->execute([$type, $activity, $now]);
         echo json_encode(['status' => 'success']);
     } catch (Exception $e) {
         echo json_encode(['status' => 'error']);
@@ -747,8 +897,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
 
         // Audit Logging
         $verb = strtoupper($newStatus);
-        $stmt = $db->prepare("INSERT INTO audit_logs (activity_type, description) VALUES ('CRUD', ?)");
-        $stmt->execute(["Super admin updated tenant: $shopName (ID: $id) status to $verb"]);
+        $now = date('Y-m-d H:i:s');
+        $stmt = $db->prepare("INSERT INTO audit_logs (activity_type, description, created_at) VALUES ('CRUD', ?, ?)");
+        $stmt->execute(["Super admin updated tenant: $shopName (ID: $id) status to $verb", $now]);
 
         // --- GUARANTEED EMAIL NOTIFICATION ---
         $st = strtoupper(trim($newStatus));
@@ -818,76 +969,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
     exit;
 }
 
-// Ensure system_backups table exists
-try {
-    $db->exec("CREATE TABLE IF NOT EXISTS system_backups (
-        backup_id INT AUTO_INCREMENT PRIMARY KEY,
-        backup_name VARCHAR(100) NOT NULL,
-        backup_filename VARCHAR(150) NOT NULL,
-        backup_type VARCHAR(20) DEFAULT 'Full System',
-        backup_size FLOAT DEFAULT 0,
-        status VARCHAR(20) DEFAULT 'SUCCESS',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;");
-} catch (Exception $e) {
-}
+// Removed redundant system_backups logic - unified under backups table
 
-// Handle AJAX Backup Creation
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['action'] === 'create_backup') {
-    header('Content-Type: application/json');
-    try {
-        $backupDir = 'backups/';
-        if (!is_dir($backupDir))
-            mkdir($backupDir, 0777, true);
-        $filename = 'autofix_db_' . date('Ymd_His') . '.sql';
-        $fullPath = $backupDir . $filename;
-        $sqlDump = "-- AutoFix Master Snapshot\n-- Date: " . date('Y-m-d H:i:s') . "\n\n";
-        $tables = $db->query("SHOW TABLES")->fetchAll(PDO::FETCH_COLUMN);
-        foreach ($tables as $table) {
-            $row = $db->query("SHOW CREATE TABLE `$table`")->fetch();
-            $sqlDump .= "\n\nDROP TABLE IF EXISTS `$table`;\n" . $row['Create Table'] . ";\n\n";
-            $rows = $db->query("SELECT * FROM `$table`")->fetchAll(PDO::FETCH_ASSOC);
-            foreach ($rows as $r) {
-                $cols = array_keys($r);
-                $vals = array_map(function ($v) use ($db) {
-                    return ($v === null) ? 'NULL' : $db->quote($v);
-                }, array_values($r));
-                $sqlDump .= "INSERT INTO `$table` (`" . implode("`, `", $cols) . "`) VALUES (" . implode(", ", $vals) . ");\n";
-            }
-        }
-        file_put_contents($fullPath, $sqlDump);
-        $sizeMB = round(filesize($fullPath) / (1024 * 1024), 4);
-        $db->prepare("INSERT INTO system_backups (backup_name, backup_filename, backup_size, status) VALUES (?, ?, ?, 'SUCCESS')")
-            ->execute(["Manual Snapshot " . date('M j, Y H:i'), $filename, $sizeMB]);
-        echo json_encode(['status' => 'success', 'filename' => $filename]);
-    } catch (Exception $e) {
-        echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
-    }
-    exit;
-}
-
-// Handle AJAX Backup Deletion
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['action'] === 'delete_backup') {
-    header('Content-Type: application/json');
-    try {
-        $id = (int) $_POST['backup_id'];
-        $b = $db->prepare("SELECT backup_filename FROM system_backups WHERE backup_id = ?");
-        $b->execute([$id]);
-        $backup = $b->fetch();
-        if ($backup) {
-            $file = 'backups/' . $backup['backup_filename'];
-            if (file_exists($file))
-                unlink($file);
-            $db->prepare("DELETE FROM system_backups WHERE backup_id = ?")->execute([$id]);
-            echo json_encode(['status' => 'success']);
-        } else {
-            echo json_encode(['status' => 'error', 'message' => 'Backup not found']);
-        }
-    } catch (Exception $e) {
-        echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
-    }
-    exit;
-}
 
 // Ensure audit_logs table has customer_id for monitoring
 try {
@@ -898,7 +981,7 @@ try {
         customer_id INT NULL,
         activity_type VARCHAR(50),
         description TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at DATETIME NOT NULL,
         INDEX (tenant_id),
         INDEX (user_id),
         INDEX (customer_id)
@@ -915,7 +998,7 @@ try {
                                        AND shop_name NOT LIKE '[REJECTED]%'
                                        AND TRIM(LOWER(IFNULL(status, ''))) NOT IN ('rejected', 'archived', 'cancelled')")->fetchColumn() ?: 0;
 
-    $shops_db = $db->query("SELECT t.*, t.status as status, t.shop_name as name, t.owner_name as owner, p.plan_name as planName, p.plan_id as planId, s.end_date as expiry,
+    $shops_db = $db->query("SELECT t.*, t.status as status, t.shop_name as name, t.owner_name as owner, IFNULL(p.plan_name, 'TRIAL') as planName, s.plan_id as planId, s.end_date as expiry,
                              s.billing_cycle, p.price as monthlyPrice, p.price_yearly as yearlyPrice,
                              (SELECT COUNT(*) FROM appointments a WHERE a.tenant_id = t.tenant_id) as bookings,
                              (SELECT COUNT(*) FROM customers c WHERE c.tenant_id = t.tenant_id) as customer_count,
@@ -923,7 +1006,7 @@ try {
                              (SELECT SUM(amount) FROM tenant_payments tp WHERE tp.tenant_id = t.tenant_id AND (UPPER(tp.payment_status) = 'PAID' OR UPPER(tp.payment_status) = 'SUCCESS')) as revenue,
                              (SELECT MAX(created_at) FROM audit_logs al WHERE al.tenant_id = t.tenant_id) as last_activity
                              FROM tenants t 
-                             LEFT JOIN tenant_subscriptions s ON s.subscription_id = (SELECT subscription_id FROM tenant_subscriptions WHERE tenant_id = t.tenant_id AND status = 'ACTIVE' ORDER BY subscription_id DESC LIMIT 1)
+                             LEFT JOIN tenant_subscriptions s ON s.subscription_id = (SELECT subscription_id FROM tenant_subscriptions WHERE tenant_id = t.tenant_id ORDER BY subscription_id DESC LIMIT 1)
                              LEFT JOIN subscription_plans p ON s.plan_id = p.plan_id 
                              WHERE TRIM(LOWER(IFNULL(t.status, ''))) NOT IN ('rejected', 'archived', 'cancelled')
                              AND t.shop_name NOT LIKE '[REJECTED]%'
@@ -1050,6 +1133,18 @@ try {
     $dashboard_trends = [];
 }
 
+// Retrieve active superadmin user details
+$session_user_id = $_SESSION['user_id'] ?? 1;
+try {
+    $admin_data = $db->prepare("SELECT name, email, avatar_url FROM users WHERE user_id = ?");
+    $admin_data->execute([$session_user_id]);
+    $admin_row = $admin_data->fetch();
+} catch (Exception $e) {
+    $admin_row = null;
+}
+$admin_name = $admin_row['name'] ?? $_SESSION['name'] ?? 'Main Admin';
+$admin_avatar = $admin_row['avatar_url'] ?? '';
+
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -1068,57 +1163,53 @@ try {
     <style>
         /* Premium Native Date Picker Styling */
         input[type="date"] {
-            color-scheme: dark;
+            color-scheme: var(--date-picker-scheme);
             cursor: pointer;
             border: 1px solid var(--glass-border);
-            background: rgba(255, 255, 255, 0.03);
+            background: var(--input-bg);
+            color: var(--date-picker-color);
             transition: 0.3s;
             padding: 0.6rem 0.8rem;
+            border-radius: 8px;
         }
 
         input[type="date"]:focus {
             border-color: var(--accent);
             box-shadow: 0 0 10px var(--accent-glow);
-            background: rgba(255, 255, 255, 0.06);
+            background: var(--input-bg);
             outline: none;
         }
 
-        /* Force Native Calendar Icon to Solid White & High Visibility */
+        /* Force Native Calendar Icon to High Visibility */
         input[type="date"]::-webkit-calendar-picker-indicator {
-            -webkit-appearance: none;
-            display: block;
-            background: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="16" height="15" viewBox="0 0 24 24"><path fill="%23ffffff" d="M20 3h-1V1h-2v2H7V1H5v2H4c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 18H4V8h16v13z"/></svg>') no-repeat;
-            background-position: center;
-            background-size: 16px;
-            width: 20px;
-            height: 20px;
+            filter: var(--date-picker-scheme)==='light' ? invert(0): invert(0);
             cursor: pointer;
-            opacity: 1 !important;
-            filter: none !important;
-            margin-left: 10px;
+            opacity: 0.7;
+            transition: 0.2s;
         }
 
-        /* Make the placeholder text white/visible */
+        input[type="date"]::-webkit-calendar-picker-indicator:hover {
+            opacity: 1;
+        }
+
+        /* Make the placeholder text visible */
         input[type="date"]::-webkit-datetime-edit {
-            color: #fff;
+            color: var(--date-picker-color);
         }
 
         input[type="date"]::-webkit-datetime-edit-fields-wrapper {
-            color: #fff;
+            color: var(--date-picker-color);
         }
 
         input[type="date"]::-webkit-datetime-edit-text {
-            color: rgba(255, 255, 255, 0.5);
+            color: var(--text-dim);
+            opacity: 0.5;
         }
 
         input[type="date"]::-webkit-datetime-edit-month-field,
         input[type="date"]::-webkit-datetime-edit-day-field,
         input[type="date"]::-webkit-datetime-edit-year-field {
-            color: #fff;
-        }
-
-        input[type="date"]::-webkit-calendar-picker-indicator:hover {
-            background-color: rgba(255, 255, 255, 0.1);
+            color: var(--date-picker-color);
         }
 
         :root {
@@ -1137,25 +1228,14 @@ try {
             --card-bg: rgba(255, 255, 255, 0.03);
             --input-bg: rgba(0, 0, 0, 0.2);
             --modal-bg: rgba(15, 23, 42, 0.95);
+            --sidebar-bg: rgba(0, 0, 0, 0.2);
+            --scrollbar-thumb: rgba(255, 255, 255, 0.15);
+            --scrollbar-track: rgba(0, 0, 0, 0.3);
+            --date-picker-color: #ffffff;
+            --date-picker-scheme: dark;
         }
 
-        [data-theme="light"] {
-            --bg-deep: #f8fafc;
-            --accent: #4f46e5;
-            --accent-glow: rgba(79, 70, 229, 0.4);
-            --gradient: linear-gradient(135deg, #4f46e5, #3730a3);
-            --glass: #ffffff;
-            --glass-border: rgba(0, 0, 0, 0.1);
-            --text-main: #0f172a;
-            --text-dim: #475569;
-            --error: #dc2626;
-            --success: #059669;
-            --warning: #d97706;
-            --info: #2563eb;
-            --card-bg: #ffffff;
-            --input-bg: #ffffff;
-            --modal-bg: rgba(255, 255, 255, 0.98);
-        }
+
 
         * {
             margin: 0;
@@ -1171,12 +1251,12 @@ try {
         }
 
         ::-webkit-scrollbar-track {
-            background: rgba(0, 0, 0, 0.3);
+            background: var(--scrollbar-track);
             border-radius: 10px;
         }
 
         ::-webkit-scrollbar-thumb {
-            background: rgba(255, 255, 255, 0.15);
+            background: var(--scrollbar-thumb);
             border-radius: 10px;
             border: 2px solid transparent;
             background-clip: padding-box;
@@ -1204,9 +1284,9 @@ try {
 
         /* Sidebar Styling */
         .sidebar {
-            background: rgba(0, 0, 0, 0.2);
+            background: var(--sidebar-bg);
             border-right: 1px solid var(--glass-border);
-            padding: 2.5rem 1.5rem;
+            padding: 0;
             display: flex;
             flex-direction: column;
             backdrop-filter: blur(20px);
@@ -1215,6 +1295,23 @@ try {
             height: 100vh;
             transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
             z-index: 5000;
+            overflow: visible;
+        }
+
+        .sidebar-inner {
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            height: 100%;
+            padding: 2.5rem 1.5rem;
+            overflow-y: auto;
+            scrollbar-width: none; /* Hide scrollbar for Firefox */
+            -ms-overflow-style: none;  /* Hide scrollbar for IE and Edge */
+        }
+
+        /* Hide scrollbar for Chrome, Safari and Opera */
+        .sidebar-inner::-webkit-scrollbar {
+            display: none;
         }
 
         /* Sidebar Trigger (Floating Arrow) */
@@ -1235,7 +1332,7 @@ try {
             cursor: pointer;
             z-index: 5001;
             transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
         }
 
         .sidebar-trigger:hover {
@@ -1255,11 +1352,16 @@ try {
         /* Hide labels in collapsed state */
         body.sidebar-collapsed .nav-label,
         body.sidebar-collapsed .brand-logo span,
-        body.sidebar-collapsed .badge-pending {
+        body.sidebar-collapsed .badge-pending,
+        body.sidebar-collapsed .admin-profile-details {
             display: none !important;
         }
 
         body.sidebar-collapsed .sidebar {
+            padding: 0;
+        }
+
+        body.sidebar-collapsed .sidebar-inner {
             padding: 2.5rem 0.5rem;
             align-items: center;
         }
@@ -1269,6 +1371,13 @@ try {
             justify-content: center;
             display: flex;
             font-size: 1.2rem;
+            margin-bottom: 1.5rem !important;
+        }
+
+        body.sidebar-collapsed .admin-sidebar-profile {
+            padding: 0 !important;
+            justify-content: center;
+            margin-bottom: 2rem !important;
         }
 
         body.sidebar-collapsed .nav-item {
@@ -1285,7 +1394,7 @@ try {
         .brand-logo {
             font-size: 1.6rem;
             font-weight: 800;
-            margin-bottom: 3.5rem;
+            margin-bottom: 1.5rem;
             padding-left: 1rem;
         }
 
@@ -1311,14 +1420,14 @@ try {
             gap: 12px;
         }
 
-        .nav-item:hover,
-        .nav-item.active {
+        .nav-item:hover {
             background: rgba(99, 102, 241, 0.1);
-            color: white;
+            color: var(--accent);
         }
 
         .nav-item.active {
             background: var(--accent);
+            color: white;
             box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
         }
 
@@ -1413,7 +1522,7 @@ try {
 
         .dossier-info-val {
             font-weight: 700;
-            color: white;
+            color: var(--text-main);
         }
 
         /* Main Content */
@@ -1536,7 +1645,7 @@ try {
         .stat-value {
             font-size: 2.2rem;
             font-weight: 900;
-            color: white;
+            color: var(--text-main);
             display: flex;
             align-items: baseline;
             gap: 8px;
@@ -1570,7 +1679,7 @@ try {
 
         .data-table td {
             padding: 1.25rem 1rem;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.02);
+            border-bottom: 1px solid var(--glass-border);
             font-size: 0.9rem;
         }
 
@@ -1657,11 +1766,11 @@ try {
 
         .search-input {
             flex: 1;
-            background: rgba(0, 0, 0, 0.3);
+            background: var(--input-bg);
             border: 1px solid var(--glass-border);
             padding: 1.1rem 1.5rem;
             border-radius: 18px;
-            color: white;
+            color: var(--text-main);
             outline: none;
             transition: 0.3s;
             font-size: 0.95rem;
@@ -1670,18 +1779,18 @@ try {
 
         .search-input:focus {
             border-color: var(--accent);
-            background: rgba(0, 0, 0, 0.4);
-            box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.1);
+            background: var(--input-bg);
+            box-shadow: 0 0 0 4px var(--accent-glow);
         }
 
         .search-input option {
-            background: #0f172a;
-            color: white;
+            background: var(--bg-deep);
+            color: var(--text-main);
             padding: 10px;
         }
 
         .premium-table-card {
-            background: rgba(255, 255, 255, 0.01);
+            background: var(--card-bg);
             border: 1px solid var(--glass-border);
             border-radius: 32px;
             overflow: hidden;
@@ -1693,7 +1802,7 @@ try {
         }
 
         .data-table thead {
-            background: rgba(0, 0, 0, 0.2);
+            background: var(--input-bg);
         }
 
         .data-table th {
@@ -1719,7 +1828,7 @@ try {
         }
 
         .data-table tr:hover {
-            background: rgba(255, 255, 255, 0.015);
+            background: var(--glass);
         }
 
         /* Modals */
@@ -1729,7 +1838,8 @@ try {
             left: 0;
             width: 100%;
             height: 100%;
-            background: rgba(3, 7, 18, 0.92);
+            background: rgba(3, 7, 18, 0.85);
+            /* Slightly translucent for both */
             backdrop-filter: blur(16px);
             z-index: 2000;
             display: none;
@@ -1739,16 +1849,18 @@ try {
             overflow-y: auto;
         }
 
+
+
         .modal-card {
-            background: #080c14;
-            border: 1px solid rgba(255, 255, 255, 0.08);
+            background: var(--modal-bg);
+            border: 1px solid var(--glass-border);
             border-radius: 30px;
             width: 100%;
             max-width: 650px;
             padding: 3rem 2.5rem;
             margin: auto;
             position: relative;
-            box-shadow: 0 50px 100px -20px rgba(0, 0, 0, 0.9), 0 0 80px -30px rgba(99, 102, 241, 0.15);
+            box-shadow: 0 50px 100px -20px rgba(0, 0, 0, 0.5), 0 0 80px -30px var(--accent-glow);
             animation: modalSlideUp 0.5s cubic-bezier(0.16, 1, 0.3, 1);
         }
 
@@ -1806,7 +1918,7 @@ try {
             display: block;
             font-size: 0.88rem;
             font-weight: 700;
-            color: white;
+            color: var(--text-main);
             margin-bottom: 0.7rem;
             letter-spacing: 0.02em;
         }
@@ -1823,9 +1935,9 @@ try {
 
         .modern-input {
             width: 100%;
-            background: rgba(255, 255, 255, 0.04);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            color: white;
+            background: var(--input-bg);
+            border: 1px solid var(--glass-border);
+            color: var(--text-main);
             padding: 1.2rem 1.5rem;
             border-radius: 16px;
             font-size: 0.97rem;
@@ -1834,18 +1946,49 @@ try {
         }
 
         .modern-input:focus {
-            background: rgba(255, 255, 255, 0.08);
+            background-color: var(--input-bg);
             border-color: var(--accent);
-            box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.12);
+            box-shadow: 0 0 0 4px var(--accent-glow);
+        }
+
+        select.modern-input {
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 1.2rem center;
+            background-size: 1.1rem;
+            padding-right: 3rem;
+        }
+
+        /* Password Toggle Support */
+        .password-wrapper {
+            position: relative;
+            display: flex;
+            align-items: center;
+            width: 100%;
+        }
+
+        .toggle-password {
+            position: absolute;
+            right: 1.2rem;
+            color: var(--text-dim);
+            cursor: pointer;
+            z-index: 10;
+            transition: 0.3s;
+        }
+
+        .toggle-password:hover {
+            color: var(--accent);
         }
 
         .modern-input::placeholder {
-            color: rgba(255, 255, 255, 0.2);
+            color: var(--text-dim);
+            opacity: 0.5;
         }
 
         .modern-input option {
-            background: #0f172a;
-            color: white;
+            background: var(--bg-deep);
+            color: var(--text-main);
         }
 
         .modal-footer-grid {
@@ -1856,9 +1999,9 @@ try {
         }
 
         .btn-white {
-            background: rgba(255, 255, 255, 0.06);
-            color: white;
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: var(--input-bg);
+            color: var(--text-main);
+            border: 1px solid var(--glass-border);
             padding: 1.2rem;
             border-radius: 16px;
             font-weight: 800;
@@ -1868,7 +2011,7 @@ try {
         }
 
         .btn-white:hover {
-            background: rgba(255, 255, 255, 0.12);
+            background: var(--glass);
         }
 
         .btn-gradient {
@@ -1920,7 +2063,7 @@ try {
         }
 
         .chart-box {
-            background: rgba(0, 0, 0, 0.2);
+            background: var(--card-bg);
             border: 1px solid var(--glass-border);
             border-radius: 24px;
             padding: 2rem;
@@ -1983,7 +2126,7 @@ try {
             font-size: 2.8rem;
             font-weight: 900;
             margin: 2rem 0;
-            color: white;
+            color: var(--text-main);
             letter-spacing: -2px;
         }
 
@@ -2090,15 +2233,15 @@ try {
         }
 
         .sales-premium-card {
-            background: rgba(255, 255, 255, 0.03);
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            background: var(--card-bg);
+            border: 1px solid var(--glass-border);
             border-left: 4px solid var(--accent);
             border-radius: 20px;
             padding: 1.5rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            color: white;
+            color: var(--text-main);
             transition: transform 0.2s, background 0.2s;
         }
 
@@ -2123,7 +2266,7 @@ try {
         .sales-premium-card .p-value {
             font-size: 1.6rem;
             font-weight: 800;
-            color: white;
+            color: var(--text-main);
         }
 
         .sales-premium-card .p-icon-box {
@@ -2134,9 +2277,9 @@ try {
             align-items: center;
             justify-content: center;
             font-size: 1.2rem;
-            color: white;
+            color: var(--accent);
             opacity: 0.8;
-            background: rgba(255, 255, 255, 0.1);
+            background: var(--accent-glow);
         }
 
         /* Card Specific Accents */
@@ -2224,7 +2367,7 @@ try {
             transform: translateX(-50%);
             width: 90%;
             max-width: 550px;
-            background: rgba(15, 23, 42, 0.98);
+            background: var(--modal-bg);
             border: 1px solid var(--glass-border);
             border-top: none;
             border-radius: 0 0 32px 32px;
@@ -2254,75 +2397,93 @@ try {
             <i class="fas fa-chevron-left"></i>
         </div>
 
-        <div class="brand-logo">AutoFix <span>Hub</span></div>
-        <nav class="nav-menu">
-            <div class="nav-item active" data-view="dashboard">
-                <i class="fa-solid fa-gauge-high"></i>
-                <span class="nav-label">Dashboard</span>
+        <div class="sidebar-inner">
+            <div class="brand-logo">AutoFix <span>Hub</span></div>
+
+            <!-- Super Admin Profile Widget -->
+            <div class="admin-sidebar-profile" style="padding: 0 1rem; margin-bottom: 2.5rem; display: flex; align-items: center; gap: 12px; transition: all 0.3s ease;">
+                <div class="admin-avatar-container" style="position: relative; flex-shrink: 0; width: 48px; height: 48px; border-radius: 50%; overflow: hidden; border: 2px solid rgba(255, 255, 255, 0.1); box-shadow: 0 4px 15px rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, var(--accent), #6366f1);">
+                    <?php if ($admin_avatar): ?>
+                        <img src="<?php echo htmlspecialchars($admin_avatar); ?>" id="sidebarAdminAvatar" style="width: 100%; height: 100%; object-fit: cover;">
+                    <?php else: ?>
+                        <span id="sidebarAdminInitials" style="font-weight: 800; font-size: 1.1rem; color: white;"><?php echo mb_strtoupper(mb_substr($admin_name, 0, 1)); ?></span>
+                    <?php endif; ?>
+                    <div class="status-dot" style="position: absolute; bottom: 2px; right: 2px; width: 10px; height: 10px; border-radius: 50%; background: #10b981; border: 2px solid var(--sidebar-bg); box-shadow: 0 0 10px #10b981;"></div>
+                </div>
+                <div class="admin-profile-details" style="min-width: 0; flex: 1;">
+                    <h4 id="sidebarAdminName" style="margin: 0; font-size: 0.95rem; font-weight: 800; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"><?php echo htmlspecialchars($admin_name); ?></h4>
+                    <p style="margin: 2px 0 0 0; font-size: 0.72rem; font-weight: 600; color: var(--accent); text-transform: uppercase; letter-spacing: 0.5px;">Super Admin</p>
+                </div>
             </div>
-            
-            <div class="nav-item" data-view="shops"
-                style="display:flex; align-items:center; justify-content:space-between; width:100%;">
-                <div style="display:flex; align-items:center; gap:12px; position:relative;">
-                    <div style="position:relative;">
-                        <i class="fa-solid fa-building-user"></i>
-                        <div id="sidebar-notif-dot" class="notif-dot"
-                            style="display: <?php echo ($pending_tenant_count > 0) ? 'block' : 'none'; ?>;"></div>
+
+            <nav class="nav-menu">
+                <div class="nav-item active" data-view="dashboard">
+                    <i class="fa-solid fa-gauge-high"></i>
+                    <span class="nav-label">Dashboard</span>
+                </div>
+
+                <div class="nav-item" data-view="shops"
+                    style="display:flex; align-items:center; justify-content:space-between; width:100%;">
+                    <div style="display:flex; align-items:center; gap:12px; position:relative;">
+                        <div style="position:relative;">
+                            <i class="fa-solid fa-building-user"></i>
+                            <div id="sidebar-notif-dot" class="notif-dot"
+                                style="display: <?php echo ($pending_tenant_count > 0) ? 'block' : 'none'; ?>;"></div>
+                        </div>
+                        <span class="nav-label">Tenant Management</span>
                     </div>
-                    <span class="nav-label">Tenant Management</span>
+                    <span id="sidebar-pending-badge" class="badge-pending"
+                        style="display: <?php echo ($pending_tenant_count > 0) ? 'block' : 'none'; ?>;">
+                        <?php echo $pending_tenant_count; ?>
+                    </span>
                 </div>
-                <span id="sidebar-pending-badge" class="badge-pending"
-                    style="display: <?php echo ($pending_tenant_count > 0) ? 'block' : 'none'; ?>;">
-                    <?php echo $pending_tenant_count; ?>
-                </span>
-            </div>
-            
-            <div class="nav-item" data-view="plans">
-                <i class="fa-solid fa-credit-card"></i>
-                <span class="nav-label">Subscriptions</span>
-            </div>
-            <div class="nav-item" data-view="payments">
-                <i class="fa-solid fa-sack-dollar"></i>
-                <span class="nav-label">Sales Report</span>
-            </div>
-            <div class="nav-item" data-view="price_standards">
-                <i class="fa-solid fa-tags"></i>
-                <span class="nav-label">Price Standards</span>
-            </div>
-            <div class="nav-item" data-view="reports">
-                <i class="fa-solid fa-chart-pie"></i>
-                <span class="nav-label">Reports</span>
-            </div>
-            <div class="nav-item" data-view="logs">
-                <i class="fa-solid fa-clipboard-list"></i>
-                <span class="nav-label">Audit Logs</span>
-            </div>
-            <div class="nav-item" data-view="backup">
-                <i class="fa-solid fa-database"></i>
-                <span class="nav-label">Backup</span>
-            </div>
-            <div class="nav-item" data-view="settings">
-                <i class="fa-solid fa-gears"></i>
-                <span class="nav-label">Settings</span>
-            </div>
-            
-            <div class="nav-item" data-view="chat" style="display:flex; justify-content:space-between; align-items:center; margin-top:1.5rem; border-top:1px solid rgba(255,255,255,0.05); padding-top:1.5rem;">
-                <div style="display:flex; align-items:center; gap:12px;">
-                    <i class="fa-solid fa-headset"></i>
-                    <span class="nav-label">Chat Support</span>
+
+                <div class="nav-item" data-view="plans">
+                    <i class="fa-solid fa-credit-card"></i>
+                    <span class="nav-label">Subscriptions</span>
                 </div>
-                <span id="globalChatBadge" style="display:none; background:var(--error); color:white; font-size:0.6rem; padding:2px 6px; border-radius:10px;">0</span>
+                <div class="nav-item" data-view="payments">
+                    <i class="fa-solid fa-sack-dollar"></i>
+                    <span class="nav-label">Sales Report</span>
+                </div>
+                <div class="nav-item" data-view="price_standards">
+                    <i class="fa-solid fa-tags"></i>
+                    <span class="nav-label">Price Standards</span>
+                </div>
+                <div class="nav-item" data-view="reports">
+                    <i class="fa-solid fa-chart-pie"></i>
+                    <span class="nav-label">Reports</span>
+                </div>
+                <div class="nav-item" data-view="logs">
+                    <i class="fa-solid fa-clipboard-list"></i>
+                    <span class="nav-label">Audit Logs</span>
+                </div>
+                <div class="nav-item" data-view="backup">
+                    <i class="fa-solid fa-database"></i>
+                    <span class="nav-label">Backup</span>
+                </div>
+                <div class="nav-item" data-view="settings">
+                    <i class="fa-solid fa-gears"></i>
+                    <span class="nav-label">Settings</span>
+                </div>
+
+                <div class="nav-item" data-view="chat"
+                    style="display:flex; justify-content:space-between; align-items:center; margin-top:1.5rem; border-top:1px solid var(--glass-border); padding-top:1.5rem;">
+                    <div style="display:flex; align-items:center; gap:12px;">
+                        <i class="fa-solid fa-headset"></i>
+                        <span class="nav-label">Chat Support</span>
+                    </div>
+                    <span id="globalChatBadge"
+                        style="display:none; background:var(--error); color:white; font-size:0.6rem; padding:2px 6px; border-radius:10px;">0</span>
+                </div>
+            </nav>
+
+
+            <div class="nav-item" id="logoutBtn"
+                style="color: var(--error); margin-top: 0.5rem; display:flex; align-items:center; gap:12px;">
+                <i class="fa-solid fa-right-from-bracket"></i>
+                <span class="nav-label">Logout Account</span>
             </div>
-        </nav>
-        
-        <div class="nav-item" id="theme-toggle" style="margin-top: auto; border-top: 1px solid var(--glass-border); padding-top: 1.5rem; display:flex; align-items:center; gap:12px;">
-            <i class="fa-solid fa-moon"></i>
-            <span class="nav-label">Dark Mode</span>
-        </div>
-        <div class="nav-item" id="logoutBtn"
-            style="color: var(--error); margin-top: 0.5rem; display:flex; align-items:center; gap:12px;">
-            <i class="fa-solid fa-right-from-bracket"></i>
-            <span class="nav-label">Logout Account</span>
         </div>
     </aside>
 
@@ -2347,7 +2508,7 @@ try {
                     <div class="stat-value">
                         <span id="stat-active-users" style="color:var(--success);">0</span>
                         <span
-                            style="color:rgba(255,255,255,0.1); font-size:1.6rem; font-weight:300; margin:0 12px;">/</span>
+                            style="color:var(--glass-border); font-size:1.6rem; font-weight:300; margin:0 12px;">/</span>
                         <span id="stat-inactive-users" style="color:var(--error);">0</span>
                     </div>
                 </div>
@@ -2356,18 +2517,19 @@ try {
                         style="color:var(--warning); filter: drop-shadow(0 0 10px rgba(245,158,11,0.6));"></i>
                     <p class="stat-label">Daily / Monthly Log</p>
                     <div class="stat-value">
-                        <span id="stat-daily-act" style="color:white;">0</span>
+                        <span id="stat-daily-act" style="color:var(--text-main);">0</span>
                         <span
-                            style="color:rgba(255,255,255,0.1); font-size:1.6rem; font-weight:300; margin:0 12px;">/</span>
+                            style="color:var(--glass-border); font-size:1.6rem; font-weight:300; margin:0 12px;">/</span>
                         <span id="stat-monthly-act" style="color:var(--warning);">0</span>
                     </div>
                 </div>
                 <div class="stat-card"
-                    style="background: linear-gradient(135deg, rgba(16, 185, 129, 0.1), rgba(0,0,0,0.2)); border-color: rgba(16, 185, 129, 0.3);">
+                    style="background: linear-gradient(135deg, rgba(16, 185, 129, 0.1), var(--glass)); border-color: rgba(16, 185, 129, 0.3);">
                     <i class="fa-solid fa-wallet stat-icon"
                         style="color:var(--success); filter: drop-shadow(0 0 10px rgba(16,185,129,0.8));"></i>
-                    <p class="stat-label" style="color:rgba(255,255,255,0.8);">System Revenue</p>
-                    <div class="stat-value" id="stat-revenue" style="color:white; font-size: 2.2rem;">₱0</div>
+                    <p class="stat-label" style="color:var(--text-dim);">System Revenue</p>
+                    <div class="stat-value" id="stat-revenue" style="color:var(--text-main); font-size: 2.2rem;">₱0
+                    </div>
                 </div>
             </div>
 
@@ -2420,7 +2582,7 @@ try {
                         <h3 style="font-size: 1.4rem; font-weight: 900; margin-bottom: 0.3rem;">Pending Verification
                             Requests
                         </h3>
-                        <p style="color: rgba(255,255,255,0.5); font-size: 0.95rem;">There are <b id="pendingCountText"
+                        <p style="color: var(--text-dim); font-size: 0.95rem;">There are <b id="pendingCountText"
                                 style="color:var(--warning);">0</b> new tenants awaiting your manual business proof
                             review.</p>
                     </div>
@@ -2468,11 +2630,12 @@ try {
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2.5rem;">
                 <div>
                     <h1 style="font-size: 2.2rem; letter-spacing: -1px; font-weight: 800;">Global Price Standards</h1>
-                    <p style="color: var(--text-dim);">Set price ceilings and floors for services to ensure platform-wide consistency.</p>
+                    <p style="color: var(--text-dim);">Set price ceilings and floors for services to ensure
+                        platform-wide consistency.</p>
                 </div>
                 <button class="btn-gradient" onclick="openMasterServiceModal()">+ Add Standard Service</button>
             </div>
-            
+
             <div class="premium-table-card">
                 <table class="data-table">
                     <thead>
@@ -2511,17 +2674,17 @@ try {
         <div id="reports" class="view-section">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2.5rem;">
                 <div>
-                    <h1>System Reports</h1>
+                    <h1 style="color:var(--text-main);">System Reports</h1>
                     <p style="color:var(--text-dim);">Generate and export tenant activity, user registrations, and
                         system usage.</p>
                 </div>
                 <div style="display:flex; gap:12px;">
-                    <select id="reportFilterTenant" class="search-input" onchange="renderReports()"
-                        style="background: rgba(255,255,255,0.05); border:1px solid var(--glass-border); color:white; padding: 0.8rem 1rem; border-radius:12px; font-family:inherit; cursor:pointer;">
-                        <option value="all">All Tenants</option>
+                    <select id="reportFilterTenant" onchange="renderReports()"
+                        style="background: var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding: 0.8rem 1rem; border-radius:12px; font-family:inherit; cursor:pointer;">
+                        <option value="all">All Management Hubs</option>
                     </select>
-                    <select id="reportFilterDate" class="search-input" onchange="renderReports()"
-                        style="background: rgba(255,255,255,0.05); border:1px solid var(--glass-border); color:white; padding: 0.8rem 1rem; border-radius:12px; font-family:inherit; cursor:pointer;">
+                    <select id="reportFilterDate" onchange="renderReports()"
+                        style="background: var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding: 0.8rem 1rem; border-radius:12px; font-family:inherit; cursor:pointer;">
                         <option value="all">All Time</option>
                         <option value="30">Last 30 Days</option>
                         <option value="7">Last 7 Days</option>
@@ -2529,7 +2692,7 @@ try {
                     </select>
                     <div style="display:flex; gap:0.8rem; align-items:center;">
                         <button class="btn-action"
-                            style="background:#ef4444; color:white; border-radius:30px; padding:0.8rem 2.2rem; border:none; font-weight:800; display:flex; align-items:center; gap:10px; transition: 0.3s; box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3);"
+                            style="background:#ef4444; color:var(--text-main); border-radius:30px; padding:0.8rem 2.2rem; border:none; font-weight:800; display:flex; align-items:center; gap:10px; transition: 0.3s; box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3);"
                             onmouseover="this.style.transform='translateY(-2px)';"
                             onmouseout="this.style.transform='translateY(0)';" onclick="downloadReportsPDF()">
                             <i class="fa-solid fa-file-pdf"></i> EXPORT PDF
@@ -2546,7 +2709,8 @@ try {
                             <p class="stat-label"
                                 style="text-transform:uppercase; letter-spacing:1px; font-weight:800; font-size:0.7rem; color:var(--text-dim);">
                                 New Registrations</p>
-                            <div class="stat-value" id="reportStatUsers" style="font-size:2.5rem; margin:1rem 0;">0
+                            <div class="stat-value" id="reportStatUsers"
+                                style="font-size:2.5rem; margin:1rem 0; color:var(--text-main);">0
                             </div>
                         </div>
                         <div
@@ -2566,7 +2730,8 @@ try {
                             <p class="stat-label"
                                 style="text-transform:uppercase; letter-spacing:1px; font-weight:800; font-size:0.7rem; color:var(--text-dim);">
                                 System Interactions</p>
-                            <div class="stat-value" id="reportStatLogs" style="font-size:2.5rem; margin:1rem 0;">0</div>
+                            <div class="stat-value" id="reportStatLogs"
+                                style="font-size:2.5rem; margin:1rem 0; color:var(--text-main);">0</div>
                         </div>
                         <div
                             style="width:45px; height:45px; background:rgba(245,158,11,0.1); border-radius:12px; display:flex; align-items:center; justify-content:center; color:var(--warning); font-size:1.2rem;">
@@ -2584,7 +2749,7 @@ try {
                                 style="text-transform:uppercase; letter-spacing:1px; font-weight:800; font-size:0.7rem; color:var(--text-dim);">
                                 Active Actions</p>
                             <div class="stat-value" id="reportStatAppointments"
-                                style="font-size:2.5rem; margin:1rem 0;">0</div>
+                                style="font-size:2.5rem; margin:1rem 0; color:var(--text-main);">0</div>
                         </div>
                         <div
                             style="width:45px; height:45px; background:rgba(16,185,129,0.1); border-radius:12px; display:flex; align-items:center; justify-content:center; color:var(--success); font-size:1.2rem;">
@@ -2596,7 +2761,7 @@ try {
             </div>
 
             <div class="glass-panel" style="padding:1.5rem;">
-                <h3 style="color:white; margin-bottom:0.5rem;">Tenant Activity Report</h3>
+                <h3 style="color:var(--text-main); margin-bottom:0.5rem;">Tenant Activity Report</h3>
                 <p style="color:var(--text-dim); font-size:0.9rem; margin-bottom:1.5rem;">Per-tenant breakdown of
                     members, users, revenue, and last activity</p>
                 <div class="table-responsive">
@@ -2632,8 +2797,8 @@ try {
             </div>
             <div class="glass-panel" style="margin-bottom:2rem; padding:2rem;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem;">
-                    <h3 style="font-size:1.1rem; display:flex; align-items:center; gap:0.5rem;"><i
-                            class="fa-solid fa-chart-area" style="color:var(--accent);"></i> Platform Usage &
+                    <h3 style="color:var(--text-main); font-size:1.1rem; display:flex; align-items:center; gap:0.5rem;">
+                        <i class="fa-solid fa-chart-area" style="color:var(--accent);"></i> Platform Usage &
                         Registration Trends</h3>
                     <div style="font-size:0.8rem; color:var(--text-dim);">Last 14 days activity visualization</div>
                 </div>
@@ -2645,7 +2810,7 @@ try {
         <div id="payments" class="view-section">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2.5rem;">
                 <div>
-                    <h1>Sales Report</h1>
+                    <h1 style="color:var(--text-main);">Sales Report</h1>
                     <p style="color:var(--text-dim);">Detailed performance analytics and transaction records.</p>
                 </div>
             </div>
@@ -2688,13 +2853,15 @@ try {
             <!-- New Insights Row -->
             <div style="display:grid; grid-template-columns: 2fr 1fr; gap:1.5rem; margin-bottom:2rem;">
                 <div class="glass-panel" style="margin-bottom:0; padding:1.5rem; position:relative;">
-                    <h3 style="margin-bottom:1.5rem; font-size:1.1rem; display:flex; align-items:center; gap:0.5rem;"><i
-                            class="fa-solid fa-chart-line" style="color:var(--accent);"></i> Sales Trends</h3>
+                    <h3
+                        style="color:var(--text-main); margin-bottom:1.5rem; font-size:1.1rem; display:flex; align-items:center; gap:0.5rem;">
+                        <i class="fa-solid fa-chart-line" style="color:var(--accent);"></i> Sales Trends</h3>
                     <div style="height:250px;"><canvas id="salesReportTrendsChart"></canvas></div>
                 </div>
                 <div class="glass-panel" style="margin-bottom:0; padding:1.5rem;">
-                    <h3 style="margin-bottom:1.5rem; font-size:1.1rem; display:flex; align-items:center; gap:0.5rem;"><i
-                            class="fa-solid fa-rocket" style="color:var(--success);"></i> Top Tenants</h3>
+                    <h3
+                        style="color:var(--text-main); margin-bottom:1.5rem; font-size:1.1rem; display:flex; align-items:center; gap:0.5rem;">
+                        <i class="fa-solid fa-rocket" style="color:var(--success);"></i> Top Tenants</h3>
                     <div id="topTenantsPerfList" style="display:flex; flex-direction:column; gap:1rem;">
                         <p style="color:var(--text-dim); font-size:0.85rem;">Loading top performers...</p>
                     </div>
@@ -2702,8 +2869,9 @@ try {
             </div>
 
             <div class="glass-panel" style="padding:1.5rem; margin-bottom:2rem;">
-                <h3 style="margin-bottom:1.5rem; font-size:1.1rem; display:flex; align-items:center; gap:0.5rem;"><i
-                        class="fa-solid fa-table-list" style="color:var(--info);"></i> Revenue by Plan</h3>
+                <h3
+                    style="color:var(--text-main); margin-bottom:1.5rem; font-size:1.1rem; display:flex; align-items:center; gap:0.5rem;">
+                    <i class="fa-solid fa-table-list" style="color:var(--info);"></i> Revenue by Plan</h3>
                 <div class="table-container">
                     <table class="data-table">
                         <thead>
@@ -2721,7 +2889,7 @@ try {
                 </div>
             </div>
 
-            <h3 style="margin-bottom: 1rem; font-size: 1.1rem;">Transaction History</h3>
+            <h3 style="color:var(--text-main); margin-bottom: 1rem; font-size: 1.1rem;">Transaction History</h3>
             <div class="search-container"
                 style="display:flex; flex-direction:column; gap:1.5rem; background:rgba(255,255,255,0.02); padding:1.8rem; border-radius:18px; border:1px solid var(--glass-border);">
                 <!-- Row 1: Search & Status Controls -->
@@ -2745,7 +2913,7 @@ try {
                         </select>
                     </div>
                     <button class="btn-action"
-                        style="background:#ef4444; color:white; border-radius:30px; padding:0.85rem 2.2rem; border:none; font-weight:800; display:flex; align-items:center; gap:10px; transition: 0.3s; box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3);"
+                        style="background:#ef4444; color:var(--text-main); border-radius:30px; padding:0.85rem 2.2rem; border:none; font-weight:800; display:flex; align-items:center; gap:10px; transition: 0.3s; box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3);"
                         onmouseover="this.style.transform='translateY(-2px)';"
                         onmouseout="this.style.transform='translateY(0)';" onclick="downloadSalesPDF()">
                         <i class="fa-solid fa-file-pdf"></i> EXPORT PDF
@@ -2786,15 +2954,19 @@ try {
                         </div>
 
                         <button onclick="renderPayments()"
-                            style="background:var(--accent); color:white; border:none; padding: 0.85rem 1.8rem; border-radius:12px; font-size:0.85rem; font-weight:900; cursor:pointer; height:45px; transition:0.3s; display:flex; align-items:center; gap:8px; box-shadow: 0 4px 15px var(--accent-glow);"
+                            style="background:var(--accent); color:var(--text-main); border:none; padding: 0.85rem 1.8rem; border-radius:12px; font-size:0.85rem; font-weight:900; cursor:pointer; height:45px; transition:0.3s; display:flex; align-items:center; gap:8px; box-shadow: 0 4px 15px var(--accent-glow);"
                             onmouseover="this.style.transform='translateY(-2px)'"
                             onmouseout="this.style.transform='translateY(0)'">
                             <i class="fa-solid fa-filter"></i> APPLY FILTERS
                         </button>
                     </div>
 
+                    <button onclick="downloadReportsCSV()"
+                        style="background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding: 0.85rem 1.5rem; border-radius:12px; font-size:0.75rem; font-weight:800; cursor:pointer; display:flex; align-items:center; gap:8px; height:45px; transition:0.3s;">
+                        <i class="fa-solid fa-file-csv"></i> Export CSV
+                    </button>
                     <button onclick="resetPaymentFilters()"
-                        style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding: 0.85rem 1.5rem; border-radius:12px; font-size:0.75rem; font-weight:800; cursor:pointer; display:flex; align-items:center; gap:8px; height:45px; transition:0.3s;"
+                        style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:var(--text-main); padding: 0.85rem 1.5rem; border-radius:12px; font-size:0.75rem; font-weight:800; cursor:pointer; display:flex; align-items:center; gap:8px; height:45px; transition:0.3s;"
                         onmouseover="this.style.background='rgba(255,255,255,0.1)'"
                         onmouseout="this.style.background='rgba(255,255,255,0.05)'">
                         <i class="fa-solid fa-rotate-right"></i> RESET FILTERS
@@ -2825,7 +2997,7 @@ try {
         <div id="logs" class="view-section">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2.5rem;">
                 <div>
-                    <h1>System Activity & Audit Logs</h1>
+                    <h1 style="color:var(--text-main);">System Activity & Audit Logs</h1>
                     <p style="color:var(--text-dim);">Monitoring security and platform CRUD operations.</p>
                 </div>
                 <button class="btn-action" style="background:var(--error);" onclick="clearAllLogs()">Clear Audit
@@ -2860,43 +3032,69 @@ try {
         <div id="backup" class="view-section">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2.5rem;">
                 <div>
-                    <h1 style="font-size:2.2rem; font-weight:900; letter-spacing:-1px;">System Backup</h1>
+                    <h1 style="color:var(--text-main); font-size:2.2rem; font-weight:900; letter-spacing:-1px;">System
+                        Backup</h1>
                     <p style="color:var(--text-dim); margin-top:5px;">Database and filesystem snapshots.</p>
                 </div>
-                <button class="btn-action" style="background:var(--success); border-radius:12px; padding:12px 24px; font-weight:800;" onclick="createManualBackup()">+ Create Manual Backup</button>
+                <button class="btn-action"
+                    style="background:var(--success); border-radius:12px; padding:12px 24px; font-weight:800;"
+                    onclick="createManualBackup()">+ Create Manual Backup</button>
             </div>
-            <div class="stats-grid" style="grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); margin-bottom:2rem;">
-                <div class="stat-card" style="background:rgba(16, 185, 129, 0.05); border-color:rgba(16, 185, 129, 0.2); padding:2rem; border-radius:24px;">
-                    <p class="stat-label" style="color:var(--success); text-transform:uppercase; font-size:0.75rem; font-weight:900; letter-spacing:1px;">Last Successful Backup</p>
-                    <div class="stat-value" style="font-size:1.5rem; font-weight:900; margin-top:10px;" id="lastBackupTime">None</div>
+            <div class="stats-grid"
+                style="grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); margin-bottom:2rem;">
+                <div class="stat-card"
+                    style="background:rgba(16, 185, 129, 0.05); border-color:rgba(16, 185, 129, 0.2); padding:2rem; border-radius:24px;">
+                    <p class="stat-label"
+                        style="color:var(--success); text-transform:uppercase; font-size:0.75rem; font-weight:900; letter-spacing:1px;">
+                        Last Successful Backup</p>
+                    <div class="stat-value"
+                        style="color:var(--text-main); font-size:1.5rem; font-weight:900; margin-top:10px;"
+                        id="lastBackupTime">None</div>
                 </div>
-                <div class="stat-card" style="background:rgba(255,255,255,0.02); border-color:var(--glass-border); padding:2rem; border-radius:24px;">
-                    <p class="stat-label" style="text-transform:uppercase; font-size:0.75rem; font-weight:900; letter-spacing:1px; color:var(--text-dim);">Total Backup Size</p>
-                    <div class="stat-value" style="font-size:1.5rem; font-weight:900; margin-top:10px;" id="totalBackupSize">0.0 KB</div>
+                <div class="stat-card"
+                    style="background:rgba(255,255,255,0.02); border-color:var(--glass-border); padding:2rem; border-radius:24px;">
+                    <p class="stat-label"
+                        style="text-transform:uppercase; font-size:0.75rem; font-weight:900; letter-spacing:1px; color:var(--text-dim);">
+                        Total Backup Size</p>
+                    <div class="stat-value"
+                        style="color:var(--text-main); font-size:1.5rem; font-weight:900; margin-top:10px;"
+                        id="totalBackupSize">0.0 KB</div>
                 </div>
             </div>
             <div class="glass-panel" style="border-radius:24px; overflow:hidden;">
                 <table class="data-table">
                     <thead style="background:rgba(255,255,255,0.02);">
                         <tr>
-                            <th style="padding:1.5rem; text-align:left; font-size:0.8rem; text-transform:uppercase; color:var(--text-dim);">Backup ID</th>
-                            <th style="padding:1.5rem; text-align:left; font-size:0.8rem; text-transform:uppercase; color:var(--text-dim);">Date/Time</th>
-                            <th style="padding:1.5rem; text-align:left; font-size:0.8rem; text-transform:uppercase; color:var(--text-dim);">Type</th>
-                            <th style="padding:1.5rem; text-align:left; font-size:0.8rem; text-transform:uppercase; color:var(--text-dim);">Status</th>
-                            <th style="padding:1.5rem; text-align:left; font-size:0.8rem; text-transform:uppercase; color:var(--text-dim);">Actions</th>
+                            <th
+                                style="padding:1.5rem; text-align:left; font-size:0.8rem; text-transform:uppercase; color:var(--text-dim);">
+                                Backup ID</th>
+                            <th
+                                style="padding:1.5rem; text-align:left; font-size:0.8rem; text-transform:uppercase; color:var(--text-dim);">
+                                Date/Time</th>
+                            <th
+                                style="padding:1.5rem; text-align:left; font-size:0.8rem; text-transform:uppercase; color:var(--text-dim);">
+                                Type</th>
+                            <th
+                                style="padding:1.5rem; text-align:left; font-size:0.8rem; text-transform:uppercase; color:var(--text-dim);">
+                                Status</th>
+                            <th
+                                style="padding:1.5rem; text-align:left; font-size:0.8rem; text-transform:uppercase; color:var(--text-dim);">
+                                Actions</th>
                         </tr>
                     </thead>
                     <tbody id="backupListContainer"></tbody>
                 </table>
             </div>
-        </div>    </div>
+        </div>
+        </div>
 
         <!-- Section 1.10: Settings -->
         <!-- Section 1.8: Chat Support Hub -->
         <div id="chat" class="view-section">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2.5rem;">
                 <div>
-                    <h1 style="font-size:2.2rem; font-weight:900; letter-spacing:-1px;">Chat Support Hub</h1>
+                    <h1 style="color:var(--text-main); font-size:2.2rem; font-weight:900; letter-spacing:-1px;">Chat
+                        Support Hub</h1>
                     <p style="color:var(--text-dim); margin-top:5px;">Direct communication with workshop owners.</p>
                 </div>
             </div>
@@ -2904,15 +3102,18 @@ try {
             <div style="display:grid; grid-template-columns: 350px 1fr; gap:2rem; height: calc(100vh - 250px);">
                 <!-- Conversation List -->
                 <div class="glass-panel" style="padding:0; overflow:hidden; display:flex; flex-direction:column;">
-                    <div style="padding:1.5rem; border-bottom:1px solid var(--glass-border); display:flex; flex-direction:column; gap:1rem;">
+                    <div
+                        style="padding:1.5rem; border-bottom:1px solid var(--glass-border); display:flex; flex-direction:column; gap:1rem;">
                         <div style="font-weight:800; font-size:0.9rem; text-transform:uppercase; color:var(--accent);">
                             Active Conversations
                         </div>
                         <!-- Search Bar -->
                         <div style="position:relative;">
-                            <i class="fas fa-search" style="position:absolute; left:1rem; top:50%; transform:translateY(-50%); color:var(--text-dim); font-size:0.8rem;"></i>
-                            <input type="text" id="chatSearchInput" onkeyup="filterChatGroups()" placeholder="Search shop name..." 
-                                   style="width:100%; background:rgba(0,0,0,0.2); border:1px solid var(--glass-border); border-radius:12px; padding:0.7rem 1rem 0.7rem 2.5rem; color:white; font-size:0.85rem; outline:none;">
+                            <i class="fas fa-search"
+                                style="position:absolute; left:1rem; top:50%; transform:translateY(-50%); color:var(--text-dim); font-size:0.8rem;"></i>
+                            <input type="text" id="chatSearchInput" onkeyup="filterChatGroups()"
+                                placeholder="Search shop name..."
+                                style="width:100%; background:rgba(0,0,0,0.2); border:1px solid var(--glass-border); border-radius:12px; padding:0.7rem 1rem 0.7rem 2.5rem; color:var(--text-main); font-size:0.85rem; outline:none;">
                         </div>
                     </div>
                     <div id="chatGroupsList" style="flex:1; overflow-y:auto;">
@@ -2925,28 +3126,43 @@ try {
                 </div>
 
                 <!-- Chat Window -->
-                <div class="glass-panel" id="adminChatWindow" style="padding:0; overflow:hidden; display:none; flex-direction:column;">
-                    <div id="adminChatHeader" style="padding:1.5rem; border-bottom:1px solid var(--glass-border); display:flex; justify-content:space-between; align-items:center; background:rgba(99, 102, 241, 0.05);">
-                        <div>
-                            <h3 id="chatTargetName" style="margin:0; font-size:1.1rem; font-weight:900;">Shop Name</h3>
-                            <span style="font-size:0.75rem; color:var(--accent);">Connected</span>
+                <div class="glass-panel" id="adminChatWindow"
+                    style="padding:0; overflow:hidden; display:none; flex-direction:column;">
+                    <div id="adminChatHeader"
+                        style="padding:1.5rem; border-bottom:1px solid var(--glass-border); display:flex; justify-content:space-between; align-items:center; background:rgba(99, 102, 241, 0.05);">
+                        <div style="display:flex; align-items:center; gap:12px;">
+                            <div id="chatHeaderAvatar"
+                                style="width:38px; height:38px; border-radius:50%; background:linear-gradient(135deg, var(--accent), #6366f1); display:flex; align-items:center; justify-content:center; flex-shrink:0; overflow:hidden; box-shadow:0 3px 10px rgba(0,0,0,0.2);">
+                                <span style="font-weight:900; font-size:0.9rem; color:white;">?</span>
+                            </div>
+                            <div>
+                                <h3 id="chatTargetName"
+                                    style="color:var(--text-main); margin:0; font-size:1.1rem; font-weight:900;">Shop Name
+                                </h3>
+                                <span style="font-size:0.75rem; color:var(--accent);">Connected</span>
+                            </div>
                         </div>
                     </div>
-                    <div id="adminChatMessages" style="flex:1; padding:2rem; overflow-y:auto; display:flex; flex-direction:column; gap:1.5rem; background:rgba(0,0,0,0.1);">
+                    <div id="adminChatMessages"
+                        style="flex:1; padding:2rem; overflow-y:auto; display:flex; flex-direction:column; gap:1.5rem; background:rgba(0,0,0,0.1);">
                         <!-- Messages loaded here -->
                     </div>
-                    <div style="padding:1.5rem; border-top:1px solid var(--glass-border); display:flex; gap:1.5rem; background:rgba(0,0,0,0.2);">
-                        <input type="text" id="adminChatInput" class="modern-input" placeholder="Type your reply..." style="flex:1;">
-                        <button class="btn-action" style="padding:0 2.5rem; border-radius:16px;" onclick="sendAdminReply()">
+                    <div
+                        style="padding:1.5rem; border-top:1px solid var(--glass-border); display:flex; gap:1.5rem; background:rgba(0,0,0,0.2);">
+                        <input type="text" id="adminChatInput" class="modern-input" placeholder="Type your reply..."
+                            style="flex:1;">
+                        <button class="btn-action" style="padding:0 2.5rem; border-radius:16px;"
+                            onclick="sendAdminReply()">
                             <i class="fas fa-paper-plane" style="margin-right:10px;"></i> Send
                         </button>
                     </div>
                 </div>
 
                 <!-- Empty State -->
-                <div class="glass-panel" id="chatEmptyState" style="display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; color:var(--text-dim);">
+                <div class="glass-panel" id="chatEmptyState"
+                    style="display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; color:var(--text-dim);">
                     <i class="fa-solid fa-comments" style="font-size:4rem; margin-bottom:1.5rem; opacity:0.1;"></i>
-                    <h3>Select a conversation</h3>
+                    <h3 style="color:var(--text-main);">Select a conversation</h3>
                     <p>Choose a shop from the left to start chatting.</p>
                 </div>
             </div>
@@ -2955,7 +3171,7 @@ try {
         <div id="settings" class="view-section">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2.5rem;">
                 <div>
-                    <h1>System Configuration</h1>
+                    <h1 style="color:var(--text-main);">System Configuration</h1>
                     <p style="color:var(--text-dim);">Global settings, branding, limits, and permissions.</p>
                 </div>
                 <button class="btn-action" onclick="saveConfiguration(this)">Save Configuration</button>
@@ -3008,32 +3224,40 @@ try {
 
             <!-- Admin Team Management -->
             <div class="glass-panel" style="margin-top:2rem;">
-                <h3 style="margin-bottom: 2rem; display: flex; align-items: center; gap: 12px; font-size: 1.1rem; color: var(--accent);">
+                <h3
+                    style="margin-bottom: 2rem; display: flex; align-items: center; gap: 12px; font-size: 1.1rem; color: var(--accent);">
                     <i class="fa-solid fa-user-shield"></i> Admin Team Management
                 </h3>
-                
-                <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--glass-border); border-radius: 20px; padding: 1rem; margin-bottom: 2.5rem;">
+
+                <div
+                    style="background: rgba(255,255,255,0.02); border: 1px solid var(--glass-border); border-radius: 20px; padding: 1rem; margin-bottom: 2.5rem;">
                     <table style="width:100%; border-collapse: collapse;">
                         <thead>
-                            <tr style="text-align:left; color:var(--text-dim); font-size:0.75rem; text-transform:uppercase; letter-spacing:1px;">
+                            <tr
+                                style="text-align:left; color:var(--text-dim); font-size:0.75rem; text-transform:uppercase; letter-spacing:1px;">
                                 <th style="padding:1rem;">Name</th>
                                 <th style="padding:1rem;">Username</th>
                                 <th style="padding:1rem; text-align:right;">Actions</th>
                             </tr>
                         </thead>
                         <tbody id="adminListBody">
-                            <?php foreach($admins_db as $adm): ?>
+                            <?php foreach ($admins_db as $adm): ?>
                                 <tr style="border-top:1px solid var(--glass-border);">
-                                    <td style="padding:1rem; font-weight:700;"><?php echo htmlspecialchars($adm['name']); ?></td>
-                                    <td style="padding:1rem; color:var(--text-dim);"><?php echo htmlspecialchars($adm['email']); ?></td>
+                                    <td style="padding:1rem; font-weight:700; color:var(--text-main);">
+                                        <?php echo htmlspecialchars($adm['name']); ?></td>
+                                    <td style="padding:1rem; color:var(--text-dim);">
+                                        <?php echo htmlspecialchars($adm['email']); ?></td>
                                     <td style="padding:1rem; text-align:right;">
-                                        <?php if($adm['id'] != ($_SESSION['user_id'] ?? '')): ?>
-                                            <button class="btn-action" style="background:var(--error); padding:6px 12px; font-size:0.75rem;" 
-                                                    onclick="deleteAdmin(<?php echo $adm['id']; ?>, '<?php echo htmlspecialchars($adm['name']); ?>')">
+                                        <?php if ($adm['id'] != ($_SESSION['user_id'] ?? '')): ?>
+                                            <button class="btn-action"
+                                                style="background:var(--error); padding:6px 12px; font-size:0.75rem;"
+                                                onclick="deleteAdmin(<?php echo $adm['id']; ?>, '<?php echo htmlspecialchars($adm['name']); ?>')">
                                                 Remove
                                             </button>
                                         <?php else: ?>
-                                            <span style="font-size:0.7rem; color:var(--accent); font-weight:800; text-transform:uppercase;">You (Main)</span>
+                                            <span
+                                                style="font-size:0.7rem; color:var(--accent); font-weight:800; text-transform:uppercase;">You
+                                                (Main)</span>
                                         <?php endif; ?>
                                     </td>
                                 </tr>
@@ -3042,8 +3266,10 @@ try {
                     </table>
                 </div>
 
-                <div style="background: rgba(99, 102, 241, 0.03); border: 1px solid rgba(99, 102, 241, 0.1); border-radius: 24px; padding: 1.5rem;">
-                    <h4 style="margin-bottom:1.5rem; font-size:0.9rem; color:white;">Add New Administrator</h4>
+                <div
+                    style="background: rgba(99, 102, 241, 0.03); border: 1px solid rgba(99, 102, 241, 0.1); border-radius: 24px; padding: 1.5rem;">
+                    <h4 style="margin-bottom:1.5rem; font-size:0.9rem; color:var(--text-main);">Add New Administrator
+                    </h4>
                     <div style="display:grid; grid-template-columns: 1fr 1fr 1fr auto; gap:1.5rem; align-items:end;">
                         <div class="form-group">
                             <label style="font-size:0.7rem; color:var(--text-dim);">Full Name</label>
@@ -3057,7 +3283,8 @@ try {
                             <label style="font-size:0.7rem; color:var(--text-dim);">Initial Password</label>
                             <input type="password" id="newAdminPass" class="modern-input" placeholder="Min 8 chars">
                         </div>
-                        <button class="btn-action" style="padding:1rem 2rem; border-radius:12px;" onclick="addAdmin(this)">
+                        <button class="btn-action" style="padding:1rem 2rem; border-radius:12px;"
+                            onclick="addAdmin(this)">
                             Add Account
                         </button>
                     </div>
@@ -3065,27 +3292,54 @@ try {
             </div>
 
             <!-- Profile Management -->
-            <div class="glass-panel" style="margin-top:2rem; border-top: 1px solid rgba(239, 68, 68, 0.2);">
+            <div class="glass-panel" style="margin-top:2rem; border-top: 1px solid var(--accent);">
                 <h3
-                    style="margin-bottom: 2rem; font-size: 1.1rem; color: var(--error); display: flex; align-items: center; gap: 10px;">
-                    <i class="fa-solid fa-shield-halved"></i> Account Security (Super Admin)
+                    style="margin-bottom: 2rem; font-size: 1.1rem; color: var(--accent); display: flex; align-items: center; gap: 10px;">
+                    <i class="fa-solid fa-user-gear"></i> Super Admin Profile & Security
                 </h3>
                 <div style="display:grid; grid-template-columns: 1fr 1fr; gap:2rem;">
+                    
+                    <div class="form-group" style="grid-column: span 2; display: flex; align-items: center; gap: 20px; background: rgba(255,255,255,0.02); padding: 1.5rem; border-radius: 16px; border: 1px dashed var(--glass-border);">
+                        <div id="settingsAdminAvatarPreview" style="width: 70px; height: 70px; border-radius: 50%; background: linear-gradient(135deg, var(--accent), #6366f1); display: flex; align-items: center; justify-content: center; overflow: hidden; border: 2px solid rgba(255, 255, 255, 0.1); box-shadow: 0 4px 15px rgba(0,0,0,0.3); flex-shrink: 0;">
+                            <?php if ($admin_avatar): ?>
+                                <img src="<?php echo htmlspecialchars($admin_avatar); ?>" style="width: 100%; height: 100%; object-fit: cover;">
+                            <?php else: ?>
+                                <span style="font-weight: 800; font-size: 1.5rem; color: white;"><?php echo mb_strtoupper(mb_substr($admin_name, 0, 1)); ?></span>
+                            <?php endif; ?>
+                        </div>
+                        <div style="flex: 1;">
+                            <label style="color:var(--text-main); font-weight:700; display:block; margin-bottom: 6px;">Profile Photo</label>
+                            <input type="file" id="settingAdminAvatarFile" accept="image/*" class="modern-input" style="background: rgba(0,0,0,0.2); padding: 8px 12px; font-size: 0.85rem;">
+                            <span style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; display: block;">Recommended size: Square image. JPG, PNG or WebP.</span>
+                        </div>
+                    </div>
+
                     <div class="form-group">
-                        <label style="color:rgba(255,255,255,0.7); font-weight:700;">New Password</label>
+                        <label style="color:var(--text-main); font-weight:700;">Display Name</label>
+                        <input type="text" class="modern-input" id="settingAdminName"
+                            value="<?php echo htmlspecialchars($admin_name); ?>" required style="background: rgba(0,0,0,0.2);">
+                    </div>
+                    <div class="form-group">
+                        <label style="color:var(--text-main); font-weight:700;">Email Address</label>
+                        <input type="email" class="modern-input" id="settingAdminEmail"
+                            value="<?php echo htmlspecialchars($admin_row['email'] ?? ''); ?>" required style="background: rgba(0,0,0,0.2);">
+                    </div>
+
+                    <div class="form-group">
+                        <label style="color:var(--text-main); font-weight:700;">New Password</label>
                         <input type="password" class="modern-input" id="settingAdminPassword"
                             placeholder="Leave blank to keep current" style="background: rgba(0,0,0,0.2);">
                     </div>
                     <div class="form-group">
-                        <label style="color:rgba(255,255,255,0.7); font-weight:700;">Confirm Password</label>
+                        <label style="color:var(--text-main); font-weight:700;">Confirm Password</label>
                         <input type="password" class="modern-input" id="settingAdminPasswordConfirm"
                             placeholder="••••••••" style="background: rgba(0,0,0,0.2);">
                     </div>
                     <div style="grid-column: span 2; display: flex; justify-content: center; margin-top: 1rem;">
                         <button class="btn-action"
-                            style="background:var(--error); padding: 1rem 3rem; border-radius: 14px; font-weight: 800; font-size: 0.9rem; box-shadow: 0 10px 25px rgba(239, 68, 68, 0.3); transition: 0.3s; border: none; cursor: pointer;"
+                            style="background:var(--accent); padding: 1rem 3rem; border-radius: 14px; font-weight: 800; font-size: 0.9rem; box-shadow: 0 10px 25px rgba(99, 102, 241, 0.3); transition: 0.3s; border: none; cursor: pointer;"
                             onclick="saveConfiguration(this)">
-                            Confirm Password Update
+                            Save Changes
                         </button>
                     </div>
                 </div>
@@ -3100,7 +3354,8 @@ try {
             <button class="btn-close-modal" onclick="closeShopModal()">&times;</button>
             <div class="logo-icon">A</div>
             <h2 id="shopModalTitle"
-                style="margin-bottom:0.5rem; font-size:1.8rem; font-weight:800; color:white; text-align:center;">Onboard
+                style="margin-bottom:0.5rem; font-size:1.8rem; font-weight:800; color:var(--text-main); text-align:center;">
+                Onboard
                 Your Shop</h2>
             <p id="shopModalSub"
                 style="color:var(--text-dim); margin-bottom:2.5rem; text-align:center; font-size:0.95rem;">Join the 500+
@@ -3143,13 +3398,19 @@ try {
                 <div id="passwordFields" style="display:grid; grid-template-columns:1fr 1fr; gap:1.2rem;">
                     <div class="form-group">
                         <label>Create Password</label>
-                        <input type="password" id="shopPassword" name="password" class="modern-input"
-                            placeholder="Min. 8 characters">
+                        <div class="password-wrapper">
+                            <input type="password" id="shopPassword" name="password" class="modern-input"
+                                placeholder="Min. 8 characters">
+                            <i class="fas fa-eye toggle-password" onclick="togglePasswordVisibility('shopPassword', this)"></i>
+                        </div>
                     </div>
                     <div class="form-group">
                         <label>Confirm Password</label>
-                        <input type="password" id="shopConfirmPassword" class="modern-input"
-                            placeholder="Re-type password">
+                        <div class="password-wrapper">
+                            <input type="password" id="shopConfirmPassword" class="modern-input"
+                                placeholder="Re-type password">
+                            <i class="fas fa-eye toggle-password" onclick="togglePasswordVisibility('shopConfirmPassword', this)"></i>
+                        </div>
                     </div>
                 </div>
 
@@ -3189,7 +3450,9 @@ try {
         <div class="modal-card">
             <button class="btn-close-modal" onclick="closePlanModal()">&times;</button>
             <div class="logo-icon" style="background:linear-gradient(135deg,#6366f1,#a855f7);">✦</div>
-            <h2 style="margin-bottom:0.5rem; font-size:1.8rem; font-weight:800; color:white; text-align:center;">Edit
+            <h2
+                style="margin-bottom:0.5rem; font-size:1.8rem; font-weight:800; color:var(--text-main); text-align:center;">
+                Edit
                 Subscription Plan</h2>
             <p style="color:var(--text-dim); margin-bottom:2.5rem; text-align:center; font-size:0.95rem;">Changes will
                 reflect immediately on the landing page.</p>
@@ -3209,15 +3472,15 @@ try {
                     <div class="form-group">
                         <label>Monthly Price</label>
                         <div class="input-with-prefix">
-                            <span class="input-prefix" style="font-weight:800; color:white;">₱</span>
-                            <input type="number" id="monthlyPrice" class="modern-input has-prefix" required 
+                            <span class="input-prefix" style="font-weight:800; color:var(--text-main);">₱</span>
+                            <input type="number" id="monthlyPrice" class="modern-input has-prefix" required
                                 oninput="document.getElementById('yearlyPrice').value = Math.round(this.value * 12 * 0.8)">
                         </div>
                     </div>
                     <div class="form-group">
                         <label>Yearly Price</label>
                         <div class="input-with-prefix">
-                            <span class="input-prefix" style="font-weight:800; color:white;">₱</span>
+                            <span class="input-prefix" style="font-weight:800; color:var(--text-main);">₱</span>
                             <input type="number" id="yearlyPrice" class="modern-input has-prefix" required>
                         </div>
                     </div>
@@ -3270,12 +3533,13 @@ try {
     <!-- Notification Modal (Alert/Confirm) -->
     <div class="modal-overlay" id="notificationModal" style="z-index: 9999; display: none;">
         <div class="modal-card"
-            style="max-width: 450px; text-align: center; padding: 3rem 2.5rem; background: rgba(10,10,20,0.95); border: 1px solid var(--glass-border); box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);">
+            style="max-width: 450px; text-align: center; padding: 3rem 2.5rem; background: var(--modal-bg); border: 1px solid var(--glass-border); box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);">
             <div id="notiIcon"
-                style="width: 80px; height: 80px; background: rgba(99, 102, 241, 0.1); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 2rem; font-size: 2.5rem; color: var(--accent); transition: 0.3s;">
+                style="width: 80px; height: 80px; background: var(--accent-glow); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 2rem; font-size: 2.5rem; color: var(--accent); transition: 0.3s;">
                 <i class="fa-solid fa-circle-info"></i>
             </div>
-            <h2 id="notiTitle" style="margin-bottom: 1rem; font-size: 1.6rem; font-weight: 800; color: white;">Notice
+            <h2 id="notiTitle"
+                style="margin-bottom: 1rem; font-size: 1.6rem; font-weight: 800; color: var(--text-main);">Notice
             </h2>
             <p id="notiMessage"
                 style="color: var(--text-dim); margin-bottom: 2.5rem; line-height: 1.6; font-size: 1rem;">Message goes
@@ -3296,7 +3560,8 @@ try {
             <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom: 2rem;">
                 <div>
                     <h2 id="dossierTitle"
-                        style="font-size: 2.2rem; letter-spacing: -1.5px; font-weight: 900; color:white;">Applicant
+                        style="font-size: 2.2rem; letter-spacing: -1.5px; font-weight: 900; color:var(--text-main);">
+                        Applicant
                         Dossier</h2>
                     <p id="dossierSubtitle"
                         style="color: var(--accent); font-weight: 700; text-transform: uppercase; font-size: 0.8rem; letter-spacing: 2px;">
@@ -3414,7 +3679,8 @@ try {
             </div>
 
             <div style="margin-top: 2rem;">
-                <button class="btn-gradient" style="width:100%; border-radius: 16px;" onclick="closeProofModal()">Close Document</button>
+                <button class="btn-gradient" style="width:100%; border-radius: 16px;" onclick="closeProofModal()">Close
+                    Document</button>
             </div>
         </div>
     </div>
@@ -3424,35 +3690,50 @@ try {
         <div class="modal-card" style="max-width: 550px;">
             <button class="btn-close-modal" onclick="closeMasterServiceModal()">&times;</button>
             <div class="logo-icon" style="background: var(--accent);"><i class="fas fa-tags"></i></div>
-            <h2 id="msModalTitle" style="margin-bottom:0.5rem; font-size:1.8rem; font-weight:800; color:white; text-align:center;">
+            <h2 id="msModalTitle"
+                style="margin-bottom:0.5rem; font-size:1.8rem; font-weight:800; color:white; text-align:center;">
                 Standard Service</h2>
-            <p style="color:var(--text-dim); margin-bottom:2rem; text-align:center; font-size:0.9rem;">Set the global pricing boundary for this automotive service.</p>
-            
+            <p style="color:var(--text-dim); margin-bottom:2rem; text-align:center; font-size:0.9rem;">Set the global
+                pricing boundary for this automotive service.</p>
+
             <form id="masterServiceForm" onsubmit="saveMasterService(event)">
                 <input type="hidden" name="master_id" id="ms_id">
                 <div style="margin-bottom: 1.5rem;">
-                    <label style="display:block; margin-bottom:0.5rem; font-size:0.85rem; color:var(--text-dim); font-weight:600;">Service Name</label>
-                    <input type="text" name="service_name" id="ms_name" required class="modern-input" placeholder="e.g. Oil Change (Synthetic)">
+                    <label
+                        style="display:block; margin-bottom:0.5rem; font-size:0.85rem; color:var(--text-dim); font-weight:600;">Service
+                        Name</label>
+                    <input type="text" name="service_name" id="ms_name" required class="modern-input"
+                        placeholder="e.g. Oil Change (Synthetic)">
                 </div>
                 <div style="margin-bottom: 1.5rem;">
-                    <label style="display:block; margin-bottom:0.5rem; font-size:0.85rem; color:var(--text-dim); font-weight:600;">Category</label>
-                    <input type="text" name="category" id="ms_cat" required class="modern-input" placeholder="e.g. Maintenance">
+                    <label
+                        style="display:block; margin-bottom:0.5rem; font-size:0.85rem; color:var(--text-dim); font-weight:600;">Category</label>
+                    <input type="text" name="category" id="ms_cat" required class="modern-input"
+                        placeholder="e.g. Maintenance">
                 </div>
                 <div style="display:grid; grid-template-columns: 1fr 1fr; gap:1.5rem; margin-bottom:2rem;">
                     <div>
-                        <label style="display:block; margin-bottom:0.5rem; font-size:0.85rem; color:var(--success); font-weight:600;">Min Price (Floor)</label>
-                        <input type="number" name="min_price" id="ms_min" required class="modern-input" value="0" step="0.01">
+                        <label
+                            style="display:block; margin-bottom:0.5rem; font-size:0.85rem; color:var(--success); font-weight:600;">Min
+                            Price (Floor)</label>
+                        <input type="number" name="min_price" id="ms_min" required class="modern-input" value="0"
+                            step="0.01">
                     </div>
                     <div>
-                        <label style="display:block; margin-bottom:0.5rem; font-size:0.85rem; color:var(--error); font-weight:600;">Max Price (Ceiling)</label>
-                        <input type="number" name="max_price" id="ms_max" required class="modern-input" value="0" step="0.01">
+                        <label
+                            style="display:block; margin-bottom:0.5rem; font-size:0.85rem; color:var(--error); font-weight:600;">Max
+                            Price (Ceiling)</label>
+                        <input type="number" name="max_price" id="ms_max" required class="modern-input" value="0"
+                            step="0.01">
                     </div>
                 </div>
-                <button type="submit" class="btn-gradient" style="width:100%; padding:1.2rem; font-weight:800; border-radius:15px;">SAVE SERVICE STANDARD</button>
+                <button type="submit" class="btn-gradient"
+                    style="width:100%; padding:1.2rem; font-weight:800; border-radius:15px;">SAVE SERVICE
+                    STANDARD</button>
             </form>
         </div>
     </div>
-        </div>
+    </div>
     </div>
 
     <script>
@@ -3510,6 +3791,7 @@ try {
                 window.serverUserCounts = <?php echo json_encode($user_counts); ?> || { active: 0, inactive: 0 };
                 window.systemSettings = <?php echo json_encode($settings_db); ?> || {};
                 window.dashboardTrends = <?php echo json_encode($dashboard_trends); ?> || [];
+                window.adminAvatarUrl = <?php echo json_encode($admin_avatar); ?>;
 
                 reports = shops.map(s => ({
                     name: s.name,
@@ -3519,6 +3801,8 @@ try {
                 }));
 
                 console.log("Database initialized successfully", { shops: shops.length, plans: plans.length });
+                if (plans.length === 0) console.warn("No plans found in database!");
+                if (shops.length > 0) console.log("Sample Shop Data:", shops[0]);
             } catch (err) {
                 console.error("Critical error loading database variables:", err);
                 shops = []; payments = []; logs = []; plans = []; backups = [];
@@ -3550,7 +3834,15 @@ try {
                 body: formData
             }).then(() => {
                 // Also update local list for immediate display
-                logs.unshift({ time: new Date().toISOString().replace('T', ' ').split('.')[0], source: `${source} (${user})`, activity, type });
+                const now = new Date();
+                const year = now.getFullYear();
+                const month = String(now.getMonth() + 1).padStart(2, '0');
+                const day = String(now.getDate()).padStart(2, '0');
+                const hours = String(now.getHours()).padStart(2, '0');
+                const minutes = String(now.getMinutes()).padStart(2, '0');
+                const seconds = String(now.getSeconds()).padStart(2, '0');
+                const timeStr = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+                logs.unshift({ time: timeStr, source: `${source} (${user})`, activity, type });
                 if (logs.length > 100) logs.pop();
                 renderLogs();
             });
@@ -3596,7 +3888,7 @@ try {
                 try { renderLogs(); } catch (e) { console.error("Logs render error", e); }
                 try { renderPayments(); } catch (e) { console.error("Payments render error", e); }
                 try { renderReports(); } catch (e) { console.error("Reports render", e); }
-                try { renderBackups(); } catch (e) { console.error("Backups render", e); }
+                // try { renderBackups(); } catch (e) { console.error("Backups render error", e); }
                 try { renderMasterServices(); } catch (e) { console.error("Master Services render", e); }
 
                 // Final Chart Update
@@ -3744,11 +4036,11 @@ try {
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
                     <td style="font-size:0.75rem; color:var(--text-dim);">${formatTimestamp(p.date)}</td>
-                    <td><code style="background:rgba(255,255,255,0.05); padding:3px 8px; border-radius:5px; font-size:0.8rem;">${p.ref}</code></td>
-                    <td><div style="font-weight:700;">${p.shopName}</div></td>
-                    <td><b>₱${parseFloat(p.amount).toLocaleString()}</b></td>
+                    <td><code style="background:var(--input-bg); padding:3px 8px; border-radius:5px; font-size:0.8rem; color:var(--accent);">极 ${p.ref}</code></td>
+                    <td><div style="font-weight:700; color:var(--text-main);">${p.shopName}</div></td>
+                    <td><b style="color:var(--text-main);">₱${parseFloat(p.amount).toLocaleString()}</b></td>
                     <td style="text-align:center;">
-                        <span style="font-size:0.7rem; font-weight:800; color:var(--text-dim); background:rgba(255,255,255,0.03); padding:4px 10px; border-radius:8px; border:1px solid var(--glass-border);">
+                        <span style="font-size:0.7rem; font-weight:800; color:var(--text-dim); background:var(--input-bg); padding:4px 10px; border-radius:8px; border:1px solid var(--glass-border);">
                             ${(p.payment_method || 'PAYMONGO').toUpperCase()}
                         </span>
                     </td>
@@ -4025,30 +4317,42 @@ try {
                 body.innerHTML = '<tr><td colspan="7" style="text-align:center; padding:2rem; color:var(--text-dim);">No tenants found matching criteria.</td></tr>';
             }
 
+            let grandUsers = 0;
+            let grandBookings = 0;
+            let grandRevenue = 0;
+
             reportShops.forEach(s => {
                 const tr = document.createElement('tr');
                 const lastActStr = s.lastActivity ? formatTimestamp(s.lastActivity) : '—';
                 const joinedStr = s.joined ? formatTimestamp(s.joined).split(',')[0] : '—';
                 const st = (s.status || '').toLowerCase();
 
+                const u = parseInt(s.users || 0);
+                const bVal = parseInt(s.customers || 0);
+                const r = parseFloat(s.revenue || 0);
+
+                grandUsers += u;
+                grandBookings += bVal;
+                grandRevenue += r;
+
                 tr.innerHTML = `
                     <td>
                         <div style="display:flex; align-items:center; gap:12px;">
-                            <div style="width:32px; height:32px; background:rgba(255,255,255,0.05); border:1px solid var(--glass-border); border-radius:10px; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:0.8rem; color:var(--accent);">${(s.name || ' ').charAt(0)}</div>
-                            <div style="font-weight:800; color:white; font-size:0.95rem;">${s.name}</div>
+                            <div style="width:32px; height:32px; background:var(--glass); border:1px solid var(--glass-border); border-radius:10px; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:0.8rem; color:var(--accent);">${(s.name || ' ').charAt(0)}</div>
+                            <div style="font-weight:800; color:var(--text-main); font-size:0.95rem;">${s.name}</div>
                         </div>
                     </td>
                     <td>
                         <div style="display:flex; align-items:center; gap:8px;">
                             <span style="width:10px; height:10px; border-radius:50%; background:${st === 'active' ? 'var(--success)' : (st === 'pending' ? 'var(--warning)' : 'var(--error)')}; box-shadow:0 0 10px ${st === 'active' ? 'rgba(16,185,129,0.4)' : 'rgba(239,68,68,0.4)'};"></span>
-                            <span style="font-weight:700; font-size:0.8rem; color:white; text-transform:uppercase; letter-spacing:0.5px;">${st}</span>
+                            <span style="font-weight:700; font-size:0.8rem; color:var(--text-main); text-transform:uppercase; letter-spacing:0.5px;">${st}</span>
                         </div>
                     </td>
-                    <td><b style="color:white; font-size:1rem;">${(s.users || 0).toLocaleString()}</b></td>
-                    <td><b style="color:var(--accent); font-size:1rem;">${(s.customers || 0).toLocaleString()}</b></td>
+                    <td><b style="color:var(--text-main); font-size:1rem;">${u.toLocaleString()}</b></td>
+                    <td><b style="color:var(--accent); font-size:1rem;">${bVal.toLocaleString()}</b></td>
                     <td>
-                        <div style="background:rgba(16,185,129,0.05); padding:6px 12px; border-radius:10px; border:1px solid rgba(16,185,129,0.1); display:inline-block;">
-                            <b style="color:var(--success); font-size:0.95rem;">₱${(parseFloat(s.revenue) || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</b>
+                        <div style="background:var(--success-glow); padding:6px 12px; border-radius:10px; border:1px solid rgba(16,185,129,0.1); display:inline-block;">
+                            <b style="color:var(--success); font-size:0.95rem;">₱${r.toLocaleString(undefined, { minimumFractionDigits: 2 })}</b>
                         </div>
                     </td>
                     <td style="font-size:0.8rem; color:var(--text-dim); font-weight:500;">${lastActStr}</td>
@@ -4056,6 +4360,21 @@ try {
                 `;
                 body.appendChild(tr);
             });
+
+            // Add Grand Total Row
+            if (reportShops.length > 0) {
+                const totalTr = document.createElement('tr');
+                totalTr.style.background = 'rgba(99, 102, 241, 0.05)';
+                totalTr.style.borderTop = '2px solid var(--accent)';
+                totalTr.innerHTML = `
+                    <td colspan="2" style="text-align:right; font-weight:900; color:var(--accent); letter-spacing:1px; text-transform:uppercase; font-size:0.75rem; padding-right:2rem;">GRAND TOTAL</td>
+                    <td><b style="color:var(--text-main); font-size:1.1rem;">${grandUsers.toLocaleString()}</b></td>
+                    <td><b style="color:var(--accent); font-size:1.1rem;">${grandBookings.toLocaleString()}</b></td>
+                    <td><b style="color:var(--success); font-size:1.1rem;">₱${grandRevenue.toLocaleString(undefined, { minimumFractionDigits: 2 })}</b></td>
+                    <td colspan="2"></td>
+                `;
+                body.appendChild(totalTr);
+            }
 
             updateSystemUsageChart(filteredLogs);
         }
@@ -4209,12 +4528,18 @@ try {
                     s.joined ? new Date(s.joined).toLocaleDateString() : 'N/A'
                 ]);
 
+                const pdfGrandUsers = filteredShops.reduce((sum, s) => sum + parseInt(s.users || 0), 0);
+                const pdfGrandBookings = filteredShops.reduce((sum, s) => sum + parseInt(s.bookings || 0), 0);
+                const pdfGrandRevenue = filteredShops.reduce((sum, s) => sum + parseFloat(s.revenue || 0), 0);
+
                 doc.autoTable({
                     startY: startY + 5,
                     head: [sCols],
                     body: sRows,
+                    foot: [['TOTAL', '', '', '', pdfGrandUsers.toLocaleString(), pdfGrandBookings.toLocaleString(), 'PHP ' + pdfGrandRevenue.toLocaleString(), '']],
                     theme: 'grid',
                     headStyles: { fillColor: [31, 41, 55], textColor: [255, 255, 255], fontStyle: 'bold', fontSize: 10 },
+                    footStyles: { fillColor: [241, 245, 249], textColor: [0, 0, 0], fontStyle: 'bold', fontSize: 9 },
                     styles: { fontSize: 8.5, cellPadding: 3, textColor: [17, 24, 39] },
                     alternateRowStyles: { fillColor: [249, 250, 251] },
                     columnStyles: { 6: { fontStyle: 'bold', halign: 'right' }, 0: { fontStyle: 'bold' } }
@@ -4286,17 +4611,7 @@ try {
             showToast('CSV Exported!');
         }
 
-        function clearAllLogs() {
-            if (!confirm('This will permanently delete your audit logs. Continue?')) return;
-            fetch('dashboard.php?action=clear_logs_db', { method: 'POST' })
-                .then(res => res.json())
-                .then(data => {
-                    if (data.status === 'success') {
-                        showToast('History cleared successfully.');
-                        location.reload();
-                    }
-                });
-        }
+
 
         function renderSettings() {
             const s = window.systemSettings || {};
@@ -4347,6 +4662,14 @@ try {
             formData.append('max_storage_gb', document.getElementById('settingMaxStorage').value);
             formData.append('default_staff_role', document.getElementById('settingDefaultRole').value);
             formData.append('auto_approve_tenant', document.getElementById('settingAutoApprove').checked ? 'on' : 'off');
+            
+            formData.append('admin_name', document.getElementById('settingAdminName').value);
+            formData.append('admin_email', document.getElementById('settingAdminEmail').value);
+            
+            const avatarFile = document.getElementById('settingAdminAvatarFile').files[0];
+            if (avatarFile) {
+                formData.append('admin_avatar_file', avatarFile);
+            }
 
             if (pass) {
                 formData.append('admin_password', pass);
@@ -4385,18 +4708,18 @@ try {
             const name = document.getElementById('newAdminName').value;
             const email = document.getElementById('newAdminEmail').value;
             const pass = document.getElementById('newAdminPass').value;
-            
+
             if (!name || !email || !pass) return alert("Please fill in all admin fields.");
-            
+
             const originalText = btn.innerText;
             btn.innerText = 'Adding...';
             btn.disabled = true;
-            
+
             const fd = new FormData();
             fd.append('name', name);
             fd.append('email', email);
             fd.append('password', pass);
-            
+
             fetch('dashboard.php?action=add_super_admin', { method: 'POST', body: fd })
                 .then(res => res.json())
                 .then(data => {
@@ -4606,81 +4929,7 @@ try {
             showToast('Executive Report Exported!');
         }
 
-        function renderBackups() {
-            const body = document.getElementById('backupTableBody');
-            if (!body) return;
-            body.innerHTML = '';
-            let lastSuccess = 'None';
-            let totalMB = 0;
 
-            const updateStats = () => {
-                if (document.getElementById('lastBackupDate')) document.getElementById('lastBackupDate').innerText = lastSuccess;
-                let sizeStr = totalMB < 1 ? (totalMB * 1024).toFixed(1) + ' KB' : totalMB.toFixed(2) + ' MB';
-                if (document.getElementById('totalBackupSize')) document.getElementById('totalBackupSize').innerText = sizeStr;
-            };
-
-            if (!Array.isArray(backups) || backups.length === 0) {
-                body.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:3rem; color:var(--text-dim);">No server snapshots available.</td></tr>';
-                updateStats(); return;
-            }
-
-            backups.forEach(b => {
-                const sizeMB = parseFloat(b.backup_size || 0);
-                totalMB += sizeMB;
-                if (b.status === 'SUCCESS' && lastSuccess === 'None') lastSuccess = formatTimestamp(b.date);
-
-                const sizeDisplay = sizeMB < 1 ? (sizeMB * 1024).toFixed(1) + ' KB' : sizeMB.toFixed(2) + ' MB';
-                const tr = document.createElement('tr');
-                tr.innerHTML = `
-                    <td><code style="background:rgba(255,255,255,0.05); padding:3px 8px; border-radius:5px; font-size:0.8rem; color:var(--accent);">BKP-${b.id}</code></td>
-                    <td style="font-size:0.75rem; color:var(--text-dim);">${formatTimestamp(b.date)}</td>
-                    <td><span style="font-weight:600;">FULL</span> <span style="font-size:0.7rem; color:var(--text-dim); opacity:0.8;">(${sizeDisplay})</span></td>
-                    <td><span class="badge ${b.status === 'SUCCESS' ? 'badge-active' : 'badge-error'}" style="font-size:0.6rem;">${b.status}</span></td>
-                    <td style="text-align:right;">
-                        <div style="display:flex; justify-content:flex-end; gap:5px;">
-                            <a href="backups/${b.backup_filename}" download class="btn-action" style="padding: 0.4rem 0.7rem; font-size: 0.7rem; background:var(--accent); color:white; text-decoration:none; border-radius:4px;">Download</a>
-                            <button class="btn-action" style="padding: 0.4rem 0.7rem; font-size: 0.7rem; background:rgba(255,255,255,0.1); color:white; border:1px solid rgba(255,255,255,0.1); border-radius:4px;" onclick="showRestoreHint('${b.backup_filename}')">Restore</button>
-                            <button class="btn-action" style="padding: 0.4rem 0.7rem; font-size: 0.7rem; background:rgba(239, 68, 68, 0.1); color:#ef4444; border:1px solid rgba(239, 68, 68, 0.2); border-radius:4px;" onclick="deleteBackup(${b.id})"><i class="fa-solid fa-trash-can"></i></button>
-                        </div>
-                    </td>
-                `;
-                body.appendChild(tr);
-            });
-            updateStats();
-        }
-
-        function showRestoreHint(file) {
-            showAlert('Restore Instructions', `1. Download the file: ${file}\n2. Access your Database Manager (phpMyAdmin).\n3. Select your AutoFix database.\n4. Use the 'Import' tab to upload this file.\n\nAutomated restore is disabled for safety.`);
-        }
-
-        function deleteBackup(id) {
-            showConfirm('Delete Backup', 'Are you sure you want to permanently delete this backup file? This cannot be undone.', () => {
-                const fd = new FormData(); fd.append('backup_id', id);
-                fetch('dashboard.php?action=delete_backup', { method: 'POST', body: fd })
-                    .then(res => res.json()).then(data => {
-                        if (data.status === 'success') { showToast('Backup deleted.'); location.reload(); }
-                        else showAlert('Error', 'Delete failed: ' + data.message, 'error');
-                    });
-            });
-        }
-
-        function initiateBackup() {
-            showConfirm('System Snapshot', 'Generate a new master database snapshot? This may take a few moments.', () => {
-                const btn = event.currentTarget || event.target;
-                const originalText = btn.innerHTML;
-                btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Processing...';
-                btn.disabled = true;
-
-                fetch('dashboard.php?action=create_backup', { method: 'POST' })
-                    .then(res => res.json())
-                    .then(data => {
-                        if (data.status === 'success') { showToast('Manual snapshot created!'); location.reload(); }
-                        else showAlert('Backup Failed', data.message, 'error');
-                    })
-                    .catch(err => showAlert('Connection Error', 'Network error during backup.', 'error'))
-                    .finally(() => { btn.innerHTML = originalText; btn.disabled = false; });
-            });
-        }
 
         const chartFont = { family: "'Outfit', sans-serif", size: 11 };
         const gridColor = 'rgba(255, 255, 255, 0.05)';
@@ -4778,33 +5027,33 @@ try {
                     if (!tbody) return;
                     tbody.innerHTML = data.map(s => `
                         <tr>
-                            <td><div style="font-weight:700; color:white;">${s.service_name}</div></td>
-                            <td><span class="badge" style="background:rgba(255,255,255,0.05); color:var(--text-dim); border:1px solid var(--glass-border);">${s.category}</span></td>
+                            <td><div style="font-weight:700; color:var(--text-main);">${s.service_name}</div></td>
+                            <td><span class="badge" style="background:var(--input-bg); color:var(--text-dim); border:1px solid var(--glass-border);">${s.category}</span></td>
                             <td style="color:var(--success); font-weight:700;">₱${parseFloat(s.min_price).toLocaleString()}</td>
                             <td style="color:var(--error); font-weight:700;">₱${parseFloat(s.max_price).toLocaleString()}</td>
                             <td style="text-align:right;">
-                                <button class="btn-action" style="background:rgba(59,130,246,0.1); color:#3b82f6; border-radius:8px; padding:5px 10px; border:none;" 
+                                <button class="btn-action" style="background:var(--accent-glow); color:var(--accent); border-radius:8px; padding:5px 10px; border:none;" 
                                     onclick='editMasterService(${JSON.stringify(s)})'><i class="fas fa-edit"></i></button>
                                 <button class="btn-action" style="background:rgba(239,68,68,0.1); color:var(--error); border-radius:8px; padding:5px 10px; border:none; margin-left:5px;" 
-                                    onclick="deleteMasterService(${s.master_id})'><i class="fas fa-trash"></i></button>
+                                    onclick="deleteMasterService(${s.master_id})"><i class="fas fa-trash"></i></button>
                             </td>
                         </tr>
                     `).join('');
                 });
         }
 
-        window.openMasterServiceModal = function() {
+        window.openMasterServiceModal = function () {
             document.getElementById('msModalTitle').innerText = "Add Standard Service";
             document.getElementById('masterServiceForm').reset();
             document.getElementById('ms_id').value = "";
             document.getElementById('masterServiceModal').style.display = "flex";
         };
 
-        window.closeMasterServiceModal = function() {
+        window.closeMasterServiceModal = function () {
             document.getElementById('masterServiceModal').style.display = "none";
         };
 
-        window.editMasterService = function(s) {
+        window.editMasterService = function (s) {
             document.getElementById('msModalTitle').innerText = "Edit Standard Service";
             document.getElementById('ms_id').value = s.master_id;
             document.getElementById('ms_name').value = s.service_name;
@@ -4814,14 +5063,14 @@ try {
             document.getElementById('masterServiceModal').style.display = "flex";
         };
 
-        window.saveMasterService = function(e) {
+        window.saveMasterService = function (e) {
             e.preventDefault();
             const formData = new FormData(e.target);
             fetch('dashboard.php?action=save_master_service', {
                 method: 'POST',
                 body: formData
             }).then(r => r.json()).then(res => {
-                if(res.status === 'success') {
+                if (res.status === 'success') {
                     closeMasterServiceModal();
                     renderMasterServices();
                 } else {
@@ -4830,15 +5079,15 @@ try {
             });
         };
 
-        window.deleteMasterService = function(id) {
-            if(!confirm("Are you sure you want to remove this service standard? Shops using it will no longer be restricted.")) return;
+        window.deleteMasterService = function (id) {
+            if (!confirm("Are you sure you want to remove this service standard? Shops using it will no longer be restricted.")) return;
             const formData = new FormData();
             formData.append('id', id);
             fetch('dashboard.php?action=delete_master_service', {
                 method: 'POST',
                 body: formData
             }).then(r => r.json()).then(res => {
-                if(res.status === 'success') renderMasterServices();
+                if (res.status === 'success') renderMasterServices();
             });
         };
 
@@ -4941,10 +5190,11 @@ try {
                 }
 
                 const cycle = (s.billing_cycle || 'monthly').toLowerCase();
-                const currentPlan = plans.find(p => p.id == s.planId);
-                const planName = currentPlan ? currentPlan.name : (s.planName || 'TRIAL');
+                // Ensure planId is compared as numbers
+                const currentPlan = plans.find(p => parseInt(p.id) === parseInt(s.planId || s.plan_id || 0));
+                const planName = (currentPlan ? currentPlan.name : (s.planName || 'TRIAL')).toUpperCase();
                 const price = currentPlan ? (cycle === 'yearly' ? currentPlan.yearlyPrice : currentPlan.monthlyPrice) : 0;
-                const formattedPrice = price > 0 ? '₱' + parseFloat(price).toLocaleString() : 'N/A';
+                const formattedPrice = price > 0 ? '₱' + parseFloat(price).toLocaleString() : 'FREE';
 
                 const s_color = (st === 'pending' ? 'badge-warning' : (st === 'active' ? 'badge-active' : (st === 'suspended' ? 'badge-info' : 'badge-error')));
                 const s_text = (st || 'unknown').toUpperCase();
@@ -4954,12 +5204,12 @@ try {
                 tr.innerHTML = `
                     <td>
                         <div style="display:flex; align-items:center; gap:1.2rem;">
-                            <div style="width:50px; height:50px; background:radial-gradient(circle at 30% 30%, rgba(255,255,255,0.1), transparent); border:1px solid var(--glass-border); border-radius:14px; display:flex; align-items:center; justify-content:center; font-weight:900; color:var(--accent); font-size:1.2rem; box-shadow:0 10px 20px -5px rgba(0,0,0,0.5);">
+                            <div style="width:50px; height:50px; background:var(--glass); border:1px solid var(--glass-border); border-radius:14px; display:flex; align-items:center; justify-content:center; font-weight:900; color:var(--accent); font-size:1.2rem; box-shadow:0 10px 20px -5px rgba(0,0,0,0.2);">
                                 ${s.name.charAt(0)}
                             </div>
                             <div>
                                 <a href="${shopUrl}" target="_blank" style="text-decoration:none; display:flex; align-items:center; gap:6px;">
-                                    <div style="font-weight:800; font-size:1.15rem; color:white;">${s.name}</div>
+                                    <div style="font-weight:800; font-size:1.15rem; color:var(--text-main);">${s.name}</div>
                                     <i class="fa-solid fa-arrow-up-right-from-square" style="font-size:0.7rem; color:var(--accent);"></i>
                                 </a>
                                 <div style="font-size:0.8rem; color:var(--text-dim); margin-top:4px; display:flex; align-items:center; gap:10px;">
@@ -4971,14 +5221,14 @@ try {
                         </div>
                     </td>
                     <td>
-                        <div style="background:rgba(99,102,241,0.05); padding:10px 15px; border-radius:12px; border:1px solid rgba(99,102,241,0.1); display:inline-block;">
+                        <div style="background:var(--accent-glow); padding:10px 15px; border-radius:12px; border:1px solid rgba(99,102,241,0.1); display:inline-block;">
                             <div style="font-weight:900; color:var(--accent); font-size:0.7rem; text-transform:uppercase; letter-spacing:1px;">${planName}</div>
-                            <div style="font-size:1.15rem; color:white; font-weight:900; margin-top:4px;">${formattedPrice} <span style="font-size:0.7rem; color:var(--text-dim); font-weight:500;">/ ${cycle}</span></div>
+                            <div style="font-size:1.15rem; color:var(--text-main); font-weight:900; margin-top:4px;">${formattedPrice} <span style="font-size:0.7rem; color:var(--text-dim); font-weight:500;">/ ${cycle}</span></div>
                         </div>
                     </td>
                     <td style="text-align:center;">
-                        <div style="display:inline-flex; flex-direction:column; align-items:center; background:rgba(255,255,255,0.02); padding:8px 15px; border-radius:12px; border:1px solid var(--glass-border);">
-                            <div style="font-size:1.2rem; font-weight:900; color:white;">${s.customers || 0}</div>
+                        <div style="display:inline-flex; flex-direction:column; align-items:center; background:var(--glass); padding:8px 15px; border-radius:12px; border:1px solid var(--glass-border);">
+                            <div style="font-size:1.2rem; font-weight:900; color:var(--text-main);">${s.customers || 0}</div>
                             <div style="font-size:0.65rem; color:var(--text-dim); font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-top:2px;">Users</div>
                         </div>
                     </td>
@@ -5026,7 +5276,7 @@ try {
             document.getElementById('dos-owner').textContent = s.owner || 'N/A';
             document.getElementById('dos-email').textContent = s.email || 'N/A';
             document.getElementById('dos-address').textContent = s.address || 'N/A';
-            document.getElementById('dos-id-type').textContent = (s.id_type || 'NOT PROVIDED').toUpperCase();
+            document.getElementById('dos-id-type').textContent = (s.id_type || s.idType || 'NOT PROVIDED').toUpperCase();
 
             // ID Photo
             const idImg = document.getElementById('dos-id-img');
@@ -5054,7 +5304,7 @@ try {
             // Actions
             const actions = document.getElementById('dossierActions');
             const st = (s.status || 'pending').toLowerCase();
-            
+
             if (st === 'pending') {
                 actions.innerHTML = `
                     <button class="btn-action" style="padding: 1rem 2.5rem; border-radius: 14px; background: var(--success); color: white; border: none; font-weight: 900; box-shadow: 0 10px 30px rgba(16, 185, 129, 0.3);" onclick="approveTenant(${s.tenant_id}); closeDossierModal();">APPROVE THIS HUB</button>
@@ -5185,12 +5435,12 @@ try {
                     </div>
                     <div class="plan-price">₱${price.toLocaleString()}<span>/${isYearly ? 'year' : 'month'}</span></div>
                     <ul class="plan-features" style="border-top:1px solid var(--glass-border); padding-top:2rem;">
-                        <li style="color:white; font-weight:700;"><i class="fa-solid fa-users" style="color:var(--accent);"></i> Up to <b>${p.maxUsers}</b> Staff Users</li>
-                        <li style="color:white; font-weight:700; margin-bottom:1.5rem;"><i class="fa-solid fa-car-on" style="color:var(--accent);"></i> <b>${p.maxBays}</b> Active Service Bays</li>
-                        ${tierFeatures.map(f => `<li><i class="fa-solid fa-circle-check" style="color:var(--success); font-size:0.7rem; opacity:0.8;"></i> ${f}</li>`).join('')}
+                        <li style="color:var(--text-main); font-weight:700;"><i class="fa-solid fa-users" style="color:var(--accent);"></i> Up to <b>${p.maxUsers}</b> Staff Users</li>
+                        <li style="color:var(--text-main); font-weight:700; margin-bottom:1.5rem;"><i class="fa-solid fa-car-on" style="color:var(--accent);"></i> <b>${p.maxBays}</b> Active Service Bays</li>
+                        ${tierFeatures.map(f => `<li style="color:var(--text-dim);"><i class="fa-solid fa-circle-check" style="color:var(--success); font-size:0.7rem; opacity:0.8;"></i> ${f}</li>`).join('')}
                     </ul>
                     <div style="display:flex; gap:10px; margin-top:auto;">
-                        <button class="btn-action" style="flex:1; padding:0.9rem; border-radius:15px; background:rgba(255,255,255,0.05); color:white; border:1px solid var(--glass-border); font-weight:800; transition:0.3s;" onmouseover="this.style.background='var(--accent)';" onmouseout="this.style.background='rgba(255,255,255,0.05)';" onclick="editPlan(${p.id})">
+                        <button class="btn-action" style="flex:1; padding:0.9rem; border-radius:15px; background:var(--input-bg); color:var(--text-main); border:1px solid var(--glass-border); font-weight:800; transition:0.3s;" onmouseover="this.style.background='var(--accent)'; this.style.color='white';" onmouseout="this.style.background='var(--input-bg)'; this.style.color='var(--text-main)';" onclick="editPlan(${p.id})">
                             <i class="fa-solid fa-gear" style="margin-right:8px; opacity:0.7;"></i> EDIT
                         </button>
                         <button class="btn-action" style="padding:0.9rem 1.2rem; border-radius:15px; background:rgba(239,68,68,0.1); color:var(--error); border:1px solid rgba(239,68,68,0.2); transition:0.3s;" onmouseover="this.style.background='var(--error)'; this.style.color='white';" onmouseout="this.style.background='rgba(239,68,68,0.1)'; this.style.color='var(--error)';" onclick="deletePlan(${p.id}, '${p.name}')">
@@ -5218,7 +5468,7 @@ try {
 
                 const source = l.shop_name
                     ? `<div style="display:flex; flex-direction:column;"><span style="color:var(--accent); font-weight:800; font-size:0.9rem;">${l.shop_name}</span>${staffStr}</div>`
-                    : `<div style="display:flex; flex-direction:column;"><span style="color:white; font-weight:800; font-size:0.9rem;">System</span>${staffStr}</div>`;
+                    : `<div style="display:flex; flex-direction:column;"><span style="color:var(--text-main); font-weight:800; font-size:0.9rem;">System</span>${staffStr}</div>`;
 
                 const typeStr = (l.type || 'INFO').toUpperCase();
                 let badgeClass = 'badge-info';
@@ -5424,8 +5674,16 @@ try {
                     .then(data => {
                         if (data.status === 'success') {
                             showToast('Audit trail cleared successfully.');
+                            const now = new Date();
+                            const year = now.getFullYear();
+                            const month = String(now.getMonth() + 1).padStart(2, '0');
+                            const day = String(now.getDate()).padStart(2, '0');
+                            const hours = String(now.getHours()).padStart(2, '0');
+                            const minutes = String(now.getMinutes()).padStart(2, '0');
+                            const seconds = String(now.getSeconds()).padStart(2, '0');
+                            const timeStr = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
                             logs = [{
-                                time: new Date().toISOString(),
+                                time: timeStr,
                                 source: 'System',
                                 activity: 'Platform Audit Trail purged by Super Admin',
                                 type: 'SECURITY',
@@ -5650,7 +5908,7 @@ try {
         setInterval(checkPendingNotifications, 30000);
 
         // --- SIDEBAR TOGGLE LOGIC ---
-        window.toggleSidebar = function() {
+        window.toggleSidebar = function () {
             const body = document.body;
             body.classList.toggle('sidebar-collapsed');
             const isCollapsed = body.classList.contains('sidebar-collapsed');
@@ -5658,7 +5916,7 @@ try {
         };
 
         // Persistent Sidebar State Restoration
-        (function() {
+        (function () {
             const isCollapsed = localStorage.getItem('superadmin_sidebar_collapsed') === 'true';
             if (isCollapsed) {
                 document.body.classList.add('sidebar-collapsed');
@@ -5670,9 +5928,28 @@ try {
             checkPendingNotifications(); // Initial check
             refreshChatGroups(); // Initial chat load
             setInterval(refreshChatGroups, 10000); // Poll chat groups every 10s
+
+            // Avatar change preview listener
+            const avatarInput = document.getElementById('settingAdminAvatarFile');
+            if (avatarInput) {
+                avatarInput.addEventListener('change', function(e) {
+                    const file = e.target.files[0];
+                    if (file) {
+                        const reader = new FileReader();
+                        reader.onload = function(evt) {
+                            const previewDiv = document.getElementById('settingsAdminAvatarPreview');
+                            if (previewDiv) {
+                                previewDiv.innerHTML = `<img src="${evt.target.result}" style="width: 100%; height: 100%; object-fit: cover;">`;
+                            }
+                        };
+                        reader.readAsDataURL(file);
+                    }
+                });
+            }
         });
 
         let activeChatTenantId = null;
+        let activeChatTenantLogo = null;
         let chatPollInterval = null;
         let allChatGroups = [];
 
@@ -5683,9 +5960,9 @@ try {
                     if (data.status === 'success') {
                         allChatGroups = data.groups;
                         filterChatGroups(); // Render with current filter
-                        
+
                         const totalUnread = data.groups.reduce((sum, g) => sum + parseInt(g.unread_count), 0);
-                        
+
                         // Show notification if total unread count increased
                         const badge = document.getElementById('globalChatBadge');
                         if (badge) {
@@ -5709,7 +5986,7 @@ try {
         function renderChatGroups(groups) {
             const list = document.getElementById('chatGroupsList');
             list.innerHTML = '';
-            
+
             if (groups.length === 0) {
                 list.innerHTML = '<div style="text-align:center; padding:3rem; color:var(--text-dim);">No support conversations yet.</div>';
                 return;
@@ -5722,31 +5999,53 @@ try {
                 item.style.borderBottom = '1px solid var(--glass-border)';
                 item.style.cursor = 'pointer';
                 item.style.background = (activeChatTenantId == g.tenant_id) ? 'rgba(99, 102, 241, 0.1)' : 'transparent';
-                
+
+                const targetPfp = g.tenant_avatar || g.logo_url;
+                const logoHtml = targetPfp
+                    ? `<img src="${targetPfp}" style="width:36px; height:36px; border-radius:50%; object-fit:cover; flex-shrink:0; box-shadow:0 2px 8px rgba(0,0,0,0.2);">`
+                    : `<div style="width:36px; height:36px; border-radius:50%; background:linear-gradient(135deg, var(--accent), #6366f1); display:flex; align-items:center; justify-content:center; flex-shrink:0; font-weight:900; font-size:0.8rem; color:white; box-shadow:0 2px 8px rgba(0,0,0,0.2);">${(g.shop_name || '?')[0].toUpperCase()}</div>`;
+
                 item.innerHTML = `
-                    <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:5px;">
-                        <div style="font-weight:800; font-size:0.95rem;">${g.shop_name}</div>
-                        ${g.unread_count > 0 ? `<span style="background:var(--error); color:white; font-size:0.6rem; padding:2px 6px; border-radius:10px;">${g.unread_count}</span>` : ''}
-                    </div>
-                    <div style="font-size:0.8rem; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
-                        ${g.last_msg || 'No messages yet'}
+                    <div style="display:flex; gap:12px; align-items:center;">
+                        ${logoHtml}
+                        <div style="flex:1; min-width:0;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:3px;">
+                                <div style="font-weight:800; font-size:0.95rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${g.shop_name}</div>
+                                ${g.unread_count > 0 ? `<span style="background:var(--error); color:white; font-size:0.6rem; padding:2px 6px; border-radius:10px; flex-shrink:0;">${g.unread_count}</span>` : ''}
+                            </div>
+                            <div style="font-size:0.8rem; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                                ${g.last_msg || 'No messages yet'}
+                            </div>
+                        </div>
                     </div>
                 `;
-                
-                item.onclick = () => openChatWithTenant(g.tenant_id, g.shop_name);
+
+                item.onclick = () => openChatWithTenant(g.tenant_id, g.shop_name, targetPfp);
                 list.appendChild(item);
             });
         }
 
-        function openChatWithTenant(tid, name) {
+        function openChatWithTenant(tid, name, logoUrl) {
             activeChatTenantId = tid;
+            activeChatTenantLogo = logoUrl || null;
             document.getElementById('chatEmptyState').style.display = 'none';
             document.getElementById('adminChatWindow').style.display = 'flex';
             document.getElementById('chatTargetName').innerText = name;
-            
+
+            // Update header avatar
+            const headerAv = document.getElementById('chatHeaderAvatar');
+            if (headerAv) {
+                if (logoUrl) {
+                    headerAv.innerHTML = `<img src="${logoUrl}" style="width:100%; height:100%; object-fit:cover; border-radius:50%;">`;
+                } else {
+                    headerAv.innerHTML = `<span style="font-weight:900; font-size:0.9rem; color:white;">${(name || '?')[0].toUpperCase()}</span>`;
+                    headerAv.style.background = 'linear-gradient(135deg, var(--accent), #6366f1)';
+                }
+            }
+
             // Highlight in list
             refreshChatGroups();
-            
+
             fetchTenantMessages();
             if (chatPollInterval) clearInterval(chatPollInterval);
             chatPollInterval = setInterval(fetchTenantMessages, 3000);
@@ -5763,38 +6062,146 @@ try {
                 });
         }
 
+        function formatChatTime(dateStr) {
+            if (!dateStr) {
+                const now = new Date();
+                return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            }
+            const date = new Date(dateStr.replace(/-/g, '/'));
+            if (isNaN(date.getTime())) {
+                const now = new Date();
+                return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            }
+            return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+
         function renderAdminMessages(msgs) {
             const box = document.getElementById('adminChatMessages');
             const wasAtBottom = box.scrollHeight - box.clientHeight <= box.scrollTop + 50;
-            
+
             box.innerHTML = '';
-            msgs.forEach(m => {
+            msgs.forEach((m, idx) => {
                 const isAdmin = m.sender_role === 'ADMIN';
-                const div = document.createElement('div');
-                div.style.alignSelf = isAdmin ? 'flex-end' : 'flex-start';
-                div.style.maxWidth = '70%';
-                div.style.padding = '12px 18px';
-                div.style.borderRadius = isAdmin ? '20px 20px 0 20px' : '20px 20px 20px 0';
-                div.style.background = isAdmin ? 'var(--accent)' : 'rgba(255,255,255,0.05)';
-                div.style.border = isAdmin ? 'none' : '1px solid var(--glass-border)';
-                div.style.color = 'white';
-                div.style.fontSize = '0.9rem';
-                div.innerText = m.message;
-                box.appendChild(div);
+
+                // Time Gap Divider (30 minutes or more since last message)
+                if (idx > 0) {
+                    const currentVal = new Date(m.created_at.replace(/-/g, '/'));
+                    const prevVal = new Date(msgs[idx - 1].created_at.replace(/-/g, '/'));
+                    if (!isNaN(currentVal.getTime()) && !isNaN(prevVal.getTime())) {
+                        const diffMins = (currentVal - prevVal) / 60000;
+                        if (diffMins >= 30) {
+                            const divider = document.createElement('div');
+                            divider.style.display = 'flex';
+                            divider.style.alignItems = 'center';
+                            divider.style.width = '100%';
+                            divider.style.margin = '10px 0';
+                            divider.style.color = 'rgba(255,255,255,0.25)';
+                            divider.style.fontSize = '0.75rem';
+                            divider.innerHTML = `
+                                <div style="flex:1; height:1px; background:linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);"></div>
+                                <span style="padding:0 12px; font-weight:600; letter-spacing:0.5px; color:rgba(255,255,255,0.45);">${formatChatTime(m.created_at)}</span>
+                                <div style="flex:1; height:1px; background:linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);"></div>
+                            `;
+                            box.appendChild(divider);
+                        }
+                    }
+                }
+
+                // Message row wrapper
+                const row = document.createElement('div');
+                row.style.display = 'flex';
+                row.style.flexDirection = isAdmin ? 'row-reverse' : 'row';
+                row.style.alignItems = 'flex-start';
+                row.style.gap = '10px';
+                row.style.width = '100%';
+
+                // Avatar
+                const avatar = document.createElement('div');
+                avatar.style.width = '32px';
+                avatar.style.height = '32px';
+                avatar.style.borderRadius = '50%';
+                avatar.style.display = 'flex';
+                avatar.style.alignItems = 'center';
+                avatar.style.justifyContent = 'center';
+                avatar.style.flexShrink = '0';
+                avatar.style.boxShadow = '0 3px 10px rgba(0,0,0,0.15)';
+                avatar.style.overflow = 'hidden';
+
+                if (isAdmin) {
+                    const adminPfp = m.sender_avatar || window.adminAvatarUrl;
+                    if (adminPfp) {
+                        avatar.style.background = 'transparent';
+                        avatar.innerHTML = `<img src="${adminPfp}" style="width:100%; height:100%; object-fit:cover; border-radius:50%;">`;
+                    } else {
+                        avatar.style.background = 'linear-gradient(135deg, #6366f1, #4f46e5)';
+                        avatar.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px; height:14px; color:white;"><path d="M3 18v-6a9 9 0 0 1 18 0v6"></path><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"></path></svg>`;
+                    }
+                } else {
+                    const tenantPfp = m.sender_avatar || m.logo_url;
+                    if (tenantPfp) {
+                        avatar.style.background = 'transparent';
+                        avatar.innerHTML = `<img src="${tenantPfp}" style="width:100%; height:100%; object-fit:cover; border-radius:50%;">`;
+                    } else {
+                        avatar.style.background = 'linear-gradient(135deg, #3b82f6, #1d4ed8)';
+                        avatar.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px; height:14px; color:white;"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v-2"></path><circle cx="12" cy="7" r="4"></circle></svg>`;
+                    }
+                }
+
+                // Content container
+                const contentContainer = document.createElement('div');
+                contentContainer.style.display = 'flex';
+                contentContainer.style.flexDirection = 'column';
+                contentContainer.style.alignItems = isAdmin ? 'flex-end' : 'flex-start';
+                contentContainer.style.maxWidth = '70%';
+
+                const bubble = document.createElement('div');
+                bubble.style.padding = '12px 18px';
+                bubble.style.borderRadius = isAdmin ? '20px 20px 0 20px' : '20px 20px 20px 0';
+                bubble.style.background = isAdmin ? 'var(--accent)' : 'var(--input-bg)';
+                bubble.style.border = isAdmin ? 'none' : '1px solid var(--glass-border)';
+                bubble.style.color = isAdmin ? 'white' : 'var(--text-main)';
+                bubble.style.fontSize = '0.9rem';
+                bubble.innerText = m.message;
+
+                const timeVal = formatChatTime(m.created_at);
+                const timeSpan = document.createElement('span');
+                timeSpan.style.fontSize = '0.7rem';
+                timeSpan.style.color = 'var(--text-dim)';
+                timeSpan.style.marginTop = '4px';
+                timeSpan.style.padding = '0 6px';
+                timeSpan.innerText = timeVal;
+
+                contentContainer.appendChild(bubble);
+                contentContainer.appendChild(timeSpan);
+                row.appendChild(avatar);
+                row.appendChild(contentContainer);
+                box.appendChild(row);
             });
 
             if (wasAtBottom) box.scrollTop = box.scrollHeight;
         }
 
+        function togglePasswordVisibility(inputId, icon) {
+            const input = document.getElementById(inputId);
+            if (input.type === 'password') {
+                input.type = 'text';
+                icon.classList.replace('fa-eye', 'fa-eye-slash');
+            } else {
+                input.type = 'password';
+                icon.classList.replace('fa-eye-slash', 'fa-eye');
+            }
+        }
+
         function sendAdminReply() {
             const input = document.getElementById('adminChatInput');
+            if (!input) return;
             const msg = input.value.trim();
             if (!msg || !activeChatTenantId) return;
 
             const fd = new FormData();
             fd.append('tenant_id', activeChatTenantId);
             fd.append('message', msg);
-            
+
             input.value = '';
             fetch('dashboard.php?action=send_support_reply', { method: 'POST', body: fd })
                 .then(r => r.json())
@@ -5804,7 +6211,10 @@ try {
                 });
         }
 
-        document.getElementById('adminChatInput').onkeypress = (e) => { if(e.key === 'Enter') sendAdminReply(); };
+        const chatInput = document.getElementById('adminChatInput');
+        if (chatInput) {
+            chatInput.onkeypress = (e) => { if (e.key === 'Enter') sendAdminReply(); };
+        }
 
         // Backup Management
         function refreshBackups() {
@@ -5813,35 +6223,65 @@ try {
                 .then(data => {
                     if (data.status === 'success') {
                         renderBackups(data.backups);
-                        document.getElementById('lastBackupTime').innerText = data.lastBackup;
-                        document.getElementById('totalBackupSize').innerText = (data.totalSize / 1024).toFixed(2) + ' KB';
+                        const lastTime = data.lastBackup && data.lastBackup !== 'None' ? formatTimestamp(data.lastBackup) : 'None';
+                        document.getElementById('lastBackupTime').innerText = lastTime;
+
+                        const totalBytes = parseFloat(data.totalSize || 0);
+                        let sizeStr = totalBytes > 1048576
+                            ? (totalBytes / 1048576).toFixed(2) + ' MB'
+                            : (totalBytes / 1024).toFixed(2) + ' KB';
+                        document.getElementById('totalBackupSize').innerText = sizeStr;
                     }
                 });
         }
 
         function renderBackups(list) {
             const container = document.getElementById('backupListContainer');
+            if (!container) return;
             container.innerHTML = '';
-            
-            if (list.length === 0) {
+
+            if (!list || list.length === 0) {
                 container.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:3rem; color:var(--text-dim);">No server snapshots available.</td></tr>';
                 return;
             }
 
             list.forEach(b => {
                 const tr = document.createElement('tr');
+                const bytes = parseFloat(b.file_size || 0);
+                const sizeDisplay = bytes > 1048576
+                    ? (bytes / 1048576).toFixed(2) + ' MB'
+                    : (bytes / 1024).toFixed(2) + ' KB';
+
                 tr.innerHTML = `
                     <td style="padding:1.5rem; color:var(--accent); font-weight:800;">#${b.backup_id}</td>
-                    <td style="padding:1.5rem;">${new Date(b.created_at).toLocaleString()}</td>
-                    <td style="padding:1.5rem;"><span style="background:rgba(255,255,255,0.05); padding:4px 10px; border-radius:6px; font-size:0.7rem;">SQL DUMP</span></td>
-                    <td style="padding:1.5rem;"><span style="color:var(--success);">● ${b.status}</span></td>
-                    <td style="padding:1.5rem; display:flex; gap:10px;">
-                        <a href="backups/${b.filename}" download class="hover-bright" style="color:var(--accent); text-decoration:none;"><i class="fas fa-download"></i> Download</a>
-                        <button onclick="deleteBackup(${b.backup_id})" style="background:none; border:none; color:var(--error); cursor:pointer;"><i class="fas fa-trash"></i></button>
+                    <td style="padding:1.5rem; color:var(--text-main); font-weight:500;">${formatTimestamp(b.created_at)}</td>
+                    <td style="padding:1.5rem;">
+                        <div style="display:flex; flex-direction:column; gap:4px;">
+                            <span style="background:rgba(255,255,255,0.05); padding:4px 10px; border-radius:6px; font-size:0.7rem; color:var(--text-main); display:inline-block; width:fit-content;">DATABASE DUMP</span>
+                            <span style="font-size:0.7rem; color:var(--text-dim); opacity:0.7;">Size: ${sizeDisplay}</span>
+                        </div>
+                    </td>
+                    <td style="padding:1.5rem;"><span class="badge badge-active" style="font-size:0.65rem;">● ${b.status}</span></td>
+                    <td style="padding:1.5rem;">
+                        <div style="display:flex; gap:10px; justify-content:flex-end;">
+                            <a href="backups/${b.filename}" download class="btn-action" style="padding:0.6rem 1rem; border-radius:10px; background:var(--accent); color:white; text-decoration:none; font-size:0.75rem; font-weight:700;">
+                                <i class="fas fa-download" style="margin-right:5px;"></i> Download
+                            </a>
+                            <button class="btn-action" style="padding:0.6rem 1rem; border-radius:10px; background:rgba(255,255,255,0.05); color:var(--text-main); border:1px solid var(--glass-border); font-size:0.75rem;" onclick="showRestoreHint('${b.filename}')">
+                                <i class="fas fa-undo" style="margin-right:5px;"></i> Restore
+                            </button>
+                            <button onclick="deleteBackup(${b.backup_id})" class="btn-action" style="padding:0.6rem; border-radius:10px; background:rgba(239,68,68,0.1); color:var(--error); border:1px solid rgba(239,68,68,0.2);">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </div>
                     </td>
                 `;
                 container.appendChild(tr);
             });
+        }
+
+        function showRestoreHint(file) {
+            showAlert('Restore Instructions', `1. Download the file: ${file}\n2. Access your Database Manager (phpMyAdmin).\n3. Select your AutoFix database.\n4. Use the 'Import' tab to upload this file.\n\nNote: Automated restoration is disabled to prevent accidental data loss.`);
         }
 
         function createManualBackup() {
@@ -5849,7 +6289,7 @@ try {
             const original = btn.innerHTML;
             btn.disabled = true;
             btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Creating...';
-            
+
             fetch('dashboard.php?action=create_backup')
                 .then(r => r.json())
                 .then(data => {
@@ -5879,49 +6319,23 @@ try {
             });
         }
 
-        // Add to refreshUI
+        // --- View Refresh Override ---
         const originalRefreshUI = window.refreshUI;
-        window.refreshUI = function() {
+        window.refreshUI = function () {
             if (typeof originalRefreshUI === 'function') originalRefreshUI();
-            const activeView = document.querySelector('.view-section.active').id;
-            if (activeView === 'backup') refreshBackups();
+            const activeViewEl = document.querySelector('.view-section.active');
+            if (activeViewEl && activeViewEl.id === 'backup') {
+                refreshBackups();
+            }
         };
 
         // Initial load for backup if visible
-        window.addEventListener('load', () => {
-            if (document.getElementById('backup').classList.contains('active')) refreshBackups();
+        window.addEventListener('DOMContentLoaded', () => {
+            const activeViewEl = document.querySelector('.view-section.active');
+            if (activeViewEl && activeViewEl.id === 'backup') refreshBackups();
         });
 
-        // Theme Management for Super Admin Dashboard
-        (function () {
-            const themeBtn = document.getElementById('theme-toggle');
-            if (!themeBtn) return;
-            const themeIcon = themeBtn.querySelector('i');
-            const themeLabel = themeBtn.querySelector('.nav-label');
-            const html = document.documentElement;
 
-            const updateThemeUI = (theme) => {
-                if (theme === 'light') {
-                    if (themeIcon) themeIcon.classList.replace('fa-moon', 'fa-sun');
-                    if (themeLabel) themeLabel.innerText = 'Light Mode';
-                } else {
-                    if (themeIcon) themeIcon.classList.replace('fa-sun', 'fa-moon');
-                    if (themeLabel) themeLabel.innerText = 'Dark Mode';
-                }
-            };
-
-            const savedTheme = localStorage.getItem('superadmin_theme') || 'dark';
-            html.setAttribute('data-theme', savedTheme);
-            updateThemeUI(savedTheme);
-
-            themeBtn.addEventListener('click', () => {
-                const current = html.getAttribute('data-theme');
-                const next = current === 'light' ? 'dark' : 'light';
-                html.setAttribute('data-theme', next);
-                localStorage.setItem('superadmin_theme', next);
-                updateThemeUI(next);
-            });
-        })();
     </script>
 </body>
 

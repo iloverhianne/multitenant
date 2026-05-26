@@ -48,6 +48,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
             
             echo json_encode(['status' => 'success', 'message' => 'Email verified successfully! Profile activated.']);
         } catch (PDOException $e) {
+            $logData = date('Y-m-d H:i:s') . " - Error: " . $e->getMessage() . " - Data: " . json_encode($customer_data) . "\n";
+            file_put_contents('customer_error.log', $logData, FILE_APPEND);
             if ($e->getCode() == 23000 || strpos($e->getMessage(), '1062') !== false) {
                 echo json_encode(['status' => 'error', 'message' => 'This email is already registered with this shop.']);
             } else {
@@ -207,8 +209,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
                 $qr_img_url = "https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=" . urlencode($download_url);
             ?>
 
-            <div style="background: white; padding: 12px; border-radius: 20px; display: inline-block; margin-bottom: 2rem; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
+            <div style="background: white; padding: 12px; border-radius: 20px; display: inline-block; margin-bottom: 1rem; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
                 <img src="<?php echo $qr_img_url; ?>" alt="Scan to Download APK" style="width: 150px; height: 150px; display: block; border-radius: 10px;">
+            </div>
+
+            <a href="<?php echo $download_url; ?>" class="btn-main" style="display:inline-flex; align-items:center; justify-content:center; gap:10px; text-decoration:none; margin-bottom: 1rem; padding: 1rem;">
+                <i class="fas fa-mobile-alt"></i> Download Mobile App
+            </a>
+
+            <div style="margin-bottom: 2rem;">
+                <a href="<?php echo $download_url; ?>" style="color:var(--text-dim); font-size: 0.8rem; text-decoration: underline;">Or click here if download doesn't start</a>
             </div>
 
             <button onclick="window.location.replace('shop.php?id=<?php echo urlencode($slug); ?>')" class="btn-main" style="background: transparent; border: 1px solid var(--text-dim); color: var(--text-main); box-shadow:none; padding: 0.8rem;">Continue to Shop</button>

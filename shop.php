@@ -201,6 +201,15 @@ $theme = $shop['ui_style'] ?: 'GLASS';
         
         body { background-color: var(--bg-deep); color: var(--text-main); min-height: 100vh; overflow-x: hidden; scroll-behavior: smooth; }
 
+        /* Banner Support */
+        .hero {
+            <?php if (!empty($shop['banner_url'])): ?>
+            background-image: linear-gradient(to bottom, rgba(var(--bg-rgb), 0.7), var(--bg-deep)), url('<?php echo htmlspecialchars($shop['banner_url']); ?>') !important;
+            background-size: cover !important;
+            background-position: center !important;
+            <?php endif; ?>
+        }
+
         @keyframes float { 0% { transform: translateY(0px); } 50% { transform: translateY(-10px); } 100% { transform: translateY(0px); } }
         @keyframes glow { 0% { box-shadow: 0 0 20px var(--accent-glow); } 50% { box-shadow: 0 0 40px var(--accent-glow); } 100% { box-shadow: 0 0 20px var(--accent-glow); } }
 
@@ -265,6 +274,9 @@ $theme = $shop['ui_style'] ?: 'GLASS';
         /* --- THEME: GLASS (DEFAULT) --- */
         <?php if ($theme === 'GLASS'): ?>
         .hero { position: relative; padding: 160px 8% 120px; text-align: center; background: radial-gradient(circle at 50% -20%, var(--accent-glow), transparent 70%); }
+        <?php if (!empty($shop['banner_url'])): ?>
+        .hero { background: linear-gradient(rgba(var(--bg-rgb), 0.8), var(--bg-deep)), url('<?php echo htmlspecialchars($shop['banner_url']); ?>') no-repeat center center / cover !important; }
+        <?php endif; ?>
         .hero::before { content: ''; position: absolute; top: 10%; left: 10%; width: 300px; height: 300px; background: var(--accent); filter: blur(150px); opacity: 0.1; }
         .hero h1 { font-size: 5.5rem; font-weight: 950; letter-spacing: -3.5px; margin-bottom: 2rem; line-height: 0.95; }
         .hero h1 span { background: var(--gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
@@ -284,7 +296,7 @@ $theme = $shop['ui_style'] ?: 'GLASS';
         <?php if ($theme === 'PREMIUM'): ?>
         .hero { 
             padding: 220px 10% 150px; text-align: left; 
-            background: linear-gradient(to right, var(--bg-deep) 40%, rgba(0,0,0,0.4)), url('https://images.unsplash.com/photo-1625047509168-a7026f36ae04?q=80&w=2000&auto=format&fit=crop'); 
+            background: linear-gradient(to right, var(--bg-deep) 40%, rgba(0,0,0,0.4)), url('<?php echo htmlspecialchars($shop['banner_url'] ?: "https://images.unsplash.com/photo-1625047509168-a7026f36ae04?q=80&w=2000&auto=format&fit=crop"); ?>'); 
             background-size: cover; background-position: center; position: relative; 
         }
         .hero::after { content: ''; position: absolute; bottom: 0; left: 0; width: 100%; height: 200px; background: linear-gradient(to top, var(--bg-deep), transparent); }
@@ -346,8 +358,10 @@ $theme = $shop['ui_style'] ?: 'GLASS';
 
     <nav>
         <div class="logo" id="preview_shop_name">
-            <img src="<?php echo htmlspecialchars($shop['logo_url'] ?: ''); ?>" alt="logo" id="preview_logo" 
-                 style="<?php echo empty($shop['logo_url']) ? 'display:none;' : 'display:block;'; ?> width: 40px; height: 40px; border-radius: 8px; object-fit: cover;">
+            <?php if (!empty($shop['logo_url'])): ?>
+                <img src="<?php echo htmlspecialchars($shop['logo_url']); ?>" alt="logo" id="preview_logo" 
+                     style="width: 40px; height: 40px; border-radius: 8px; object-fit: cover;">
+            <?php endif; ?>
             <span><?php echo htmlspecialchars($shop['shop_name']); ?></span>
         </div>
         <div class="nav-links">
