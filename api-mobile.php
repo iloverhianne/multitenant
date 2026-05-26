@@ -201,12 +201,19 @@ try {
         // Get total mechanics - Flexible check
         $totalMechs = 5;
         try {
-            $stmtM = $db->prepare("SELECT COUNT(*) FROM users u JOIN roles r ON u.role_id = r.role_id WHERE u.tenant_id = ? AND r.role_name = 'MECHANIC' AND u.status = 'ACTIVE'");
+            $stmtM = $db->prepare("SELECT COUNT(*) FROM users u 
+                                   JOIN roles r ON u.role_id = r.role_id 
+                                   LEFT JOIN mechanics m ON u.user_id = m.user_id AND m.tenant_id = u.tenant_id
+                                   WHERE u.tenant_id = ? AND r.role_name = 'MECHANIC' AND u.status = 'ACTIVE'
+                                   AND (m.status IS NULL OR m.status != 'UNAVAILABLE')");
             $stmtM->execute([$tid]);
             $totalMechs = (int) $stmtM->fetchColumn();
             if ($totalMechs <= 0) {
                 // Fallback to direct role column
-                $stmtM = $db->prepare("SELECT COUNT(*) FROM users WHERE tenant_id = ? AND role = 'Mechanic' AND status = 'ACTIVE'");
+                $stmtM = $db->prepare("SELECT COUNT(*) FROM users u
+                                       LEFT JOIN mechanics m ON u.user_id = m.user_id AND m.tenant_id = u.tenant_id
+                                       WHERE u.tenant_id = ? AND u.role = 'Mechanic' AND u.status = 'ACTIVE'
+                                       AND (m.status IS NULL OR m.status != 'UNAVAILABLE')");
                 $stmtM->execute([$tid]);
                 $totalMechs = (int) $stmtM->fetchColumn();
             }
@@ -308,8 +315,13 @@ try {
         // Fetch available mechanics - Flexible check
         $mechanics = [];
         try {
-            // Plan A: JOIN roles
-            $query = "SELECT u.user_id as mechanic_id, u.name as full_name, r.role_name as specialization FROM users u JOIN roles r ON u.role_id = r.role_id WHERE u.tenant_id = ? AND r.role_name = 'MECHANIC' AND u.status = 'ACTIVE'";
+            // Plan A: JOIN roles and check status in mechanics table
+            $query = "SELECT u.user_id as mechanic_id, u.name as full_name, r.role_name as specialization 
+                      FROM users u 
+                      JOIN roles r ON u.role_id = r.role_id 
+                      LEFT JOIN mechanics m ON u.user_id = m.user_id AND m.tenant_id = u.tenant_id
+                      WHERE u.tenant_id = ? AND r.role_name = 'MECHANIC' AND u.status = 'ACTIVE'
+                      AND (m.status IS NULL OR m.status != 'UNAVAILABLE')";
             $params = [$tid];
             if (!empty($unavailableIds)) {
                 $placeholders = implode(',', array_fill(0, count($unavailableIds), '?'));
@@ -322,11 +334,15 @@ try {
         } catch (Throwable $e1) {
             try {
                 // Plan B: role column
-                $query = "SELECT user_id as mechanic_id, name as full_name, role as specialization FROM users WHERE tenant_id = ? AND role = 'Mechanic' AND status = 'ACTIVE'";
+                $query = "SELECT u.user_id as mechanic_id, u.name as full_name, u.role as specialization 
+                          FROM users u
+                          LEFT JOIN mechanics m ON u.user_id = m.user_id AND m.tenant_id = u.tenant_id
+                          WHERE u.tenant_id = ? AND u.role = 'Mechanic' AND u.status = 'ACTIVE'
+                          AND (m.status IS NULL OR m.status != 'UNAVAILABLE')";
                 $params = [$tid];
                 if (!empty($unavailableIds)) {
                     $placeholders = implode(',', array_fill(0, count($unavailableIds), '?'));
-                    $query .= " AND user_id NOT IN ($placeholders)";
+                    $query .= " AND u.user_id NOT IN ($placeholders)";
                     $params = array_merge($params, array_values($unavailableIds));
                 }
                 $stmt = $db->prepare($query);
