@@ -885,6 +885,10 @@ try {
       } catch (Exception $e) {
       }
       try {
+        $db->exec("ALTER TABLE tenants ADD COLUMN enable_price_limits INT DEFAULT 1");
+      } catch (Exception $e) {
+      }
+      try {
         $db->exec("ALTER TABLE tenants ADD COLUMN secondary_color VARCHAR(20) DEFAULT '#030712'");
       } catch (Exception $e) {
       }
@@ -1276,6 +1280,10 @@ try {
           $db->exec("ALTER TABLE repair_parts ADD COLUMN tenant_id INT NOT NULL AFTER rp_id");
         } catch (Exception $e) {
         }
+        try {
+          $db->exec("ALTER TABLE repair_parts ADD COLUMN approval_status VARCHAR(50) DEFAULT 'APPROVED'");
+        } catch (Exception $e) {
+        }
 
 
         // Audit Logs
@@ -1524,9 +1532,13 @@ try {
             exit;
           }
 
+          $checkTenant = $db->prepare("SELECT enable_price_limits FROM tenants WHERE tenant_id = ?");
+          $checkTenant->execute([$tenant_id]);
+          $enablePriceLimits = intval($checkTenant->fetchColumn() ?? 1);
+
           $masterId = !empty($_POST['master_id']) ? intval($_POST['master_id']) : null;
 
-          if ($masterId) {
+          if ($enablePriceLimits && $masterId) {
             $ms = $db->prepare("SELECT * FROM master_services WHERE master_id = ?");
             $ms->execute([$masterId]);
             $standard = $ms->fetch();
@@ -1570,7 +1582,11 @@ try {
             exit;
           }
 
-          if ($masterId) {
+          $checkTenant = $db->prepare("SELECT enable_price_limits FROM tenants WHERE tenant_id = ?");
+          $checkTenant->execute([$tenant_id]);
+          $enablePriceLimits = intval($checkTenant->fetchColumn() ?? 1);
+
+          if ($enablePriceLimits && $masterId) {
             $ms = $db->prepare("SELECT * FROM master_services WHERE master_id = ?");
             $ms->execute([$masterId]);
             $standard = $ms->fetch();
@@ -2334,10 +2350,22 @@ try {
           if (!$item || $item['quantity'] < $qty)
             throw new Exception("Insufficient stock for " . ($item['item_name'] ?? 'item'));
 
+          // Determine approval status
+          $approval_status = 'APPROVED';
+          if (strtoupper($role) === 'MECHANIC') {
+              $approval_status = 'PENDING_APPROVAL';
+          } else {
+              $jStatus = $db->prepare("SELECT status FROM repair_jobs WHERE job_id = ? AND tenant_id = ?");
+              $jStatus->execute([$jid, $tenant_id]);
+              if ($jStatus->fetchColumn() === 'IN_PROGRESS') {
+                  $approval_status = 'PENDING_APPROVAL';
+              }
+          }
+
           // Add to repair_parts
-          $pStmt = $db->prepare("INSERT INTO repair_parts (job_id, tenant_id, item_id, quantity, unit_price, total_price) VALUES (?, ?, ?, ?, ?, ?)");
+          $pStmt = $db->prepare("INSERT INTO repair_parts (job_id, tenant_id, item_id, quantity, unit_price, total_price, approval_status) VALUES (?, ?, ?, ?, ?, ?, ?)");
           $total = $item['price'] * $qty;
-          $pStmt->execute([$jid, $tenant_id, $iid, $qty, $item['price'], $total]);
+          $pStmt->execute([$jid, $tenant_id, $iid, $qty, $item['price'], $total, $approval_status]);
 
           // Deduct from inventory
           $db->prepare("UPDATE inventory SET quantity = quantity - ? WHERE item_id = ?")->execute([$qty, $iid]);
@@ -2346,7 +2374,7 @@ try {
 
           // Sync Job Total for accuracy
           try {
-            $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
+            $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id AND approval_status = 'APPROVED'), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
           } catch (Exception $ex) {
           }
 
@@ -2379,13 +2407,25 @@ try {
           if (!$service)
             throw new Exception("Service not found.");
 
-          $pStmt = $db->prepare("INSERT INTO repair_parts (job_id, tenant_id, service_id, quantity, unit_price, total_price) VALUES (?, ?, ?, 1, ?, ?)");
-          $pStmt->execute([$jid, $tenant_id, $sid, $service['price'], $service['price']]);
+          // Determine approval status
+          $approval_status = 'APPROVED';
+          if (strtoupper($role) === 'MECHANIC') {
+              $approval_status = 'PENDING_APPROVAL';
+          } else {
+              $jStatus = $db->prepare("SELECT status FROM repair_jobs WHERE job_id = ? AND tenant_id = ?");
+              $jStatus->execute([$jid, $tenant_id]);
+              if ($jStatus->fetchColumn() === 'IN_PROGRESS') {
+                  $approval_status = 'PENDING_APPROVAL';
+              }
+          }
+
+          $pStmt = $db->prepare("INSERT INTO repair_parts (job_id, tenant_id, service_id, quantity, unit_price, total_price, approval_status) VALUES (?, ?, ?, 1, ?, ?, ?)");
+          $pStmt->execute([$jid, $tenant_id, $sid, $service['price'], $service['price'], $approval_status]);
 
           $db->commit();
 
           // Sync Job Total
-          $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
+          $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id AND approval_status = 'APPROVED'), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
 
           echo json_encode(['status' => 'success', 'message' => 'Service added to job.']);
         } catch (Exception $e) {
@@ -2414,7 +2454,7 @@ try {
 
           // Sync Job Total for accuracy
           try {
-            $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
+            $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id AND approval_status = 'APPROVED'), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
           } catch (Exception $ex) {
           }
 
@@ -2436,7 +2476,12 @@ try {
                                 LEFT JOIN services s ON rp.service_id = s.service_id
                                 WHERE rp.job_id = ? AND rp.tenant_id = ?");
           $stmt->execute([$jid, $tenant_id]);
-          echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
+          $parts = $stmt->fetchAll(PDO::FETCH_ASSOC);
+          $token = md5($jid . 'autofix_secret');
+          foreach($parts as &$p) {
+              $p['token'] = $token;
+          }
+          echo json_encode($parts);
         } catch (Exception $e) {
           echo json_encode([]);
         }
@@ -2595,7 +2640,8 @@ try {
             'opening_hours',
             'address',
             'facebook_url',
-            'instagram_url'
+            'instagram_url',
+            'enable_price_limits'
           ];
 
           if (!in_array($field, $allowedFields)) {
@@ -3221,6 +3267,14 @@ try {
             throw new Exception("Invalid job data.");
           }
 
+          if ($newStatus === 'COMPLETED') {
+              $pendingCheck = $db->prepare("SELECT COUNT(*) FROM repair_parts WHERE job_id = ? AND tenant_id = ? AND approval_status = 'PENDING_APPROVAL'");
+              $pendingCheck->execute([$jobId, $tenant_id]);
+              if ($pendingCheck->fetchColumn() > 0) {
+                  throw new Exception("Operation Denied: Cannot complete job while there are items pending customer approval.");
+              }
+          }
+
           // Get old state to handle status transfers and missing fields
           $oldJob = $db->prepare("SELECT mechanic_id, bay_id, status FROM repair_jobs WHERE job_id = ? AND tenant_id = ?");
           $oldJob->execute([$jobId, $tenant_id]);
@@ -3827,6 +3881,9 @@ try {
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script>
+    // System Configurations
+    window.enablePriceLimits = <?php echo intval($tenant_custom['enable_price_limits'] ?? 1); ?>;
+
     // V100 CORE ENGINE: INITIALIZING...
     window.onerror = function (msg, url, lineNo, columnNo, error) {
       const errDiv = document.createElement('div');
@@ -4480,21 +4537,46 @@ try {
             return;
           }
           let total = 0;
+          let hasPending = false;
           list.innerHTML = data.map(p => {
             const itemTotal = parseFloat(p.total_price) || 0;
             const itemUnit = parseFloat(p.unit_price) || 0;
-            total += itemTotal;
-            return `<div style="display:flex; justify-content:space-between; align-items:center; background:var(--input-bg); padding:10px 15px; border-radius:12px; border:1px solid var(--glass-border); margin-bottom:8px;">
+            
+            let statusBadge = '';
+            if (p.approval_status === 'PENDING_APPROVAL') {
+                statusBadge = '<span style="font-size:0.6rem; background:var(--warning); color:#000; padding:2px 5px; border-radius:4px; margin-left:5px;">PENDING</span>';
+                hasPending = true;
+            } else if (p.approval_status === 'REJECTED') {
+                statusBadge = '<span style="font-size:0.6rem; background:var(--danger); color:#fff; padding:2px 5px; border-radius:4px; margin-left:5px;">REJECTED</span>';
+            }
+            
+            if (p.approval_status === 'APPROVED') {
+                total += itemTotal;
+            }
+            const rowOpacity = (p.approval_status === 'REJECTED') ? 'opacity: 0.5;' : '';
+            const totalDecor = (p.approval_status === 'REJECTED' || p.approval_status === 'PENDING_APPROVAL') ? 'text-decoration: line-through;' : '';
+
+            return `<div style="display:flex; justify-content:space-between; align-items:center; background:var(--input-bg); padding:10px 15px; border-radius:12px; border:1px solid var(--glass-border); margin-bottom:8px; ${rowOpacity}">
                       <div style="flex:1;">
-                        <div style="font-weight:700; font-size:0.85rem; color:var(--text-main);">${p.item_name}</div>
+                        <div style="font-weight:700; font-size:0.85rem; color:var(--text-main);">${p.item_name} ${statusBadge}</div>
                         <div style="font-size:0.7rem; color:var(--text-dim);">${p.service_id ? 'Labor / Service' : `${p.quantity} units @ ₱${itemUnit.toLocaleString()}`}</div>
                       </div>
                       <div style="display:flex; align-items:center; gap:12px;">
-                        <div style="font-weight:800; color:var(--accent); font-size:0.9rem;">₱${itemTotal.toLocaleString()}</div>
+                        <div style="font-weight:800; color:var(--accent); font-size:0.9rem; ${totalDecor}">₱${itemTotal.toLocaleString()}</div>
                         <i class="fas fa-times-circle" onclick="window.removePartFromJob(${p.rp_id}, ${jid})" style="color:var(--danger); cursor:pointer;"></i>
                       </div>
                     </div>`;
           }).join('');
+          
+          const approvalContainer = document.getElementById('customerApprovalLinkContainer');
+          if(approvalContainer) {
+              if (hasPending) {
+                  approvalContainer.style.display = 'block';
+                  window.currentApprovalLink = window.location.origin + window.location.pathname.replace('tenant-dashboard.php', '') + 'customer-agreement.php?job_id=' + jid + '&token=' + (data[0] ? data[0].token : '');
+              } else {
+                  approvalContainer.style.display = 'none';
+              }
+          }
           if (bill) bill.innerText = '₱' + total.toLocaleString(undefined, { minimumFractionDigits: 2 });
           const overall = document.getElementById('totalOverallBill');
           if (overall) {
@@ -8953,6 +9035,17 @@ try {
               </button>
             </div>
 
+            <div class="form-group" style="margin-bottom: 1.5rem;">
+              <label>Service Price Limit Enforcement</label>
+              <select name="enable_price_limits" id="setting_enable_price_limits" onfocus="highlightInPreview('enable_price_limits')">
+                <option value="1" <?php echo ($tenant_custom['enable_price_limits'] ?? 1) == 1 ? 'selected' : ''; ?>>Enabled</option>
+                <option value="0" <?php echo ($tenant_custom['enable_price_limits'] ?? 1) == 0 ? 'selected' : ''; ?>>Disabled</option>
+              </select>
+              <button type="button" class="feature-save-btn" onclick="saveSingleSetting('enable_price_limits', this)">
+                <i class="fas fa-save"></i> Save Price Limit Setting
+              </button>
+            </div>
+
             <div class="form-group"
               style="margin-bottom: 1.5rem; background: rgba(255,255,255,0.02); padding: 1rem; border-radius: 12px; border: 1px dashed var(--glass-border);">
               <label>Logo Branding</label>
@@ -11379,6 +11472,11 @@ try {
             style="display:flex; flex-direction:column; gap:6px; max-height:100px; overflow-y:auto;"></div>
           <input type="hidden" name="parts_json" id="pay_parts_json" value="[]">
         </div>
+        
+        <div id="paymentReceiptDetails" style="margin-bottom:0.8rem; background:rgba(0,0,0,0.2); padding:1rem; border-radius:12px; border:1px solid rgba(255,255,255,0.05); display:none;">
+            <div style="font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase; margin-bottom:8px;">Receipt Breakdown</div>
+            <div id="receiptBreakdownContent" style="font-size:0.85rem; color:#fff;"></div>
+        </div>
 
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:0.8rem;">
           <div>
@@ -11600,6 +11698,11 @@ try {
                 style="flex:1; display:flex; flex-direction:column; gap:8px; min-height:120px; max-height:220px; overflow-y:auto; background:rgba(0,0,0,0.15); border-radius:15px; padding:12px; border:1px solid rgba(255,255,255,0.03);">
                 <div style="text-align:center; color:var(--text-dim); font-size:0.8rem; padding:20px;">No parts
                   recorded.</div>
+              </div>
+              
+              <div id="customerApprovalLinkContainer" style="display:none; margin-top:8px; padding:10px; background:rgba(239, 161, 52, 0.1); border:1px solid rgba(239, 161, 52, 0.3); border-radius:12px; text-align:center;">
+                  <div style="font-size:0.75rem; color:var(--warning); font-weight:700; margin-bottom:5px;">Items Pending Customer Approval</div>
+                  <button type="button" onclick="navigator.clipboard.writeText(window.currentApprovalLink); alert('Approval link copied to clipboard! Send this to the customer.');" style="background:var(--warning); color:#000; border:none; border-radius:8px; padding:5px 15px; font-weight:600; font-size:0.8rem; cursor:pointer;"><i class="fas fa-link"></i> Copy Approval Link</button>
               </div>
 
               <div
@@ -12229,6 +12332,38 @@ try {
       if (amtInput) amtInput.value = window.basePaymentAmount.toFixed(2);
       if (amtHidden) amtHidden.value = window.basePaymentAmount.toFixed(2);
       if (jidInput) jidInput.value = jobId;
+
+      const breakdownContainer = document.getElementById('paymentReceiptDetails');
+      const breakdownContent = document.getElementById('receiptBreakdownContent');
+      if (breakdownContainer && breakdownContent) {
+          if (jobId) {
+              breakdownContainer.style.display = 'block';
+              breakdownContent.innerHTML = '<div style="text-align:center; padding:10px;"><i class="fas fa-spinner fa-spin"></i> Loading...</div>';
+              fetch(`tenant-dashboard.php?action=fetch_job_parts&job_id=${jobId}`)
+                .then(r => r.json())
+                .then(data => {
+                    let html = '<table style="width:100%; text-align:left; border-collapse:collapse;">';
+                    let sum = 0;
+                    data.forEach(p => {
+                        if(p.approval_status === 'APPROVED' || !p.approval_status) {
+                            const itemTotal = parseFloat(p.total_price) || 0;
+                            sum += itemTotal;
+                            html += `<tr><td style="padding:4px 0; border-bottom:1px dashed rgba(255,255,255,0.1);">${p.item_name} (x${p.quantity})</td><td style="text-align:right; border-bottom:1px dashed rgba(255,255,255,0.1);">₱${itemTotal.toLocaleString(undefined, {minimumFractionDigits:2})}</td></tr>`;
+                        }
+                    });
+                    
+                    const servicePrice = window.basePaymentAmount - sum; 
+                    if (servicePrice > 0) {
+                        html += `<tr><td style="padding:4px 0; border-bottom:1px dashed rgba(255,255,255,0.1);">Main Service / Labor</td><td style="text-align:right; border-bottom:1px dashed rgba(255,255,255,0.1);">₱${servicePrice.toLocaleString(undefined, {minimumFractionDigits:2})}</td></tr>`;
+                    }
+                    html += `<tr><td style="padding:8px 0 0 0; font-weight:700; color:var(--accent);">Subtotal</td><td style="text-align:right; padding:8px 0 0 0; font-weight:700; color:var(--accent);">₱${window.basePaymentAmount.toLocaleString(undefined, {minimumFractionDigits:2})}</td></tr>`;
+                    html += '</table>';
+                    breakdownContent.innerHTML = html;
+                }).catch(() => { breakdownContent.innerHTML = 'Failed to load breakdown.'; });
+          } else {
+              breakdownContainer.style.display = 'none';
+          }
+      }
 
       window.syncPaymentParts();
       openModal('paymentModal');
