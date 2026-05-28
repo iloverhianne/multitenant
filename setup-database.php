@@ -82,12 +82,18 @@ try {
         service_name VARCHAR(100) NOT NULL,
         description TEXT,
         price DECIMAL(10,2) NOT NULL,
+        min_price DECIMAL(10,2) NULL,
+        max_price DECIMAL(10,2) NULL,
         status ENUM('ACTIVE', 'INACTIVE') DEFAULT 'ACTIVE',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX (tenant_id)
     ) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;";
     $db->exec($sql3);
-    echo "<li>[OK] <b>services</b> table checked/created.</li>";
+    
+    // Patch for existing table
+    try { $db->exec("ALTER TABLE services ADD COLUMN min_price DECIMAL(10,2) NULL, ADD COLUMN max_price DECIMAL(10,2) NULL"); } catch(Exception $e) {}
+
+    echo "<li>[OK] <b>services</b> table checked/created/patched.</li>";
 
     // 4. REPAIR JOBS TABLE
     $sql4 = "CREATE TABLE IF NOT EXISTS repair_jobs (
