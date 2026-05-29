@@ -332,7 +332,50 @@ try {
       if (!$new_plan)
         throw new Exception("Plan not found.");
 
+      $max_bays = intval($new_plan['max_service_bays']);
+
+      // 1. Check in-use bays
+      $stmtInUse = $db->prepare("
+          SELECT COUNT(DISTINCT b.bay_id) as in_use_count
+          FROM service_bays b
+          JOIN repair_jobs r ON b.bay_id = r.bay_id
+          WHERE b.tenant_id = ? AND r.status IN ('PENDING', 'IN_PROGRESS')
+      ");
+      $stmtInUse->execute([$tenant_id]);
+      $in_use_count = intval($stmtInUse->fetchColumn());
+
+      if ($in_use_count > $max_bays) {
+          throw new Exception("Downgrade failed: You have {$in_use_count} bays currently in-use, but the selected plan only allows {$max_bays}. Please complete or cancel active jobs to free up bays first.");
+      }
+
+      // 2. Calculate excess bays
+      $stmtTotal = $db->prepare("SELECT COUNT(*) FROM service_bays WHERE tenant_id = ?");
+      $stmtTotal->execute([$tenant_id]);
+      $total_bays = intval($stmtTotal->fetchColumn());
+      $excess_bays = $total_bays - $max_bays;
+
       $db->beginTransaction();
+
+      if ($excess_bays > 0) {
+          // Find excess empty bays and delete them
+          $stmtEmpty = $db->query("
+              SELECT b.bay_id 
+              FROM service_bays b
+              WHERE b.tenant_id = " . intval($tenant_id) . " 
+                AND b.bay_id NOT IN (
+                    SELECT r.bay_id FROM repair_jobs r WHERE r.tenant_id = " . intval($tenant_id) . " AND r.status IN ('PENDING', 'IN_PROGRESS') AND r.bay_id IS NOT NULL
+                )
+              ORDER BY b.bay_id DESC
+              LIMIT " . intval($excess_bays)
+          );
+          $bays_to_delete = $stmtEmpty->fetchAll(PDO::FETCH_COLUMN);
+          
+          if (!empty($bays_to_delete)) {
+              $placeholders = implode(',', array_fill(0, count($bays_to_delete), '?'));
+              $db->prepare("DELETE FROM service_bays WHERE bay_id IN ($placeholders) AND tenant_id = ?")
+                 ->execute(array_merge($bays_to_delete, [$tenant_id]));
+          }
+      }
 
       $new_start = date('Y-m-d');
       $cycle = strtolower($_POST['billing_cycle'] ?? 'monthly');
@@ -680,8 +723,6 @@ try {
           service_name VARCHAR(100) NOT NULL,
           description TEXT NULL,
           price DECIMAL(10,2) NOT NULL,
-          min_price DECIMAL(10,2) NULL,
-          max_price DECIMAL(10,2) NULL,
           category VARCHAR(50) NULL,
           estimated_time VARCHAR(50) NULL,
           status ENUM('ACTIVE', 'INACTIVE') DEFAULT 'ACTIVE',
@@ -693,15 +734,20 @@ try {
         } catch (Exception $e) {
         }
         try {
-          $db->exec("ALTER TABLE services ADD COLUMN min_price DECIMAL(10,2) NULL, ADD COLUMN max_price DECIMAL(10,2) NULL");
-        } catch (Exception $e) {
-        }
-        try {
           $db->exec("ALTER TABLE services ADD COLUMN category VARCHAR(50) NULL AFTER price");
         } catch (Exception $e) {
         }
         try {
           $db->exec("ALTER TABLE services ADD COLUMN estimated_time VARCHAR(50) NULL AFTER category");
+        } catch (Exception $e) {
+        }
+        // Tenant-defined price limits (tenant sets these, not superadmin)
+        try {
+          $db->exec("ALTER TABLE services ADD COLUMN tenant_min_price DECIMAL(10,2) DEFAULT NULL AFTER estimated_time");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE services ADD COLUMN tenant_max_price DECIMAL(10,2) DEFAULT NULL AFTER tenant_min_price");
         } catch (Exception $e) {
         }
       } catch (Exception $e) {
@@ -847,7 +893,7 @@ try {
         // Robust SYNC: Use PHP iteration to ensure all staff with role 'MECHANIC' are in the masterfile
         try {
           // Find all users who should be mechanics
-          $mechanicUsers = $db->prepare("SELECT user_id, tenant_id, name FROM users WHERE (role_id = 5 OR role_id IN (SELECT role_id FROM roles WHERE role_name = 'MECHANIC')) AND tenant_id IS NOT NULL");
+          $mechanicUsers = $db->prepare("SELECT user_id, tenant_id, name FROM users WHERE (role_id = 5 OR role_id IN (SELECT role_id FROM roles WHERE role_name = 'MECHANIC')) AND tenant_id IS NOT NULL AND (status IS NULL OR status != 'INACTIVE')");
           $mechanicUsers->execute();
           $all_m = $mechanicUsers->fetchAll(PDO::FETCH_ASSOC);
 
@@ -953,13 +999,9 @@ try {
 
       // Payments Table Healer/Creation
       try {
-        $db->exec("CREATE TABLE IF NOT EXISTS services (service_id INT AUTO_INCREMENT PRIMARY KEY, tenant_id INT, master_id INT DEFAULT NULL, service_name VARCHAR(100), description TEXT, price DECIMAL(10,2), min_price DECIMAL(10,2) NULL, max_price DECIMAL(10,2) NULL, category VARCHAR(50), estimated_time VARCHAR(50), status ENUM('ACTIVE', 'INACTIVE'), created_at DATETIME)");
+        $db->exec("CREATE TABLE IF NOT EXISTS services (service_id INT AUTO_INCREMENT PRIMARY KEY, tenant_id INT, master_id INT DEFAULT NULL, service_name VARCHAR(100), description TEXT, price DECIMAL(10,2), category VARCHAR(50), estimated_time VARCHAR(50), status ENUM('ACTIVE', 'INACTIVE'), created_at DATETIME)");
         try {
           $db->exec("ALTER TABLE services ADD COLUMN master_id INT DEFAULT NULL AFTER tenant_id");
-        } catch (Exception $e) {
-        }
-        try {
-          $db->exec("ALTER TABLE services ADD COLUMN min_price DECIMAL(10,2) NULL, ADD COLUMN max_price DECIMAL(10,2) NULL");
         } catch (Exception $e) {
         }
         $db->exec("CREATE TABLE IF NOT EXISTS payments (payment_id INT AUTO_INCREMENT PRIMARY KEY, tenant_id INT, amount DECIMAL(10,2), status VARCHAR(20))");
@@ -977,6 +1019,10 @@ try {
         }
         try {
           $db->exec("ALTER TABLE payments ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE payments ADD COLUMN amount_tendered DECIMAL(15,2) NULL AFTER amount");
         } catch (Exception $e) {
         }
         try {
@@ -1370,7 +1416,7 @@ try {
         $db->exec("ALTER TABLE users ADD COLUMN profile_pic VARCHAR(255) NULL AFTER name");
       } catch (Exception $e) {
       }
-      $stmt = $db->prepare("SELECT user_id, name, email, profile_pic, role_id, status FROM users WHERE tenant_id = ? ORDER BY role_id ASC");
+      $stmt = $db->prepare("SELECT user_id, name, email, profile_pic, role_id, status FROM users WHERE tenant_id = ? AND (status IS NULL OR status != 'INACTIVE') ORDER BY role_id ASC");
       $stmt->execute([$tenant_id]);
       $staff_list = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -1528,40 +1574,36 @@ try {
           $name = trim($_POST['service_name'] ?? '');
           $desc = trim($_POST['description'] ?? '');
           $price = floatval($_POST['price'] ?? 0);
-          $min_price = (isset($_POST['min_price']) && $_POST['min_price'] !== '') ? floatval($_POST['min_price']) : null;
-          $max_price = (isset($_POST['max_price']) && $_POST['max_price'] !== '') ? floatval($_POST['max_price']) : null;
+          $tenantMin = !empty($_POST['tenant_min_price']) ? floatval($_POST['tenant_min_price']) : null;
+          $tenantMax = !empty($_POST['tenant_max_price']) ? floatval($_POST['tenant_max_price']) : null;
 
           if (empty($name)) {
             echo json_encode(['status' => 'error', 'message' => 'Service name is required.']);
             exit;
           }
 
-          $masterId = !empty($_POST['master_id']) ? intval($_POST['master_id']) : null;
-
-<<<<<<< HEAD
-          if ($enablePriceLimits && $min_price !== null && $max_price !== null) {
-              if ($price < $min_price || $price > $max_price) {
-                throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($min_price) . " and ₱" . number_format($max_price));
-=======
-          if ($masterId) {
-            $ms = $db->prepare("SELECT * FROM master_services WHERE master_id = ?");
-            $ms->execute([$masterId]);
-            $standard = $ms->fetch();
-            if ($standard) {
-              if ($price < $standard['min_price'] || $price > $standard['max_price']) {
-                throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($standard['min_price']) . " and ₱" . number_format($standard['max_price']));
->>>>>>> b06e76f6ed1f975805a82d2ac66b7861d774451c
-              }
+          // Validate against tenant-defined limits (if set)
+          if ($tenantMin !== null && $tenantMax !== null) {
+            if ($price < $tenantMin || $price > $tenantMax) {
+              throw new Exception("Price is outside your set range! Must be between ₱" . number_format($tenantMin, 2) . " and ₱" . number_format($tenantMax, 2));
+            }
           }
 
-          $stmt = $db->prepare("INSERT INTO services (tenant_id, master_id, service_name, description, price, min_price, max_price, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')");
-          if ($stmt->execute([$tenant_id, $masterId, $name, $desc, $price, $min_price, $max_price])) {
+          $masterId = !empty($_POST['master_id']) ? intval($_POST['master_id']) : null;
+          if ($masterId) {
+            $ms = $db->prepare("SELECT service_name FROM master_services WHERE master_id = ?");
+            $ms->execute([$masterId]);
+            $standard = $ms->fetch();
+            if ($standard) $name = $standard['service_name'];
+          }
+
+          $stmt = $db->prepare("INSERT INTO services (tenant_id, master_id, service_name, description, price, tenant_min_price, tenant_max_price, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')");
+          if ($stmt->execute([$tenant_id, $masterId, $name, $desc, $price, $tenantMin, $tenantMax])) {
             try {
               $log = $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'CRUD', ?)");
               $log->execute([$tenant_id, $_SESSION['user_id'] ?? 0, "Staff " . ($_SESSION['name'] ?? 'Unknown') . " added new service: $name (₱$price)"]);
             } catch (Exception $logErr) {
             }
-
             echo json_encode(['status' => 'success', 'message' => 'Service added successfully.']);
           } else {
             echo json_encode(['status' => 'error', 'message' => 'Database insert failed.']);
@@ -1578,8 +1620,8 @@ try {
           $name = trim($_POST['service_name'] ?? '');
           $desc = trim($_POST['description'] ?? '');
           $price = floatval($_POST['price'] ?? 0);
-          $min_price = (isset($_POST['min_price']) && $_POST['min_price'] !== '') ? floatval($_POST['min_price']) : null;
-          $max_price = (isset($_POST['max_price']) && $_POST['max_price'] !== '') ? floatval($_POST['max_price']) : null;
+          $tenantMin = !empty($_POST['tenant_min_price']) ? floatval($_POST['tenant_min_price']) : null;
+          $tenantMax = !empty($_POST['tenant_max_price']) ? floatval($_POST['tenant_max_price']) : null;
           $masterId = !empty($_POST['master_id']) ? intval($_POST['master_id']) : null;
 
           if (empty($name) || empty($id)) {
@@ -1587,24 +1629,18 @@ try {
             exit;
           }
 
-<<<<<<< HEAD
-          $checkTenant = $db->prepare("SELECT enable_price_limits FROM tenants WHERE tenant_id = ?");
-          $checkTenant->execute([$tenant_id]);
-          $enablePriceLimits = intval($checkTenant->fetchColumn() ?? 1);
+          // Validate against tenant-defined limits (if set)
+          if ($tenantMin !== null && $tenantMax !== null) {
+            if ($price < $tenantMin || $price > $tenantMax) {
+              throw new Exception("Price is outside your set range! Must be between ₱" . number_format($tenantMin, 2) . " and ₱" . number_format($tenantMax, 2));
+            }
+          }
 
-          if ($enablePriceLimits && $min_price !== null && $max_price !== null) {
-              if ($price < $min_price || $price > $max_price) {
-                throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($min_price) . " and ₱" . number_format($max_price));
-=======
           if ($masterId) {
-            $ms = $db->prepare("SELECT * FROM master_services WHERE master_id = ?");
+            $ms = $db->prepare("SELECT service_name FROM master_services WHERE master_id = ?");
             $ms->execute([$masterId]);
             $standard = $ms->fetch();
-            if ($standard) {
-              if ($price < $standard['min_price'] || $price > $standard['max_price']) {
-                throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($standard['min_price']) . " and ₱" . number_format($standard['max_price']));
->>>>>>> b06e76f6ed1f975805a82d2ac66b7861d774451c
-              }
+            if ($standard) $name = $standard['service_name'];
           }
 
           // AUTO-HEAL: Ensure description column exists
@@ -1613,14 +1649,13 @@ try {
           } catch (Exception $e) {
           }
 
-          $stmt = $db->prepare("UPDATE services SET master_id=?, service_name=?, description=?, price=?, min_price=?, max_price=? WHERE service_id=? AND tenant_id=?");
-          if ($stmt->execute([$masterId, $name, $desc, $price, $min_price, $max_price, $id, $tenant_id])) {
+          $stmt = $db->prepare("UPDATE services SET master_id=?, service_name=?, description=?, price=?, tenant_min_price=?, tenant_max_price=? WHERE service_id=? AND tenant_id=?");
+          if ($stmt->execute([$masterId, $name, $desc, $price, $tenantMin, $tenantMax, $id, $tenant_id])) {
             try {
               $log = $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'CRUD', ?)");
               $log->execute([$tenant_id, $_SESSION['user_id'] ?? 0, "Staff " . ($_SESSION['name'] ?? 'Unknown') . " updated service: $name (ID: $id)"]);
             } catch (Exception $logErr) {
             }
-
             echo json_encode(['status' => 'success', 'message' => 'Service updated successfully.']);
           } else {
             echo json_encode(['status' => 'error', 'message' => 'Database update failed.']);
@@ -1675,12 +1710,14 @@ try {
                                COALESCE(v.plate_no, v2.plate_no, j.walkin_plate) as plate_no, 
                                COALESCE(v.make, v2.make, '') as make, 
                                COALESCE(v.model, v2.model, j.walkin_model) as model, 
-                               s.service_name 
+                               s.service_name,
+                               COALESCE(m.full_name, 'N/A') as mechanic_name
                                FROM repair_jobs j 
                                LEFT JOIN customers c ON j.customer_id = c.customer_id 
                                LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id 
                                LEFT JOIN vehicles v2 ON v2.vehicle_id = (SELECT v3.vehicle_id FROM vehicles v3 WHERE v3.customer_id = j.customer_id LIMIT 1) AND v.plate_no IS NULL 
                                LEFT JOIN services s ON j.service_id = s.service_id 
+                               LEFT JOIN mechanics m ON j.mechanic_id = m.mechanic_id
                                WHERE j.job_id = ? AND j.tenant_id = ?");
           $stmt->execute([$id, $tenant_id]);
           $j = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -1691,6 +1728,37 @@ try {
           $shop->execute([$tenant_id]);
           $s = $shop->fetch(PDO::FETCH_ASSOC);
           $sn = $s['shop_name'] ?? 'Auto Shop';
+          
+          $duration = 'N/A';
+          if (!empty($j['started_at'])) {
+              $start = strtotime($j['started_at']);
+              $end = !empty($j['completed_at']) ? strtotime($j['completed_at']) : time();
+              if ($start && $end && $end >= $start) {
+                  $diff = $end - $start;
+                  $hours = floor($diff / 3600);
+                  $minutes = floor(($diff % 3600) / 60);
+                  $duration = $hours > 0 ? "{$hours}h {$minutes}m" : "{$minutes}m";
+              }
+          }
+
+          $payStmt = $db->prepare("SELECT amount_tendered FROM payments WHERE job_id = ? AND payment_method = 'CASH' AND amount_tendered IS NOT NULL ORDER BY payment_id DESC LIMIT 1");
+          $payStmt->execute([$id]);
+          $amount_tendered = floatval($payStmt->fetchColumn() ?: 0);
+          
+          $changeHtml = "";
+          if ($amount_tendered > 0) {
+              $change = max(0, $amount_tendered - $j['total_amount']);
+              $changeHtml = "
+                  <div style='display:flex; justify-content:space-between; font-size:0.9rem; margin-top:5px;'>
+                    <span>Cash Tendered:</span>
+                    <span>₱" . number_format($amount_tendered, 2) . "</span>
+                  </div>
+                  <div style='display:flex; justify-content:space-between; font-size:0.9rem; color:#10b981; font-weight:bold; margin-top:2px;'>
+                    <span>Change:</span>
+                    <span>₱" . number_format($change, 2) . "</span>
+                  </div>
+              ";
+          }
 
           ob_clean();
           echo "<div style='text-align:center; margin-bottom:1.5rem; border-bottom:1px dashed #ccc; padding-bottom:1rem;'>
@@ -1703,6 +1771,8 @@ try {
                   <p><strong>Date:</strong> " . date('M d, Y h:i A', strtotime($j['created_at'])) . "</p>
                   <p><strong>Customer:</strong> " . ($j['customer'] ?: $j['walkin_name']) . "</p>
                   <p><strong>Plate:</strong> " . ($j['plate_no'] ?: $j['walkin_plate']) . "</p>
+                  <p><strong>Mechanic:</strong> {$j['mechanic_name']}</p>
+                  <p><strong>Duration:</strong> {$duration}</p>
                   <div style='margin:1rem 0; border-top:1px solid #eee; border-bottom:1px solid #eee; padding:10px 0;'>
                     <div style='display:flex; justify-content:space-between;'>
                       <span>{$j['service_name']}</span>
@@ -1713,6 +1783,7 @@ try {
                     <span>TOTAL:</span>
                     <span>₱" . number_format($j['total_amount'], 2) . "</span>
                   </div>
+                  $changeHtml
                 </div>
                 <div style='margin-top:2rem; text-align:center; font-size:0.8rem; color:#999;'>
                   <p>Thank you for choosing $sn!</p>
@@ -1725,7 +1796,7 @@ try {
       }
 
       if ($_GET['action'] === 'fetch_services') {
-        $stmt = $db->prepare("SELECT s.*, m.min_price, m.max_price FROM services s LEFT JOIN master_services m ON s.master_id = m.master_id WHERE s.tenant_id = ? ORDER BY s.service_name ASC");
+        $stmt = $db->prepare("SELECT s.*, m.min_price AS master_min_price, m.max_price AS master_max_price FROM services s LEFT JOIN master_services m ON s.master_id = m.master_id WHERE s.tenant_id = ? ORDER BY s.service_name ASC");
         $stmt->execute([$tenant_id]);
         echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
         exit;
@@ -1853,7 +1924,7 @@ try {
           } catch (Exception $e) {
           }
 
-          $stmt = $db->prepare("SELECT u.user_id, u.name, u.email, u.profile_pic, r.role_name, u.status FROM users u JOIN roles r ON u.role_id = r.role_id WHERE u.tenant_id = ? ORDER BY u.email DESC");
+          $stmt = $db->prepare("SELECT u.user_id, u.name, u.email, u.profile_pic, r.role_name, u.status FROM users u JOIN roles r ON u.role_id = r.role_id WHERE u.tenant_id = ? AND (u.status IS NULL OR u.status != 'INACTIVE') ORDER BY u.email DESC");
           $stmt->execute([$tenant_id]);
           header('Content-Type: application/json');
           echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
@@ -2163,6 +2234,54 @@ try {
           }
 
           echo json_encode(['status' => 'success', 'message' => 'Mechanic status updated successfully.']);
+        } catch (Exception $e) {
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'delete_mechanic' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        try {
+          $auth_role = strtoupper($_SESSION['role'] ?? '');
+          if ($auth_role !== 'OWNER') {
+            throw new Exception("Unauthorized: Only shop owners can remove mechanics.");
+          }
+
+          $id = intval($_POST['mechanic_id'] ?? 0);
+          if (!$id) {
+            throw new Exception("Mechanic ID is required.");
+          }
+
+          // Check if mechanic has active jobs
+          $activeCheck = $db->prepare("SELECT COUNT(*) FROM repair_jobs WHERE mechanic_id = ? AND tenant_id = ? AND status = 'IN_PROGRESS'");
+          $activeCheck->execute([$id, $tenant_id]);
+          if ($activeCheck->fetchColumn() > 0) {
+            throw new Exception("Cannot remove: This mechanic has active repair jobs. Complete or reassign them first.");
+          }
+
+          // Get mechanic info before deletion
+          $infoStmt = $db->prepare("SELECT full_name, user_id FROM mechanics WHERE mechanic_id = ? AND tenant_id = ?");
+          $infoStmt->execute([$id, $tenant_id]);
+          $mechInfo = $infoStmt->fetch(PDO::FETCH_ASSOC);
+          $mechName = $mechInfo['full_name'] ?? 'Unknown Mechanic';
+          $mechUserId = $mechInfo['user_id'] ?? null;
+
+          // Delete from mechanics table
+          $stmt = $db->prepare("DELETE FROM mechanics WHERE mechanic_id = ? AND tenant_id = ?");
+          $stmt->execute([$id, $tenant_id]);
+
+          // Deactivate the linked user account if exists
+          if ($mechUserId) {
+            $db->prepare("UPDATE users SET status = 'INACTIVE' WHERE user_id = ? AND tenant_id = ?")->execute([$mechUserId, $tenant_id]);
+          }
+
+          // Audit log
+          try {
+            $log = $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'CRUD', ?)");
+            $log->execute([$tenant_id, $_SESSION['user_id'] ?? 0, "Removed mechanic: $mechName (ID: $id)"]);
+          } catch (Exception $logErr) {}
+
+          echo json_encode(['status' => 'success', 'message' => "Mechanic '$mechName' has been removed successfully."]);
         } catch (Exception $e) {
           echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
         }
@@ -3202,9 +3321,11 @@ try {
                       LEFT JOIN services s ON j.service_id = s.service_id
                       LEFT JOIN mechanics m ON j.mechanic_id = m.mechanic_id
                       LEFT JOIN service_bays b ON j.bay_id = b.bay_id
-                      WHERE j.tenant_id = ? AND j.status NOT IN ('CANCELLED', 'SETTLED')
+                      WHERE j.tenant_id = ? AND j.status != 'SETTLED'
                       GROUP BY j.job_id
-                      ORDER BY j.updated_at DESC");
+                      ORDER BY CASE WHEN j.status = 'COMPLETED' THEN 1 ELSE 0 END ASC,
+                               j.completed_at DESC, 
+                               j.updated_at DESC");
           $stmt->execute([$tenant_id]);
           $res = $stmt->fetchAll(PDO::FETCH_ASSOC);
           echo json_encode($res ?: []);
@@ -3261,9 +3382,17 @@ try {
           if (empty($bayId))
             $bayId = $old['bay_id'];
 
+          // Unassign resources if CANCELLED
+          if ($newStatus === 'CANCELLED') {
+              $mechanicId = null;
+              $bayId = null;
+          }
+
           // Enforce rule: Must have BOTH a mechanic and a bay to save updates
-          if (empty($mechanicId) || empty($bayId)) {
-            throw new Exception("Operation Denied: A mechanic and a service bay must be assigned to this job first.");
+          if ($newStatus !== 'PENDING' && $newStatus !== 'CANCELLED') {
+            if (empty($mechanicId) || empty($bayId)) {
+              throw new Exception("Operation Denied: A mechanic and a service bay must be assigned to this job first.");
+            }
           }
 
           // Validation: If resource changed, check availability
@@ -3291,9 +3420,40 @@ try {
           if ($newStatus === 'COMPLETED')
             $timeUpdate = ", completed_at = NOW()";
 
+          // Auto-migrate schema for agreement proof if missing
+          try {
+              $db->exec("ALTER TABLE repair_jobs ADD COLUMN agreement_signature LONGTEXT NULL, ADD COLUMN agreement_proof_file VARCHAR(255) NULL");
+          } catch(Exception $e) {}
+
+          // Handle Signature and File Upload
+          $sig = $_POST['agreement_signature'] ?? '';
+          $proofFile = null;
+          
+          if(isset($_FILES['agreement_proof']) && $_FILES['agreement_proof']['error'] == 0) {
+              $proofName = time() . '_' . basename($_FILES['agreement_proof']['name']);
+              if(move_uploaded_file($_FILES['agreement_proof']['tmp_name'], 'uploads/' . $proofName)) {
+                  $proofFile = $proofName;
+              }
+          }
+
+          $extraUpdate = "";
+          $params = [$newStatus, $mechanicId, $bayId, $checklist];
+
+          if (!empty($sig)) {
+              $extraUpdate .= ", agreement_signature = ?";
+              $params[] = $sig;
+          }
+          if ($proofFile) {
+              $extraUpdate .= ", agreement_proof_file = ?";
+              $params[] = $proofFile;
+          }
+          
+          $params[] = $jobId;
+          $params[] = $tenant_id;
+
           // Update the job
-          $stmt = $db->prepare("UPDATE repair_jobs SET status = ?, mechanic_id = ?, bay_id = ?, checklist = ?, updated_at = NOW() $timeUpdate WHERE job_id = ? AND tenant_id = ?");
-          $stmt->execute([$newStatus, $mechanicId, $bayId, $checklist, $jobId, $tenant_id]);
+          $stmt = $db->prepare("UPDATE repair_jobs SET status = ?, mechanic_id = ?, bay_id = ?, checklist = ?, updated_at = NOW() $timeUpdate $extraUpdate WHERE job_id = ? AND tenant_id = ?");
+          $stmt->execute($params);
 
           $db->prepare("INSERT INTO repair_timeline (job_id, status_update, remarks, tenant_id, user_id) VALUES (?, ?, ?, ?, ?)")
             ->execute([$jobId, $newStatus, $remarks, $tenant_id, $_SESSION['user_id']]);
@@ -3355,9 +3515,14 @@ try {
 
           $jobId = !empty($_POST['job_id']) ? intval($_POST['job_id']) : null;
           $apptId = !empty($_POST['appointment_id']) ? intval($_POST['appointment_id']) : null;
+          
+          $amountTendered = null;
+          if ($method === 'CASH' && !empty($_POST['amount_tendered'])) {
+              $amountTendered = floatval($_POST['amount_tendered']);
+          }
 
-          $stmt = $db->prepare("INSERT INTO payments (tenant_id, customer_id, walkin_name, job_id, appointment_id, amount, payment_method, reference_no, status, payment_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', NOW())");
-          $stmt->execute([$tenant_id, $finalCustomerId, $finalWalkinName, $jobId, $apptId, $amount, $method, $ref]);
+          $stmt = $db->prepare("INSERT INTO payments (tenant_id, customer_id, walkin_name, job_id, appointment_id, amount, amount_tendered, payment_method, reference_no, status, payment_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', NOW())");
+          $stmt->execute([$tenant_id, $finalCustomerId, $finalWalkinName, $jobId, $apptId, $amount, $amountTendered, $method, $ref]);
 
           // Handle Inventory & Official Parts logging
           $fullDataJson = $_POST['parts_json'] ?? '{"parts":[], "services":[]}';
@@ -3982,6 +4147,51 @@ try {
       const amtHidden = document.getElementById('pay_amount_hidden');
       if (amtInput) amtInput.value = final.toFixed(2);
       if (amtHidden) amtHidden.value = final.toFixed(2);
+      
+      if (typeof window.calculateChange === 'function') {
+          window.calculateChange();
+      }
+    };
+    
+    window.toggleTenderedField = function() {
+        const method = document.getElementById('pay_method')?.value;
+        const tenderedField = document.getElementById('tenderedField');
+        const tenderedInput = document.getElementById('pay_amount_tendered');
+        if (method === 'CASH') {
+            if (tenderedField) tenderedField.style.display = 'block';
+            if (tenderedInput) tenderedInput.setAttribute('required', 'required');
+        } else {
+            if (tenderedField) tenderedField.style.display = 'none';
+            if (tenderedInput) {
+                tenderedInput.removeAttribute('required');
+                tenderedInput.value = '';
+            }
+            const changeDisplay = document.getElementById('changeDisplay');
+            if (changeDisplay) changeDisplay.style.display = 'none';
+        }
+    };
+
+    window.calculateChange = function() {
+        const tenderedInput = document.getElementById('pay_amount_tendered');
+        if (!tenderedInput) return;
+        const tendered = parseFloat(tenderedInput.value) || 0;
+        const amountToPay = parseFloat(document.getElementById('pay_amount_hidden')?.value) || 0;
+        const changeDisplay = document.getElementById('changeDisplay');
+        if (!changeDisplay) return;
+        
+        if (tendered >= amountToPay && amountToPay > 0) {
+            const change = tendered - amountToPay;
+            changeDisplay.innerText = 'Change: ₱' + change.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+            changeDisplay.style.display = 'block';
+            changeDisplay.style.color = '#10b981';
+        } else if (tendered > 0 && tendered < amountToPay) {
+            const short = amountToPay - tendered;
+            changeDisplay.innerText = 'Short: ₱' + short.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+            changeDisplay.style.display = 'block';
+            changeDisplay.style.color = '#ef4444';
+        } else {
+            changeDisplay.style.display = 'none';
+        }
     };
 
     window.openRecordPaymentModal = function (jobId, customerId, customerName, amount) {
@@ -3992,6 +4202,12 @@ try {
       window.basePaymentAmount = parseFloat(amount || 0);
       const jidInput = document.getElementById('pay_job_id');
       if (jidInput) jidInput.value = jobId || '';
+      
+      const methodSelect = document.getElementById('pay_method');
+      if (methodSelect) {
+          methodSelect.value = 'CASH';
+          if (typeof window.toggleTenderedField === 'function') window.toggleTenderedField();
+      }
 
       const amtInput = document.getElementById('pay_amount');
       const amtHidden = document.getElementById('pay_amount_hidden');
@@ -4017,59 +4233,6 @@ try {
 
       // Force initial sync to ensure base amount is captured
       window.syncPaymentParts();
-
-      // RECEIPT BREAKDOWN LOGIC
-      const receiptContainer = document.getElementById('paymentReceiptDetails');
-      const breakdownContent = document.getElementById('receiptBreakdownContent');
-      if (receiptContainer && breakdownContent) {
-          if (jobId) {
-              receiptContainer.style.display = 'block';
-              breakdownContent.innerHTML = '<div style="text-align:center;"><i class="fas fa-spinner fa-spin"></i> Loading Breakdown...</div>';
-              
-              fetch(`tenant-dashboard.php?action=get_job_details&id=${jobId}`)
-                  .then(r => r.json())
-                  .then(job => {
-                      if (!job) throw new Error("Job not found");
-                      
-                      let baseServiceName = job.service_name || 'Service Package';
-                      let baseServicePrice = parseFloat(job.service_price) || 0;
-                      
-                      fetch(`tenant-dashboard.php?action=fetch_job_parts&job_id=${jobId}`)
-                          .then(r => r.json())
-                          .then(parts => {
-                              let html = '<table style="width:100%; border-collapse:collapse; margin-bottom:10px;">';
-                              html += '<tr><th style="text-align:left; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px;">Description</th>';
-                              html += '<th style="text-align:right; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px;">Amount</th></tr>';
-                              
-                              // Base Service
-                              html += `<tr><td style="padding:5px 0;">${baseServiceName}</td>`;
-                              html += `<td style="text-align:right; padding:5px 0;">₱${baseServicePrice.toLocaleString(undefined, {minimumFractionDigits: 2})}</td></tr>`;
-                              
-                              let subtotal = baseServicePrice;
-                              
-                              // Additional Parts
-                              parts.forEach(p => {
-                                  if(p.approval_status === 'APPROVED') {
-                                      let itemTotal = parseFloat(p.total_price) || 0;
-                                      subtotal += itemTotal;
-                                      html += `<tr><td style="padding:5px 0; color:#94a3b8; font-size:0.8rem;">+ ${p.item_name} (x${p.quantity})</td>`;
-                                      html += `<td style="text-align:right; padding:5px 0; color:#94a3b8; font-size:0.8rem;">₱${itemTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</td></tr>`;
-                                  }
-                              });
-                              
-                              html += `<tr><th style="text-align:left; border-top:1px dashed rgba(255,255,255,0.2); padding-top:5px; margin-top:5px;">Job Subtotal</th>`;
-                              html += `<th style="text-align:right; border-top:1px dashed rgba(255,255,255,0.2); padding-top:5px; margin-top:5px;">₱${subtotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</th></tr>`;
-                              
-                              html += '</table>';
-                              breakdownContent.innerHTML = html;
-                          });
-                  }).catch(err => {
-                      breakdownContent.innerHTML = '<div style="color:var(--danger); text-align:center;">Failed to load breakdown.</div>';
-                  });
-          } else {
-              receiptContainer.style.display = 'none';
-          }
-      }
 
       if (typeof window.openModal === 'function') window.openModal('paymentModal');
     };
@@ -4227,61 +4390,27 @@ try {
         });
     };
 
-    window.editService = function (id, name, desc, price, masterId = null, minPrice = null, maxPrice = null) {
+    window.editService = function (id, name, desc, price, masterId = null, tenantMin = null, tenantMax = null) {
       if (document.getElementById('edit_service_id')) document.getElementById('edit_service_id').value = id;
       if (document.getElementById('edit_service_name')) document.getElementById('edit_service_name').value = name;
       if (document.getElementById('edit_service_desc')) document.getElementById('edit_service_desc').value = (desc === 'null' || !desc) ? '' : desc;
-      if (document.getElementById('edit_service_min_price')) document.getElementById('edit_service_min_price').value = (minPrice === null || minPrice === 'null') ? '' : minPrice;
-      if (document.getElementById('edit_service_max_price')) document.getElementById('edit_service_max_price').value = (maxPrice === null || maxPrice === 'null') ? '' : maxPrice;
 
       const priceInput = document.getElementById('edit_service_price');
-      const form = document.getElementById('editServiceForm');
-      const submitBtn = form ? form.querySelector('button[onclick*="saveEditService"]') : null;
-      let hint = form ? form.querySelector('.price-hint') : null;
-
-      if (!hint && form && priceInput) {
-        hint = document.createElement('div');
-        hint.className = 'price-hint';
-        hint.style.fontSize = '0.75rem';
-        hint.style.marginTop = '5px';
-        priceInput.parentNode.appendChild(hint);
-      }
+      const minInput = document.getElementById('edit_tenant_min_price');
+      const maxInput = document.getElementById('edit_tenant_max_price');
 
       if (priceInput) {
         priceInput.value = price;
-        if (minPrice !== null && maxPrice !== null && parseFloat(minPrice) > 0) {
-          priceInput.min = minPrice;
-          priceInput.max = maxPrice;
-          priceInput.placeholder = `Range: ₱${parseFloat(minPrice).toLocaleString()} - ₱${parseFloat(maxPrice).toLocaleString()}`;
-
-          const validate = () => {
-            const val = parseFloat(priceInput.value || 0);
-            const isInvalid = (val < parseFloat(minPrice) || val > parseFloat(maxPrice));
-            if (hint) {
-              hint.style.color = isInvalid ? '#ef4444' : 'var(--accent)';
-              hint.innerHTML = `<i class="fas fa-${isInvalid ? 'exclamation-triangle' : 'info-circle'}"></i> Recommended Price: ₱${parseFloat(minPrice).toLocaleString()} - ₱${parseFloat(maxPrice).toLocaleString()}`;
-            }
-            if (submitBtn) {
-              submitBtn.disabled = isInvalid;
-              submitBtn.style.opacity = isInvalid ? '0.5' : '1';
-              submitBtn.style.cursor = isInvalid ? 'not-allowed' : 'pointer';
-            }
-          };
-          priceInput.oninput = validate;
-          validate();
-        } else {
-          priceInput.removeAttribute('min');
-          priceInput.removeAttribute('max');
-          priceInput.placeholder = "";
-          priceInput.oninput = null;
-          if (hint) hint.innerHTML = '';
-          if (submitBtn) {
-            submitBtn.disabled = false;
-            submitBtn.style.opacity = '1';
-            submitBtn.style.cursor = 'pointer';
-          }
-        }
+        priceInput.removeAttribute('min');
+        priceInput.removeAttribute('max');
+        priceInput.oninput = null;
       }
+
+      // Populate tenant-defined price limits into the form fields
+      if (minInput) minInput.value = (tenantMin !== null && tenantMin !== 'null') ? tenantMin : '';
+      if (maxInput) maxInput.value = (tenantMax !== null && tenantMax !== 'null') ? tenantMax : '';
+
+      window.validateTenantPrices('edit');
 
       const masterInput = document.getElementById('edit_service_master_id');
       if (masterInput) masterInput.value = masterId || "";
@@ -4458,13 +4587,30 @@ try {
 
               // REFRESH BILLING - Now that window.currentJobServicePrice is set
               if (window.refreshJobPartsList) window.refreshJobPartsList(id);
+              
+              const authStatus = document.getElementById('authProofStatus');
+              const authSection = document.getElementById('customerAuthSection');
+              if (authStatus) {
+                if (job.agreement_signature || job.agreement_proof_file) {
+                  authStatus.style.display = 'block';
+                  authStatus.innerHTML = `<i class="fas fa-check-circle"></i> Authorization Already on File 
+                    <br><a href="${job.agreement_proof_file ? 'uploads/'+job.agreement_proof_file : '#'}" target="_blank" style="color:#10b981; text-decoration:underline;">[View Proof File]</a>`;
+                  if (authSection) authSection.style.display = 'block';
+                } else {
+                  authStatus.style.display = 'none';
+                }
+              }
+              if(window.clearSignature) window.clearSignature();
             }
           });
 
         const mS = document.getElementById('status_mechanic_id');
         const bS = document.getElementById('status_bay_id');
-        if (mS) mS.innerHTML = '<option>Loading...</option>';
-        if (bS) bS.innerHTML = '<option>Loading...</option>';
+        if (mS) mS.innerHTML = '<option value="">Loading...</option>';
+        if (bS) bS.innerHTML = '<option value="">Loading...</option>';
+        
+        if (window.toggleJobStatusEdit) window.toggleJobStatusEdit(editMode);
+        
         fetch(`tenant-dashboard.php?action=fetch_available_resources&preferred_id=${currentBayId || 0}&current_mechanic_id=${currentMechId || 0}`)
           .then(r => r.json()).then(data => {
             if (mS) {
@@ -4483,11 +4629,56 @@ try {
               if (!bS.value && currentBayId && currentBayId != 0) bHtml += `<option value="${currentBayId}" selected>Current Bay</option>`;
               bS.innerHTML = bHtml;
             }
+            if (window.validateCommitButton) window.validateCommitButton();
           });
-
-        if (window.toggleJobStatusEdit) window.toggleJobStatusEdit(editMode);
       } catch (e) { console.error("Modal Open Error:", e); alert("Modal Error: " + e.message); }
     };
+
+    window.validateCommitButton = function() {
+      const sb = document.getElementById('saveJobBtn');
+      if (!sb) return;
+      
+      const statusSelect = document.getElementById('job_current_status');
+      const currentStatus = statusSelect ? statusSelect.value : '';
+      
+      const mS = document.getElementById('status_mechanic_id');
+      const bS = document.getElementById('status_bay_id');
+      const mH = document.getElementById('status_mechanic_id_hidden');
+      const bH = document.getElementById('status_bay_id_hidden');
+      const mId = (mS && !mS.disabled && mS.value) ? mS.value : (mH ? mH.value : (mS ? mS.value : ''));
+      const bId = (bS && !bS.disabled && bS.value) ? bS.value : (bH ? bH.value : (bS ? bS.value : ''));
+      
+      let isValid = true;
+      if (currentStatus !== 'CANCELLED') {
+          if (!mId || !bId) isValid = false;
+      }
+      
+      if (isValid) {
+          sb.disabled = false;
+          sb.style.opacity = '1';
+          sb.style.filter = 'none';
+          sb.style.cursor = 'pointer';
+          sb.style.pointerEvents = 'auto';
+      } else {
+          sb.disabled = true;
+          sb.style.opacity = '0.4';
+          sb.style.filter = 'grayscale(1)';
+          sb.style.cursor = 'not-allowed';
+          sb.style.pointerEvents = 'none';
+      }
+    };
+
+    // Prevent Enter key from submitting the form if it's invalid or unintentionally
+    document.addEventListener('DOMContentLoaded', function() {
+        const jsf = document.getElementById('jobStatusForm');
+        if (jsf) {
+            jsf.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && e.target.tagName !== 'TEXTAREA') {
+                    e.preventDefault();
+                }
+            });
+        }
+    });
 
     window.toggleJobStatusEdit = function (editing) {
       const mS = document.getElementById('status_mechanic_id');
@@ -4499,21 +4690,30 @@ try {
       const isMech = userRole === 'MECHANIC';
       const currentStatus = sS ? sS.value : '';
       const isCompleted = (currentStatus === 'COMPLETED');
-      if (mS) mS.disabled = !editing || isCompleted || isMech;
-      if (bS) bS.disabled = !editing || isCompleted || isMech;
+      if (mS) {
+          mS.disabled = !editing || isCompleted || isMech;
+          mS.addEventListener('change', window.validateCommitButton);
+      }
+      if (bS) {
+          bS.disabled = !editing || isCompleted || isMech;
+          bS.addEventListener('change', window.validateCommitButton);
+      }
       if (eb) eb.style.display = editing ? 'none' : 'flex';
       if (sb) sb.style.display = editing ? 'flex' : 'none';
 
       // Dynamic Status Enforcer: If they select IN_PROGRESS or COMPLETED, hide PENDING
       if (sS) {
-        sS.onchange = function () {
+        sS.addEventListener('change', function () {
           const val = this.value;
           const pendingOpt = this.querySelector('option[value="PENDING"]');
           if (pendingOpt && (val === 'IN_PROGRESS' || val === 'COMPLETED')) {
             pendingOpt.style.display = 'none';
           }
-        };
+          window.validateCommitButton();
+        });
       }
+      
+      window.validateCommitButton();
     };
 
     // --- PARTS & MATERIALS ENGINE ---
@@ -4550,6 +4750,9 @@ try {
       fetch(`tenant-dashboard.php?action=fetch_job_parts&job_id=${jid}`)
         .then(r => r.json()).then(data => {
           window.currentlyAddedServiceIds = data.filter(p => p.service_id).map(p => parseInt(p.service_id));
+          const authSection = document.getElementById('customerAuthSection');
+          if (authSection) authSection.style.display = data.length > 0 ? 'block' : 'none';
+
           if (!data.length) {
             list.innerHTML = '<div style="text-align:center; color:var(--text-dim); font-size:0.8rem; padding:20px;">No parts recorded.</div>';
             if (bill) bill.innerText = '₱0.00';
@@ -4775,12 +4978,37 @@ try {
       const bH = document.getElementById('status_bay_id_hidden');
       const mId = (mS && mS.value) ? mS.value : (mH ? mH.value : '');
       const bId = (bS && bS.value) ? bS.value : (bH ? bH.value : '');
-      if (!mId || !bId) return window.showAlert('Assignment Required', 'Please assign a mechanic and bay.', 'error');
+      
+      const statusSelect = document.getElementById('job_current_status');
+      const currentStatus = statusSelect ? statusSelect.value : '';
+      if (currentStatus !== 'CANCELLED') {
+        if (!mId || !bId) return window.showAlert('Assignment Required', 'Please select a Mechanic and a Service Bay before committing progress.', 'error');
+      }
       if (!fd.has('mechanic_id')) fd.append('mechanic_id', mId);
       if (!fd.has('bay_id')) fd.append('bay_id', bId);
       const checked = [];
       document.querySelectorAll('.ann-chk:checked').forEach(c => checked.push(c.value));
       fd.append('checklist', checked.join(', '));
+      
+      const authSection = document.getElementById('customerAuthSection');
+      if (authSection && authSection.style.display !== 'none') {
+        const authStatus = document.getElementById('authProofStatus');
+        const hasAuthOnFile = authStatus && authStatus.style.display !== 'none';
+        const sigCanvas = document.getElementById('authSignaturePad');
+        const hasNewSig = sigCanvas && window.hasSignature;
+        const fileInput = form.querySelector('input[name="agreement_proof"]');
+        const hasNewFile = fileInput && fileInput.files && fileInput.files.length > 0;
+        
+        if (!hasAuthOnFile && !hasNewSig && !hasNewFile) {
+          return window.showAlert('Authorization Required', 'Please provide a signature or upload proof of customer authorization before committing progress.', 'error');
+        }
+      }
+
+      const sigCanvas = document.getElementById('authSignaturePad');
+      if (sigCanvas && window.hasSignature) {
+          fd.append('agreement_signature', sigCanvas.toDataURL());
+      }
+
       fetch('tenant-dashboard.php?action=update_job_status', { method: 'POST', body: fd })
         .then(r => r.json()).then(data => {
           if (data.status === 'success') {
@@ -5115,6 +5343,60 @@ try {
       openModal('addServiceModal');
     };
 
+    window.validateTenantPrices = function(prefix) {
+      const priceInput = document.getElementById(prefix + '_service_price');
+      const minInput = document.getElementById(prefix + '_tenant_min_price');
+      const maxInput = document.getElementById(prefix + '_tenant_max_price');
+      
+      const formId = prefix === 'add' ? 'addServiceForm' : 'editServiceForm';
+      const form = document.getElementById(formId);
+      if(!form) return;
+      const submitBtn = prefix === 'add' ? form.querySelector('button[onclick*="submitAddService"]') : form.querySelector('button[onclick*="saveEditService"]');
+      if(!submitBtn) return;
+      
+      const price = parseFloat(priceInput.value);
+      const min = parseFloat(minInput.value);
+      const max = parseFloat(maxInput.value);
+      
+      const hintElId = prefix + '_price_validation_hint';
+      let hintEl = document.getElementById(hintElId);
+      if (!hintEl) {
+        hintEl = document.createElement('p');
+        hintEl.id = hintElId;
+        hintEl.style.fontSize = '0.75rem';
+        hintEl.style.marginTop = '5px';
+        hintEl.style.color = '#ef4444';
+        const grid = minInput.parentElement.parentElement;
+        grid.parentNode.insertBefore(hintEl, grid.nextSibling);
+      }
+      
+      let isValid = true;
+      let msg = '';
+      
+      if (isNaN(price) || isNaN(min) || isNaN(max) || price <= 0 || min <= 0 || max <= 0) {
+        isValid = false;
+        msg = 'Price and limits are required.';
+      } else if (min > max) {
+        isValid = false;
+        msg = 'Min price cannot be greater than Max price.';
+      } else if (price < min || price > max) {
+        isValid = false;
+        msg = `Price must be between \u20b1${min} and \u20b1${max}.`;
+      }
+      
+      if (isValid) {
+        hintEl.innerHTML = '';
+        submitBtn.disabled = false;
+        submitBtn.style.opacity = '1';
+        submitBtn.style.cursor = 'pointer';
+      } else {
+        hintEl.innerHTML = `<i class="fas fa-exclamation-triangle"></i> ${msg}`;
+        submitBtn.disabled = true;
+        submitBtn.style.opacity = '0.5';
+        submitBtn.style.cursor = 'not-allowed';
+      }
+    };
+
     window.syncMasterService = function (el, formId) {
       const form = document.getElementById(formId);
       if (!form) return;
@@ -5139,40 +5421,12 @@ try {
         }
       }
 
-      const validate = () => {
-        if (!priceInput || isNaN(min) || min === 0) {
-          if (submitBtn) { submitBtn.disabled = false; submitBtn.style.opacity = '1'; submitBtn.style.cursor = 'pointer'; }
-          return;
-        }
-        const val = parseFloat(priceInput.value || 0);
-        const isInvalid = (val < min || val > max);
-
-        hint.style.color = isInvalid ? '#ef4444' : 'var(--accent)';
-        hint.innerHTML = `<i class="fas fa-${isInvalid ? 'exclamation-triangle' : 'info-circle'}"></i> Recommended Price: ₱${min.toLocaleString()} - ₱${max.toLocaleString()}`;
-
-        if (submitBtn) {
-          submitBtn.disabled = isInvalid;
-          submitBtn.style.opacity = isInvalid ? '0.5' : '1';
-          submitBtn.style.cursor = isInvalid ? 'not-allowed' : 'pointer';
-        }
-      };
-
       if (priceInput) {
-        priceInput.min = min;
-        priceInput.max = max;
-        priceInput.placeholder = (min > 0) ? `Range: ₱${min.toLocaleString()} - ₱${max.toLocaleString()}` : "0.00";
-
-        hint.className = 'price-hint';
-        hint.style.fontSize = '0.75rem';
-        hint.style.marginTop = '5px';
-        if (min > 0) {
-          if (!form.querySelector('.price-hint')) priceInput.parentNode.appendChild(hint);
-          priceInput.oninput = validate;
-          validate();
-        } else {
-          if (form.querySelector('.price-hint')) form.querySelector('.price-hint').remove();
-          if (submitBtn) { submitBtn.disabled = false; submitBtn.style.opacity = '1'; submitBtn.style.cursor = 'pointer'; }
+        priceInput.placeholder = "0.00";
+        if (form.querySelector('.price-hint')) {
+          form.querySelector('.price-hint').remove();
         }
+        window.validateTenantPrices(formId === 'addServiceForm' ? 'add' : 'edit');
       }
     };
 
@@ -5184,7 +5438,7 @@ try {
           try {
             const s = t.indexOf('['), e = t.lastIndexOf(']') + 1;
             const data = JSON.parse(t.substring(s, e));
-            if (!data.length) { b.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:2rem;">No logs found.</td></tr>'; return; }
+            if (!data.length) { b.innerHTML = '<tr><td colspan="7" style="text-align:center; padding:2rem;">No logs found.</td></tr>'; return; }
             b.innerHTML = data.map(p => `
               <tr>
                 <td>#${p.payment_id}</td>
@@ -5193,9 +5447,12 @@ try {
                 <td>₱${parseFloat(p.amount || 0).toLocaleString()}</td>
                 <td>${new Date(p.payment_date).toLocaleDateString()}</td>
                 <td><span class="badge badge-active">${p.status}</span></td>
+                <td>
+                  ${p.job_id ? `<button class="btn-outline" style="padding:4px 10px; font-size:0.75rem;" onclick="window.viewJobReceipt(${p.job_id})"><i class="fas fa-file-invoice"></i> Receipt</button>` : `<span style="color:#666; font-size:0.75rem;">N/A</span>`}
+                </td>
               </tr>
             `).join('');
-          } catch (e) { b.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:2rem;">Sync failed.</td></tr>'; }
+          } catch (e) { b.innerHTML = '<tr><td colspan="7" style="text-align:center; padding:2rem;">Sync failed.</td></tr>'; }
         });
     };
 
@@ -6754,11 +7011,19 @@ try {
                     <?php echo ($user_cycle === 'yearly') ? '/yr' : '/mo'; ?>
                   </span>
                 </div>
+                <div style="margin-bottom:25px; color:#94a3b8; font-size:0.95rem; display:flex; flex-direction:column; gap:10px; text-align:left; background:rgba(255,255,255,0.02); padding:15px; border-radius:12px;">
+                  <div style="display:flex; align-items:center; gap:10px;">
+                    <div style="background:rgba(255,255,255,0.05); padding:6px; border-radius:8px; color:var(--accent);"><i class="fas fa-users fa-fw"></i></div>
+                    <span>Up to <strong><?php echo $p['max_users'] >= 999 ? 'Unlimited' : $p['max_users']; ?></strong> Staff Accounts</span>
+                  </div>
+                  <div style="display:flex; align-items:center; gap:10px;">
+                    <div style="background:rgba(255,255,255,0.05); padding:6px; border-radius:8px; color:var(--accent);"><i class="fas fa-warehouse fa-fw"></i></div>
+                    <span>Up to <strong><?php echo $p['max_service_bays'] >= 999 ? 'Unlimited' : $p['max_service_bays']; ?></strong> Service Bays</span>
+                  </div>
+                </div>
                 <button class="upgrade-select-btn btn-action"
                   style="width:100%; padding:15px; border-radius:15px; font-weight:800; <?php echo $is_current ? 'opacity:0.5; pointer-events:none;' : ''; ?>"
-                  type="button" <?php echo $is_current ? 'disabled' : ''; ?> onclick="processUpgrade(
-            <?php echo $p['plan_id']; ?>, '
-            <?php echo addslashes($p['plan_name']); ?>', event)">
+                  type="button" <?php echo $is_current ? 'disabled' : ''; ?> onclick="processUpgrade(<?php echo $p['plan_id']; ?>, '<?php echo addslashes($p['plan_name']); ?>', event)">
                   <?php echo $is_current ? 'Current Plan' : 'Select Plan'; ?>
                 </button>
               </div>
@@ -6918,13 +7183,16 @@ try {
           body.innerHTML = data.map(s => {
             const safeName = (s.service_name || '').replace(/'/g, "\\'");
             const safeDesc = (s.description || '').replace(/'/g, "\\'");
+            const priceRange = (s.tenant_min_price && s.tenant_max_price)
+              ? `<br><small style="color:var(--accent);font-size:0.72rem;">🔒 Range: ₱${parseFloat(s.tenant_min_price).toLocaleString()} – ₱${parseFloat(s.tenant_max_price).toLocaleString()}</small>`
+              : '';
             return `<tr>
               <td><strong>${s.service_name}</strong></td>
               <td><small>${s.description || 'No description'}</small></td>
-              <td>₱${parseFloat(s.price || 0).toLocaleString()}</td>
+              <td>₱${parseFloat(s.price || 0).toLocaleString()}${priceRange}</td>
               <td><span class="badge badge-active">ACTIVE</span></td>
               <td>
-                <button class="btn-outline" onclick="window.editService(${s.service_id}, '${safeName}', '${safeDesc}', ${s.price}, ${s.master_id || 'null'}, ${s.min_price || 'null'}, ${s.max_price || 'null'})">Edit</button>
+                <button class="btn-outline" onclick="window.editService(${s.service_id}, '${safeName}', '${safeDesc}', ${s.price}, ${s.master_id || 'null'}, ${s.tenant_min_price || 'null'}, ${s.tenant_max_price || 'null'})">Edit</button>
                 <button class="btn-outline" style="color:var(--danger); border-color:rgba(239,68,68,0.3); margin-left:5px;" onclick="window.deleteService(${s.service_id})">Delete</button>
               </td>
             </tr>`;
@@ -6968,13 +7236,17 @@ try {
       btn.innerText = 'Saving...';
       btn.disabled = true;
 
+      // Client-side validation against tenant-defined limits
       const priceInput = form.querySelector('input[name="price"]');
-      if (priceInput.min && priceInput.max) {
-        const val = parseFloat(priceInput.value);
-        const min = parseFloat(priceInput.min);
-        const max = parseFloat(priceInput.max);
-        if (val < min || val > max) {
-          showToast(`Price must be between ₱${min.toLocaleString()} and ₱${max.toLocaleString()}`, 'error');
+      const minInput = form.querySelector('input[name="tenant_min_price"]');
+      const maxInput = form.querySelector('input[name="tenant_max_price"]');
+      if (priceInput && minInput && maxInput && minInput.value !== '' && maxInput.value !== '') {
+        const val = parseFloat(priceInput.value || 0);
+        const tMin = parseFloat(minInput.value);
+        const tMax = parseFloat(maxInput.value);
+        if (val < tMin || val > tMax) {
+          showToast(`Price must be between ₱${tMin.toLocaleString('en-PH', {minimumFractionDigits:2})} and ₱${tMax.toLocaleString('en-PH', {minimumFractionDigits:2})}`, 'error');
+          btn.innerText = originalText; btn.disabled = false;
           return;
         }
       }
@@ -7005,39 +7277,35 @@ try {
       const nameEl = document.getElementById('edit_service_name');
       const descEl = document.getElementById('edit_service_desc');
       const priceEl = document.getElementById('edit_service_price');
+      const minEl = document.getElementById('edit_tenant_min_price');
+      const maxEl = document.getElementById('edit_tenant_max_price');
 
       if (!idEl || !nameEl || !priceEl) {
         showToast('System Error: Missing form fields in Edit Modal', 'error');
         return;
       }
 
-      const id = idEl.value;
-      const name = nameEl.value;
-      const desc = descEl ? descEl.value : '';
-      const price = priceEl.value;
+      const price = parseFloat(priceEl.value || 0);
+      const tenantMin = minEl && minEl.value !== '' ? parseFloat(minEl.value) : null;
+      const tenantMax = maxEl && maxEl.value !== '' ? parseFloat(maxEl.value) : null;
 
-      const priceInput = document.querySelector('#editServiceForm input[name="price"]');
-      if (priceInput && priceInput.min && priceInput.max) {
-        const val = parseFloat(priceInput.value);
-        const min = parseFloat(priceInput.min);
-        const max = parseFloat(priceInput.max);
-        if (val < min || val > max) {
-          showToast(`Price must be between ₱${min.toLocaleString()} and ₱${max.toLocaleString()}`, 'error');
+      // Client-side validation against tenant limits
+      if (tenantMin !== null && tenantMax !== null) {
+        if (price < tenantMin || price > tenantMax) {
+          showToast(`Price must be between ₱${tenantMin.toLocaleString()} and ₱${tenantMax.toLocaleString()}`, 'error');
           return;
         }
       }
 
       const fd = new FormData();
-      fd.append('service_id', id);
-      fd.append('service_name', name);
-      fd.append('description', desc);
-      fd.append('price', price);
+      fd.append('service_id', idEl.value);
+      fd.append('service_name', nameEl.value);
+      fd.append('description', descEl ? descEl.value : '');
+      fd.append('price', priceEl.value);
+      if (minEl && minEl.value !== '') fd.append('tenant_min_price', minEl.value);
+      if (maxEl && maxEl.value !== '') fd.append('tenant_max_price', maxEl.value);
       const masterInput = document.getElementById('edit_service_master_id');
       if (masterInput && masterInput.value) fd.append('master_id', masterInput.value);
-      const minPriceEl = document.getElementById('edit_service_min_price');
-      const maxPriceEl = document.getElementById('edit_service_max_price');
-      if (minPriceEl && minPriceEl.value !== '') fd.append('min_price', minPriceEl.value);
-      if (maxPriceEl && maxPriceEl.value !== '') fd.append('max_price', maxPriceEl.value);
 
       const btn = document.querySelector('#editServiceForm button[onclick*="saveEditService"]');
       const originalText = btn ? btn.innerText : 'Update Service';
@@ -7130,11 +7398,39 @@ try {
                 <?php if (strtoupper($role) === 'OWNER' || strtoupper($role) === 'MANAGER'): ?>
                 <button type="button" class="btn-outline" style="padding:6px 12px; font-size:0.75rem; border-color:var(--accent); color:var(--text-main); cursor:pointer; position:relative; z-index:10; pointer-events:auto !important;" onclick="window.openEditShiftModal(${m.mechanic_id}, '${m.shift_start}', '${m.shift_end}', '${m.display_name.replace(/'/g, "\\'")}', '${m.shift_days || 'Mon,Tue,Wed,Thu,Fri,Sat'}')">Edit Shift</button>
                 ${toggleBtn}
+                <?php if (strtoupper($role) === 'OWNER'): ?>
+                <button type="button" class="btn-outline" style="padding:6px 12px; font-size:0.75rem; border-color:#ef4444; color:#ef4444; cursor:pointer; position:relative; z-index:10; pointer-events:auto !important;" onclick="window.deleteMechanic(${m.mechanic_id}, '${m.display_name.replace(/'/g, "\\\'")}')" title="Remove this mechanic"><i class="fas fa-trash-alt" style="margin-right:3px;"></i>Remove</button>
+                <?php endif; ?>
                 <?php endif; ?>
               </div>
             </td>
           </tr>`;
         }).join('');
+      });
+    };
+
+    window.deleteMechanic = function (mechanicId, mechanicName) {
+      if (!confirm(`⚠️ Are you sure you want to permanently remove mechanic "${mechanicName}"? This will also deactivate their user account.`)) return;
+
+      const fd = new FormData();
+      fd.append('mechanic_id', mechanicId);
+
+      fetch('tenant-dashboard.php?action=delete_mechanic', {
+        method: 'POST',
+        body: fd
+      })
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'success') {
+          showToast(data.message, 'success');
+          window.refreshMechanicsList();
+        } else {
+          showToast(data.message || 'Failed to remove mechanic.', 'error');
+        }
+      })
+      .catch(err => {
+        console.error('Delete Mechanic Error:', err);
+        showToast('Network error while removing mechanic.', 'error');
       });
     };
 
@@ -7169,7 +7465,7 @@ try {
     // refreshAppointmentsList — canonical version defined earlier at line ~4417 (with full error handling)
 
     window.startRepairFromAppointment = function (id) {
-      if (!confirm("Are you sure you want to start this repair now? This will create a Job Order and move it to Active Repairs.")) return;
+      if (!confirm("Are you sure you want to start this repair now? This will create a Job Order and move it to Repair Tracker.")) return;
 
       const formData = new FormData();
       formData.append('appointment_id', id);
@@ -7241,6 +7537,101 @@ try {
         });
     };
 
+    window.allJobOrders = [];
+    window.currentJobTab = 'IN_PROGRESS';
+
+    window.changeJobTab = function(tabStatus) {
+      window.currentJobTab = tabStatus;
+      
+      const tabs = ['IN_PROGRESS', 'PENDING', 'COMPLETED', 'CANCELLED'];
+      const tabColors = {
+        'IN_PROGRESS': '#ffc107',
+        'PENDING': '#f59e0b',
+        'COMPLETED': '#10b981',
+        'CANCELLED': '#ef4444'
+      };
+      
+      tabs.forEach(t => {
+        const btn = document.getElementById('tab_' + t);
+        const countBadge = document.getElementById('count_' + t);
+        if (btn) {
+          if (t === tabStatus) {
+            btn.className = 'btn-action';
+            btn.style.border = 'none';
+            btn.style.background = tabColors[t] || 'var(--accent)';
+            btn.style.color = 'white';
+            if (countBadge) countBadge.style.background = 'rgba(0,0,0,0.2)';
+          } else {
+            btn.className = 'btn-outline';
+            btn.style.border = '1px solid rgba(255,255,255,0.1)';
+            btn.style.background = 'transparent';
+            btn.style.color = 'white';
+            if (countBadge) countBadge.style.background = 'rgba(255,255,255,0.1)';
+          }
+        }
+      });
+      
+      window.renderJobOrdersTable();
+    };
+
+    window.renderJobOrdersTable = function() {
+      const body = document.getElementById('jobOrdersTableBody'); 
+      if (!body) return;
+      
+      const statuses = ['IN_PROGRESS', 'PENDING', 'COMPLETED', 'CANCELLED'];
+      statuses.forEach(status => {
+        const countSpan = document.getElementById('count_' + status);
+        if (countSpan) {
+          const count = window.allJobOrders.filter(j => j.status === status).length;
+          countSpan.textContent = count;
+        }
+      });
+
+      const filteredData = window.allJobOrders.filter(j => j.status === window.currentJobTab);
+      
+      if (filteredData.length === 0) {
+        body.innerHTML = `<tr><td colspan="5" style="text-align:center; padding:3rem; color:var(--text-dim);">No jobs found in ${window.currentJobTab.replace('_', ' ')}.</td></tr>`;
+        return;
+      }
+      
+      body.innerHTML = filteredData.map(j => `
+        <tr>
+          <td>
+            <strong>JO-${(j.job_id || 0).toString().padStart(4, '0')}</strong><br>
+            <span style="font-size:0.6rem; font-weight:900; padding:2px 6px; border-radius:4px; margin-top:4px; display:inline-block; background:${j.appointment_id > 0 ? 'rgba(59,130,246,0.1)' : 'rgba(16,185,129,0.1)'}; color:${j.appointment_id > 0 ? '#3b82f6' : '#10b981'}; border:1px solid ${j.appointment_id > 0 ? 'rgba(59,130,246,0.2)' : 'rgba(16,185,129,0.2)'};">
+              ${j.appointment_id > 0 ? 'APPOINTMENT' : 'WALK-IN'}
+            </span>
+          </td>
+          <td>
+            <div style="font-weight:700; color:var(--text-main); font-size:1rem;">${j.plate_no || '---'}</div>
+            <div style="font-size:0.75rem; color:var(--text-dim);">${j.make || ''} ${j.model || ''}</div>
+            <div style="font-size:0.8rem; color:var(--accent); font-weight:600; margin-top:3px;"><i class="fas fa-user"></i> ${j.customer_name || 'Walking Customer'}</div>
+            ${j.latest_remarks ? `<div style="font-size:0.75rem; background:rgba(255,255,255,0.05); padding:4px 8px; border-radius:6px; margin-top:5px; color:#94a3b8; border-left:2px solid var(--accent);"><strong>Remarks:</strong> ${j.latest_remarks}</div>` : ''}
+          </td>
+          <td>
+            <div style="font-weight:600;">${j.service_name || 'General Repair'}</div>
+            <small style="color:var(--text-dim); background:rgba(255,255,255,0.05); padding:4px 8px; border-radius:6px; display:inline-flex; align-items:center; gap:5px;">
+              <i class="fas fa-wrench" style="color:var(--accent);"></i> ${j.mechanic_name || 'No Mechanic'}
+              <i class="fas fa-warehouse" style="margin-left:8px; color:var(--accent);"></i> ${j.bay_name || 'No Bay'}
+            </small>
+          </td>
+          <td>
+            <span class="badge ${j.status === 'COMPLETED' ? 'badge-active' : (j.status === 'IN_PROGRESS' ? 'badge-warning' : (j.status === 'CANCELLED' ? 'badge-danger' : 'badge-pending'))}">
+              ${j.status || 'PENDING'}
+            </span>
+          </td>
+          <td>
+            ${(j.status !== 'COMPLETED' && j.status !== 'CANCELLED') ? `
+            <button class="btn-outline job-status-btn" style="padding:4px 10px; font-size:0.75rem; border-color:var(--accent); color:var(--accent); cursor:pointer !important;"
+                    onclick="window.handleJobClick(${j.job_id}, '${j.status}', ${j.mechanic_id || 0}, ${j.bay_id || 0}, true, false)"
+                    data-jid="${j.job_id}" data-status="${j.status}" data-mid="${j.mechanic_id || 0}" data-bid="${j.bay_id || 0}" data-edit="true" data-focus="false">
+              <i class="fas fa-user-cog"></i> Assign / Update
+            </button>
+            ` : `<span style="font-size:0.75rem; color:var(--text-dim); opacity:0.6;"><i class="fas fa-check-double"></i> ${j.status === 'CANCELLED' ? 'Cancelled' : 'Finalized'}</span>`}
+          </td>
+        </tr>`).join('');
+    };
+
     window.refreshJobOrders = function () {
       const body = document.getElementById('jobOrdersTableBody'); if (!body) return;
       console.log("[REFRESH] Active Jobs...");
@@ -7253,46 +7644,8 @@ try {
             if (start === -1 || end === 0) throw new Error('No JSON found: ' + text.substring(0, 200));
             const data = JSON.parse(text.substring(start, end));
 
-            if (!Array.isArray(data) || data.length === 0) {
-              body.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:3rem; color:var(--text-dim);">No active job orders in the shop.</td></tr>';
-              return;
-            }
-            body.innerHTML = data.map(j => `
-              <tr>
-                <td>
-                  <strong>JO-${(j.job_id || 0).toString().padStart(4, '0')}</strong><br>
-                  <span style="font-size:0.6rem; font-weight:900; padding:2px 6px; border-radius:4px; margin-top:4px; display:inline-block; background:${j.appointment_id > 0 ? 'rgba(59,130,246,0.1)' : 'rgba(16,185,129,0.1)'}; color:${j.appointment_id > 0 ? '#3b82f6' : '#10b981'}; border:1px solid ${j.appointment_id > 0 ? 'rgba(59,130,246,0.2)' : 'rgba(16,185,129,0.2)'};">
-                    ${j.appointment_id > 0 ? 'APPOINTMENT' : 'WALK-IN'}
-                  </span>
-                </td>
-                <td>
-                  <div style="font-weight:700; color:var(--text-main); font-size:1rem;">${j.plate_no || '---'}</div>
-                  <div style="font-size:0.75rem; color:var(--text-dim);">${j.make || ''} ${j.model || ''}</div>
-                  <div style="font-size:0.8rem; color:var(--accent); font-weight:600; margin-top:3px;"><i class="fas fa-user"></i> ${j.customer_name || 'Walking Customer'}</div>
-                  ${j.latest_remarks ? `<div style="font-size:0.75rem; background:rgba(255,255,255,0.05); padding:4px 8px; border-radius:6px; margin-top:5px; color:#94a3b8; border-left:2px solid var(--accent);"><strong>Remarks:</strong> ${j.latest_remarks}</div>` : ''}
-                </td>
-                <td>
-                  <div style="font-weight:600;">${j.service_name || 'General Repair'}</div>
-                  <small style="color:var(--text-dim); background:rgba(255,255,255,0.05); padding:4px 8px; border-radius:6px; display:inline-flex; align-items:center; gap:5px;">
-                    <i class="fas fa-wrench" style="color:var(--accent);"></i> ${j.mechanic_name || 'No Mechanic'}
-                    <i class="fas fa-warehouse" style="margin-left:8px; color:var(--accent);"></i> ${j.bay_name || 'No Bay'}
-                  </small>
-                </td>
-                <td>
-                  <span class="badge ${j.status === 'COMPLETED' ? 'badge-active' : (j.status === 'IN_PROGRESS' ? 'badge-warning' : 'badge-pending')}">
-                    ${j.status || 'PENDING'}
-                  </span>
-                </td>
-                <td>
-                  ${j.status !== 'COMPLETED' ? `
-                  <button class="btn-outline job-status-btn" style="padding:4px 10px; font-size:0.75rem; border-color:var(--accent); color:var(--accent); cursor:pointer !important;"
-                          onclick="window.handleJobClick(${j.job_id}, '${j.status}', ${j.mechanic_id || 0}, ${j.bay_id || 0}, true, false)"
-                          data-jid="${j.job_id}" data-status="${j.status}" data-mid="${j.mechanic_id || 0}" data-bid="${j.bay_id || 0}" data-edit="true" data-focus="false">
-                    <i class="fas fa-user-cog"></i> Assign / Update
-                  </button>
-                  ` : '<span style="font-size:0.75rem; color:var(--text-dim); opacity:0.6;"><i class="fas fa-check-double"></i> Finalized</span>'}
-                </td>
-              </tr>`).join('');
+            window.allJobOrders = Array.isArray(data) ? data : [];
+            window.renderJobOrdersTable();
           } catch (e) {
             console.error("[refreshJobOrders] Parse Error:", e.message, "\nRaw response:", text.substring(0, 500));
             body.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--danger); padding:2rem;"><i class="fas fa-exclamation-circle"></i> Data Error: Could not display jobs.<br><small style="opacity:0.6;">${e.message}</small></td></tr>`;
@@ -7317,7 +7670,7 @@ try {
              <tr>
                <td><small>${new Date(log.created_at).toLocaleString()}</small></td>
                <td><strong>${log.plate_no || 'N/A'}</strong><br><small style="color:var(--text-dim)">${log.make || ''} ${log.model || ''}</small></td>
-               <td><span class="badge ${log.status_update === 'COMPLETED' ? 'badge-active' : 'badge-info'}" style="font-size:0.65rem;">${log.status_update}</span></td>
+               <td><span class="badge ${log.status_update === 'COMPLETED' ? 'badge-active' : (log.status_update === 'IN_PROGRESS' ? 'badge-warning' : 'badge-pending')}" style="font-size:0.65rem;">${log.status_update}</span></td>
                <td style="font-size:0.9rem;">${log.remarks || '---'}</td>
              </tr>
            `).join('');
@@ -7443,7 +7796,7 @@ try {
       <div class="nav-item" data-view="job_orders" onclick="window.navToView('job_orders')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
         onmouseleave="this.style.background='transparent'">
-        <i class="fas fa-tools"></i> <span class="nav-label">Active Repairs</span>
+        <i class="fas fa-tools"></i> <span class="nav-label">Repair Tracker</span>
       </div>
       <div class="nav-item" data-view="bays" onclick="window.navToView('bays')"
         onmouseenter="this.style.background='rgba(255,255,255,0.05)'"
@@ -8175,7 +8528,7 @@ try {
     <!-- Job Orders View -->
     <div id="job_orders" class="view-section">
       <div class="glass-panel">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
           <div>
             <h3>Repair Job Orders</h3>
             <p style="color:var(--text-dim); font-size:0.9rem;">Track live progress of vehicles inside the
@@ -8184,6 +8537,15 @@ try {
           <button class="btn-action" onclick="refreshJobOrders()"><i class="fas fa-sync"></i> Refresh
             List</button>
         </div>
+        
+        <!-- Job Tabs -->
+        <div style="display:flex; gap:10px; margin-bottom:1.5rem; overflow-x:auto; padding-bottom:5px;">
+          <button id="tab_IN_PROGRESS" class="btn-action" onclick="window.changeJobTab('IN_PROGRESS')" style="padding:0.6rem 1.5rem; border-radius:12px; font-weight:700; border:none; background:#ffc107; color:white; transition:0.3s; flex-shrink:0;">In Progress <span id="count_IN_PROGRESS" style="background:rgba(0,0,0,0.2); padding:2px 8px; border-radius:10px; font-size:0.8rem; margin-left:5px;">0</span></button>
+          <button id="tab_PENDING" class="btn-outline" onclick="window.changeJobTab('PENDING')" style="padding:0.6rem 1.5rem; border-radius:12px; font-weight:700; border:1px solid rgba(255,255,255,0.1); background:transparent; color:white; transition:0.3s; flex-shrink:0;">Pending <span id="count_PENDING" style="background:rgba(255,255,255,0.1); padding:2px 8px; border-radius:10px; font-size:0.8rem; margin-left:5px;">0</span></button>
+          <button id="tab_COMPLETED" class="btn-outline" onclick="window.changeJobTab('COMPLETED')" style="padding:0.6rem 1.5rem; border-radius:12px; font-weight:700; border:1px solid rgba(255,255,255,0.1); background:transparent; color:white; transition:0.3s; flex-shrink:0;">Completed <span id="count_COMPLETED" style="background:rgba(255,255,255,0.1); padding:2px 8px; border-radius:10px; font-size:0.8rem; margin-left:5px;">0</span></button>
+          <button id="tab_CANCELLED" class="btn-outline" onclick="window.changeJobTab('CANCELLED')" style="padding:0.6rem 1.5rem; border-radius:12px; font-weight:700; border:1px solid rgba(255,255,255,0.1); background:transparent; color:white; transition:0.3s; flex-shrink:0;">Cancelled <span id="count_CANCELLED" style="background:rgba(255,255,255,0.1); padding:2px 8px; border-radius:10px; font-size:0.8rem; margin-left:5px;">0</span></button>
+        </div>
+        
         <div style="overflow-x:auto;">
           <table class="data-table">
             <thead>
@@ -8305,11 +8667,12 @@ try {
               <th>Amount Paid</th>
               <th>Date</th>
               <th>Status</th>
+              <th>Action</th>
             </tr>
           </thead>
           <tbody id="completedPaymentsBody">
             <tr>
-              <td colspan="6" style="text-align:center; padding:2rem;">Fetching payment logs...</td>
+              <td colspan="7" style="text-align:center; padding:2rem;">Fetching payment logs...</td>
             </tr>
           </tbody>
         </table>
@@ -8518,7 +8881,7 @@ try {
                 </span></td>
               <td>
                 <button class="btn-outline"
-                  onclick="editService(<?php echo $s['service_id']; ?>, '<?php echo addslashes($s['service_name']); ?>', '<?php echo addslashes($s['description']); ?>', <?php echo $s['price']; ?>, <?php echo $s['master_id'] ?? 'null'; ?>, <?php echo $s['min_price'] ?? 'null'; ?>, <?php echo $s['max_price'] ?? 'null'; ?>)">Edit</button>
+                  onclick="editService(<?php echo $s['service_id']; ?>, '<?php echo addslashes($s['service_name']); ?>', '<?php echo addslashes($s['description']); ?>', <?php echo $s['price']; ?>, <?php echo $s['master_id'] ?? 'null'; ?>, <?php echo $s['tenant_min_price'] ?? 'null'; ?>, <?php echo $s['tenant_max_price'] ?? 'null'; ?>)">Edit</button>
                 <button class="btn-outline"
                   style="color:var(--danger); border-color:rgba(239,68,68,0.3); margin-left: 5px;"
                   onclick="deleteService(<?php echo $s['service_id']; ?>)">Delete</button>
@@ -10336,12 +10699,41 @@ try {
         Object.entries(map).forEach(([inputId, selector]) => {
           const el = document.getElementById(inputId);
           if (!el) return;
-          const val = el.value;
+          let val = el.value;
+
+          if (!val) {
+            const themeEl = document.getElementById('setting_ui_style');
+            const theme = themeEl ? themeEl.value : 'GLASS';
+            const shopNameEl = document.getElementById('setting_shop_name');
+            const shopName = shopNameEl ? shopNameEl.value : 'My Shop';
+            const descEl = document.getElementById('setting_description');
+            const description = descEl ? descEl.value : '';
+
+            if (inputId === 'setting_hero_title') {
+                if (theme === 'PREMIUM') val = "UNMATCHED<br><span>PRECISION.</span>";
+                else if (theme === 'MINIMAL') val = shopName + ".";
+                else if (theme === 'VIBRANT') val = "WE REVIVE YOUR RIDE!";
+                else val = "Expert Service at<br><span>" + shopName + "</span>";
+            } else if (inputId === 'setting_hero_subtitle') {
+                if (theme === 'PREMIUM') val = shopName + ": Where elite engineering meets luxury care.";
+                else if (theme === 'MINIMAL') val = description;
+                else if (theme === 'VIBRANT') val = shopName + " POWERED";
+                else val = description || "Premium car care and maintenance for your high-performance vehicle.";
+            } else if (inputId === 'setting_shop_name') {
+                val = shopName;
+            }
+          }
+
           const targets = doc.querySelectorAll(selector);
           targets.forEach(t => {
-            if (selector === '.hero h1' && t.querySelector('span')) {
-              // Keep the span structure if possible
-              t.innerHTML = val.replace(/([^\s]+)$/, '<span>$1</span>');
+            if (selector === '.hero h1') {
+              if (val.includes('<br>')) {
+                t.innerHTML = val;
+              } else if (t.querySelector('span')) {
+                t.innerHTML = val.replace(/([^\s]+)$/, '<span>$1</span>');
+              } else {
+                t.innerText = val;
+              }
             } else {
               t.innerText = val;
             }
@@ -10464,25 +10856,30 @@ try {
           <textarea name="description" placeholder="What's included?"
             style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; min-height:90px; resize:none; box-sizing:border-box;"></textarea>
         </div>
-        <div style="margin-bottom:1.5rem; display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;">
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price (PHP)</label>
-            <input type="number" step="0.01" name="price" required placeholder="0.00"
-              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Min Price</label>
-            <input type="number" step="0.01" name="min_price" placeholder="Optional"
-              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Max Price</label>
-            <input type="number" step="0.01" name="max_price" placeholder="Optional"
-              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
+        <div style="margin-bottom:1.5rem;">
+          <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price (PHP)</label>
+          <input type="number" step="0.01" name="price" id="add_service_price" required placeholder="0.00" oninput="window.validateTenantPrices('add')"
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
-        <button type="button" onclick="submitAddService()"
-          style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1rem; border-radius:12px; font-size:1rem; font-weight:700; cursor:pointer;">Save
+        <!-- Tenant-defined price limits -->
+        <div style="margin-bottom:1rem;">
+          <label style="display:block; margin-bottom:4px; font-size:0.82rem; color:var(--accent); font-weight:600;">&#128274; Set Your Price Limits <span style="color:#ef4444; font-weight:400;">(Required)</span></label>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+            <div>
+              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Min Price (&#8369;)</label>
+              <input type="number" step="0.01" name="tenant_min_price" id="add_tenant_min_price" placeholder="e.g. 500" oninput="window.validateTenantPrices('add')"
+                style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.7rem 0.9rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+            </div>
+            <div>
+              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Max Price (&#8369;)</label>
+              <input type="number" step="0.01" name="tenant_max_price" id="add_tenant_max_price" placeholder="e.g. 2000" oninput="window.validateTenantPrices('add')"
+                style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.7rem 0.9rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+            </div>
+          </div>
+          <p style="margin:5px 0 0; font-size:0.74rem; color:#64748b;">Staff cannot save a price outside this range.</p>
+        </div>
+        <button type="button" onclick="submitAddService()" disabled
+          style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1rem; border-radius:12px; font-size:1rem; font-weight:700; cursor:not-allowed; opacity:0.5;">Save
           Service</button>
       </form>
     </div>
@@ -10512,25 +10909,30 @@ try {
           <textarea name="description" id="edit_service_desc"
             style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; min-height:90px; resize:none; box-sizing:border-box;"></textarea>
         </div>
-        <div style="margin-bottom:1.5rem; display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;">
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price (PHP)</label>
-            <input type="number" step="0.01" name="price" id="edit_service_price" required
-              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Min Price</label>
-            <input type="number" step="0.01" name="min_price" id="edit_service_min_price" placeholder="Optional"
-              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Max Price</label>
-            <input type="number" step="0.01" name="max_price" id="edit_service_max_price" placeholder="Optional"
-              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
+        <div style="margin-bottom:1.5rem;">
+          <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price (PHP)</label>
+          <input type="number" step="0.01" name="price" id="edit_service_price" required oninput="window.validateTenantPrices('edit')"
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
-        <button type="button" onclick="window.saveEditService()"
-          style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1rem; border-radius:12px; font-size:1rem; font-weight:700; cursor:pointer;">Update
+        <!-- Tenant-defined price limits -->
+        <div style="margin-bottom:1.5rem;">
+          <label style="display:block; margin-bottom:4px; font-size:0.82rem; color:var(--accent); font-weight:600;">&#128274; Your Price Limits <span style="color:#ef4444; font-weight:400;">(Required)</span></label>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+            <div>
+              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Min Price (&#8369;)</label>
+              <input type="number" step="0.01" name="tenant_min_price" id="edit_tenant_min_price" placeholder="e.g. 500" oninput="window.validateTenantPrices('edit')"
+                style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.7rem 0.9rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+            </div>
+            <div>
+              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Max Price (&#8369;)</label>
+              <input type="number" step="0.01" name="tenant_max_price" id="edit_tenant_max_price" placeholder="e.g. 2000" oninput="window.validateTenantPrices('edit')"
+                style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.7rem 0.9rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+            </div>
+          </div>
+          <p style="margin:5px 0 0; font-size:0.74rem; color:#64748b;">Staff cannot save a price outside this range.</p>
+        </div>
+        <button type="button" onclick="window.saveEditService()" disabled
+          style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1rem; border-radius:12px; font-size:1rem; font-weight:700; cursor:not-allowed; opacity:0.5;">Update
           Service</button>
       </form>
     </div>
@@ -11512,11 +11914,11 @@ try {
           </div>
         </div>
 
-        <div style="display:grid; grid-template-columns:1fr 1.2fr; gap:12px; margin-bottom:1.2rem;">
+        <div style="display:grid; grid-template-columns:1fr 1.2fr; gap:12px; margin-bottom:0.8rem;">
           <div>
             <label
               style="display:block; margin-bottom:5px; font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase;">Method</label>
-            <select name="payment_method" style="padding:0.7rem; font-size:0.85rem;">
+            <select name="payment_method" id="pay_method" onchange="window.toggleTenderedField()" style="padding:0.7rem; font-size:0.85rem;">
               <option value="CASH">CASH</option>
               <option value="GCASH">GCASH</option>
               <option value="BANK">BANK</option>
@@ -11527,8 +11929,16 @@ try {
               style="display:block; margin-bottom:5px; font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase;">Ref
               No.</label>
             <input type="text" name="reference_no" placeholder="Optional"
-              style="width:100%; background:rgba(0,0,0,0.2); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.7rem; border-radius:10px; font-size:0.85rem; outline:none;">
+              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.7rem; border-radius:10px; font-size:0.95rem; outline:none;">
           </div>
+        </div>
+
+        <div id="tenderedField" style="margin-bottom:1.2rem;">
+          <label style="display:block; margin-bottom:5px; font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase;">Amount Tendered (PHP)</label>
+          <input type="number" name="amount_tendered" id="pay_amount_tendered" step="0.01" placeholder="0.00"
+            style="width:100%; background:rgba(0,0,0,0.3); border:1px solid var(--accent); color:white; padding:0.7rem; border-radius:10px; font-size:1rem; outline:none;"
+            oninput="window.calculateChange()">
+          <div id="changeDisplay" style="margin-top:5px; font-size:0.85rem; color:#10b981; font-weight:700; display:none;">Change: ₱0.00</div>
         </div>
 
         <button type="submit"
@@ -11589,7 +11999,7 @@ try {
                 style="display:block; margin-bottom:8px; font-size:0.85rem; color:#94a3b8; font-weight:600;">Operational
                 Status</label>
               <select name="status" id="job_current_status" required
-                onchange="if(window.toggleJobStatusEdit) window.toggleJobStatusEdit(document.getElementById('saveJobBtn').style.display === 'flex')"
+                onchange="if(window.toggleJobStatusEdit) window.toggleJobStatusEdit(true)"
                 style="width:100%; padding:1rem; border-radius:12px; background:rgba(0,0,0,0.2); border:1px solid rgba(255,255,255,0.1); color:white; font-weight:600;">
                 <option value="PENDING">PENDING (Awaiting Bay)</option>
                 <option value="IN_PROGRESS">IN PROGRESS (Work Started)</option>
@@ -11728,6 +12138,27 @@ try {
                 <span id="totalOverallBill" style="font-size:1.2rem; font-weight:900; color:white;">₱0.00</span>
               </div>
 
+              <!-- Customer Authorization for Extras -->
+              <div id="customerAuthSection" style="display:none; margin-top:1.5rem; background:rgba(255,255,255,0.02); border:1px solid var(--glass-border); border-radius:15px; padding:1.2rem;">
+                <label style="display:block; margin-bottom:12px; font-size:0.8rem; color:var(--accent); font-weight:800; text-transform:uppercase; letter-spacing:1px;">Customer Authorization Proof (Optional)</label>
+                
+                <div id="authProofStatus" style="display:none; margin-bottom:12px; font-size:0.8rem; color:#10b981; font-weight:700;"><i class="fas fa-check-circle"></i> Authorization Already on File</div>
+
+                <!-- Signature Pad -->
+                <div style="margin-bottom:1rem;">
+                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                    <span style="font-size:0.75rem; color:var(--text-dim);">E-Signature:</span>
+                    <button type="button" onclick="window.clearSignature()" style="background:none; border:none; color:var(--danger); font-size:0.7rem; cursor:pointer; padding:0;">Clear / Re-sign</button>
+                  </div>
+                  <canvas id="authSignaturePad" width="350" height="150" style="background:white; border-radius:10px; width:100%; border:2px dashed rgba(255,255,255,0.2); touch-action:none;"></canvas>
+                </div>
+
+                <!-- File Upload -->
+                <div style="margin-bottom:0.5rem;">
+                  <span style="display:block; font-size:0.75rem; color:var(--text-dim); margin-bottom:5px;">Or Upload Proof (Chat Screenshot/Photo):</span>
+                  <input type="file" name="agreement_proof" accept="image/*" style="width:100%; font-size:0.8rem; color:white; background:rgba(0,0,0,0.2); padding:0.5rem; border-radius:8px; border:1px solid rgba(255,255,255,0.1);">
+                </div>
+              </div>
 
             </div>
           </div>
@@ -11857,7 +12288,7 @@ try {
           // FOR CASHIER/STAFF: Hide PENDING and REJECTED
           if (isCashier && (status === 'PENDING' || status === 'REJECTED')) return;
 
-          const statusClass = status === 'COMPLETED' || status === 'SETTLED' ? 'badge-active' : (status === 'IN_PROGRESS' ? 'badge-info' : 'badge-pending');
+          const statusClass = status === 'COMPLETED' || status === 'SETTLED' ? 'badge-active' : (status === 'IN_PROGRESS' ? 'badge-warning' : 'badge-pending');
           const isMech = role === 'MECHANIC';
 
           const isApp = parseInt(job.appointment_id) > 0;
@@ -12843,7 +13274,7 @@ try {
                   <td>${j.make} ${j.model}<br><small style="opacity:0.5;">${j.customer_name}</small></td>
                   <td>${j.service_name}</td>
                   <td style="color:white; font-weight:700;">₱${parseFloat(j.total_amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
-                  <td><span class="badge ${j.status === 'COMPLETED' ? 'badge-active' : (j.status === 'IN_PROGRESS' ? 'badge-info' : 'badge-pending')}">${j.status}</span></td>
+                  <td><span class="badge ${j.status === 'COMPLETED' ? 'badge-active' : (j.status === 'IN_PROGRESS' ? 'badge-warning' : 'badge-pending')}">${j.status}</span></td>
                   <td>
                     <button class="btn-action" style="padding:5px 15px; font-size:0.75rem; background:var(--accent); color:white; border:none; border-radius:8px; cursor:pointer;" 
                       onclick="window.openRecordPaymentModal(${j.job_id}, '${j.customer_id}', '${j.customer_name}', ${j.total_amount})">
@@ -12858,8 +13289,8 @@ try {
                   <td><strong>${j.plate_no}</strong></td>
                   <td>${j.make} ${j.model}<br><small style="opacity:0.5;">${j.customer_name}</small></td>
                   <td>${j.service_name}</td>
-                  <td><small style="color:var(--accent);">${j.mechanic_name}</small></td>
-                  <td><span class="badge ${j.status === 'COMPLETED' ? 'badge-active' : (j.status === 'IN_PROGRESS' ? 'badge-info' : 'badge-pending')}">${j.status}</span></td>
+                  <td><small style="color:var(--text-main); font-weight:600;">${j.mechanic_name}</small></td>
+                  <td><span class="badge ${j.status === 'COMPLETED' ? 'badge-active' : (j.status === 'IN_PROGRESS' ? 'badge-warning' : 'badge-pending')}">${j.status}</span></td>
                   ${window.currentUserRole === 'MECHANIC' ? `<td><button class="btn-outline" onclick="window.handleJobClick(${j.job_id}, '${j.status}', ${j.mechanic_id}, ${j.bay_id})">Manage</button></td>` : ''}
                 </tr>
               `;
@@ -14440,6 +14871,69 @@ try {
 
       // INITIAL DATA LOAD
     })();
+
+    // Signature Pad Initialization
+    document.addEventListener('DOMContentLoaded', () => {
+      setTimeout(() => {
+        const canvas = document.getElementById('authSignaturePad');
+        if(canvas) {
+          const ctx = canvas.getContext('2d');
+          let isDrawing = false;
+          
+          function getPos(e) {
+              const rect = canvas.getBoundingClientRect();
+              if(e.touches) {
+                  return { x: e.touches[0].clientX - rect.left, y: e.touches[0].clientY - rect.top };
+              }
+              return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+          }
+
+          function startPosition(e) {
+              e.preventDefault();
+              isDrawing = true;
+              const pos = getPos(e);
+              ctx.beginPath();
+              ctx.moveTo(pos.x, pos.y);
+              window.hasSignature = true;
+          }
+
+          function endPosition() {
+              isDrawing = false;
+              ctx.beginPath();
+          }
+
+          function draw(e) {
+              if(!isDrawing) return;
+              e.preventDefault();
+              const pos = getPos(e);
+              ctx.lineWidth = 2;
+              ctx.lineCap = 'round';
+              ctx.strokeStyle = '#000';
+              ctx.lineTo(pos.x, pos.y);
+              ctx.stroke();
+              ctx.beginPath();
+              ctx.moveTo(pos.x, pos.y);
+          }
+
+          canvas.addEventListener('mousedown', startPosition);
+          canvas.addEventListener('mouseup', endPosition);
+          canvas.addEventListener('mousemove', draw);
+          
+          canvas.addEventListener('touchstart', startPosition, {passive: false});
+          canvas.addEventListener('touchend', endPosition);
+          canvas.addEventListener('touchmove', draw, {passive: false});
+        }
+      }, 1000);
+    });
+    
+    window.clearSignature = function() {
+        const canvas = document.getElementById('authSignaturePad');
+        if(canvas) {
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            window.hasSignature = false;
+        }
+    };
 
     window.addEventListener('load', () => {
       console.log("[RUNTIME] Initializing Dashboard Modules...");
