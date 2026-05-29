@@ -439,8 +439,12 @@ $theme = $shop['ui_style'] ?: 'GLASS';
 
     <?php if ($theme === 'PREMIUM'): ?>
     <header class="hero" id="preview_banner">
-        <h1 id="preview_hero_title">UNMATCHED<br><span>PRECISION.</span></h1>
-        <p id="preview_hero_subtitle" style="margin-top:20px; font-size:1.4rem; color: #ddd;"><?php echo htmlspecialchars($shop['shop_name']); ?>: Where elite engineering meets luxury care.</p>
+        <?php if (!empty($shop['hero_title'])): ?>
+            <h1 id="preview_hero_title"><?php echo nl2br(htmlspecialchars($shop['hero_title'])); ?></h1>
+        <?php else: ?>
+            <h1 id="preview_hero_title">UNMATCHED<br><span>PRECISION.</span></h1>
+        <?php endif; ?>
+        <p id="preview_hero_subtitle" style="margin-top:20px; font-size:1.4rem; color: #ddd;"><?php echo htmlspecialchars($shop['hero_subtitle'] ?: ($shop['shop_name'] . ': Where elite engineering meets luxury care.')); ?></p>
     </header>
     <main class="container">
         <h2 style="font-size:4rem; letter-spacing:-2px; margin-bottom:4rem;">PREMIUM SERVICES</h2>
@@ -454,17 +458,27 @@ $theme = $shop['ui_style'] ?: 'GLASS';
             <?php endforeach; ?>
         </div>
         <div class="info-panel" id="about">
+            <?php if (!empty($shop['about_text'])): ?>
+                <div style="grid-column: span 3; margin-bottom: 2rem;">
+                    <label style="color:var(--accent); font-weight:900;">ABOUT US</label>
+                    <p style="color:var(--text-main); font-size:1.1rem; line-height:1.8;"><?php echo nl2br(htmlspecialchars($shop['about_text'])); ?></p>
+                </div>
+            <?php endif; ?>
             <div><label style="color:var(--accent); font-weight:900;">LOCATION</label><p id="preview_address"><?php echo htmlspecialchars($shop['address']); ?></p></div>
             <div><label style="color:var(--accent); font-weight:900;">CONTACT</label><p id="preview_phone"><?php echo htmlspecialchars($shop['phone']); ?><br><?php echo htmlspecialchars($shop['email']); ?></p></div>
-            <div><label style="color:var(--accent); font-weight:900;">HOURS</label><p id="preview_opening_hours">Mon - Sun: 8am - 8pm</p></div>
+            <div><label style="color:var(--accent); font-weight:900;">HOURS</label><p id="preview_opening_hours"><?php echo htmlspecialchars($shop['opening_hours'] ?: 'Mon - Sun: 8am - 8pm'); ?></p></div>
         </div>
     </main>
     <?php endif; ?>
 
     <?php if ($theme === 'MINIMAL'): ?>
     <header class="hero" id="preview_banner">
-        <h1 id="preview_hero_title"><?php echo htmlspecialchars($shop['shop_name']); ?>.</h1>
-        <p id="preview_hero_subtitle" style="color:#666; margin-top:10px;"><?php echo htmlspecialchars($shop['description']); ?></p>
+        <?php if (!empty($shop['hero_title'])): ?>
+            <h1 id="preview_hero_title"><?php echo htmlspecialchars($shop['hero_title']); ?></h1>
+        <?php else: ?>
+            <h1 id="preview_hero_title"><?php echo htmlspecialchars($shop['shop_name']); ?>.</h1>
+        <?php endif; ?>
+        <p id="preview_hero_subtitle" style="color:#666; margin-top:10px;"><?php echo htmlspecialchars($shop['hero_subtitle'] ?: $shop['description']); ?></p>
     </header>
     <main class="container">
         <div id="services">
@@ -479,6 +493,9 @@ $theme = $shop['ui_style'] ?: 'GLASS';
             <?php endforeach; ?>
         </div>
         <div id="about" class="info-panel">
+            <?php if (!empty($shop['about_text'])): ?>
+                <div><p style="color:#666;">About</p><b><?php echo nl2br(htmlspecialchars($shop['about_text'])); ?></b></div>
+            <?php endif; ?>
             <div><p style="color:#666;">Contact</p><b id="preview_phone"><?php echo htmlspecialchars($shop['email']); ?><br><?php echo htmlspecialchars($shop['phone']); ?></b></div>
             <div><p style="color:#666;">Visit</p><b id="preview_address"><?php echo htmlspecialchars($shop['address']); ?></b></div>
         </div>
@@ -487,8 +504,12 @@ $theme = $shop['ui_style'] ?: 'GLASS';
 
     <?php if ($theme === 'VIBRANT'): ?>
     <header class="hero" id="preview_banner">
-        <h1 id="preview_hero_title">WE REVIVE YOUR RIDE!</h1>
-        <p id="preview_hero_subtitle" style="font-weight:700; background:rgba(0,0,0,0.2); display:inline-block; padding:10px 20px; border-radius:10px;"><?php echo htmlspecialchars($shop['shop_name']); ?> POWERED</p>
+        <?php if (!empty($shop['hero_title'])): ?>
+            <h1 id="preview_hero_title"><?php echo htmlspecialchars($shop['hero_title']); ?></h1>
+        <?php else: ?>
+            <h1 id="preview_hero_title">WE REVIVE YOUR RIDE!</h1>
+        <?php endif; ?>
+        <p id="preview_hero_subtitle" style="font-weight:700; background:rgba(0,0,0,0.2); display:inline-block; padding:10px 20px; border-radius:10px;"><?php echo htmlspecialchars($shop['hero_subtitle'] ?: ($shop['shop_name'] . ' POWERED')); ?></p>
     </header>
     <main class="container">
         <div class="services-grid" id="services">
@@ -502,6 +523,9 @@ $theme = $shop['ui_style'] ?: 'GLASS';
         </div>
         <div id="about" class="info-panel">
             <h2 style="margin-bottom:20px;">Come Visit Us!</h2>
+            <?php if (!empty($shop['about_text'])): ?>
+                <p style="margin-bottom:20px;"><?php echo nl2br(htmlspecialchars($shop['about_text'])); ?></p>
+            <?php endif; ?>
             <p><b>Address:</b> <span id="preview_address"><?php echo htmlspecialchars($shop['address']); ?></span></p>
             <p><b>Phone:</b> <span id="preview_phone"><?php echo htmlspecialchars($shop['phone']); ?></span></p>
         </div>
