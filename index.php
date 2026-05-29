@@ -28,6 +28,8 @@ try {
         href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
         rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.25/jspdf.plugin.autotable.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
     <style>
         :root {
             --bg-deep: #030712;
@@ -1778,7 +1780,7 @@ try {
             <h3 style="font-size: 1.8rem; margin-bottom: 0.5rem;">Onboard Your Shop</h3>
             <p style="margin-bottom: 1.5rem;">Join the 500+ tenants scaling their business with AutoFix Hub.</p>
 
-            <form action="verify-email.php" method="POST" enctype="multipart/form-data">
+            <form action="verify-email.php" method="POST" enctype="multipart/form-data" onsubmit="return validateRegistrationForm()">
                 <!-- ... existing fields ... -->
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
                     <div class="form-group">
@@ -1866,7 +1868,7 @@ try {
                     <div class="form-group">
                         <label>Business Proof (BIR/Permit)</label>
                         <div class="file-upload-wrapper">
-                            <input type="file" name="business_proof" accept="image/*,.pdf" onchange="updateFileName(this)" required>
+                            <input type="file" name="business_proof" accept="image/*,.pdf" onchange="handleDocumentUpload(this, 'permitExpiryDate', 'business permit')" required>
                             <div class="file-upload-btn">
                                 <i class="fas fa-file-invoice"></i>
                                 <span>Upload Permit...</span>
@@ -1874,16 +1876,32 @@ try {
                         </div>
                     </div>
                     <div class="form-group">
-                        <label>Owner's ID Photo</label>
+                        <label>DTI Registration Proof</label>
                         <div class="file-upload-wrapper">
-                            <input type="file" name="id_photo" accept="image/*" onchange="updateFileName(this)" required>
+                            <input type="file" name="dti_proof" accept="image/*,.pdf" onchange="handleDocumentUpload(this, 'dtiExpiryDate', 'DTI permit')" required>
                             <div class="file-upload-btn">
-                                <i class="fas fa-id-card"></i>
-                                <span>Upload ID...</span>
+                                <i class="fas fa-certificate"></i>
+                                <span>Upload DTI...</span>
                             </div>
                         </div>
                     </div>
                 </div>
+
+                <div class="form-group" style="margin-bottom: 15px;">
+                    <label>Owner's ID Photo</label>
+                    <div class="file-upload-wrapper">
+                        <input type="file" name="id_photo" accept="image/*" onchange="handleDocumentUpload(this, 'idExpiryDate', 'valid ID')" required>
+                        <div class="file-upload-btn">
+                            <i class="fas fa-id-card"></i>
+                            <span>Upload ID...</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Hidden fields for OCR extracted dates -->
+                <input type="hidden" name="permit_expiry_date" id="permitExpiryDate">
+                <input type="hidden" name="dti_expiry_date" id="dtiExpiryDate">
+                <input type="hidden" name="id_expiry_date" id="idExpiryDate">
 
                 <input type="hidden" name="plan_id" id="hiddenPlanId">
                 <input type="hidden" name="billing_cycle" id="hiddenBillingCycle">
@@ -1947,6 +1965,75 @@ try {
             } else {
                 btn.innerText = 'Upload File...';
                 btn.style.color = 'var(--text-dim)';
+            }
+        }
+
+        async function handleDocumentUpload(input, dateInputId, documentName) {
+            updateFileName(input);
+            const file = input.files[0];
+            if (!file) return;
+
+            // Only auto-scan images. Skip for PDFs.
+            if (!file.type.startsWith('image/')) {
+                return; 
+            }
+
+            const wrapper = input.closest('.file-upload-wrapper');
+            const btn = wrapper.querySelector('.file-upload-btn span');
+            const originalText = btn.innerText;
+            btn.innerText = `Scanning ${documentName}...`;
+            btn.style.color = "#f59e0b"; // Warning/Processing color
+
+            try {
+                // Read with Tesseract
+                const result = await Tesseract.recognize(file, 'eng');
+                const text = result.data.text;
+                
+                // Regex to find dates in various formats
+                const dateRegex = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{4}\b|\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b/gi;
+                const matches = text.match(dateRegex);
+                
+                let isValid = false;
+                let detectedDate = null;
+                const today = new Date();
+                today.setHours(0,0,0,0);
+
+                if (matches) {
+                    for (let match of matches) {
+                        let d = new Date(match);
+                        if (!isNaN(d.getTime())) {
+                            // If any date found is in the future, we assume it's the expiry date and it's valid
+                            if (d >= today) {
+                                isValid = true;
+                                detectedDate = d;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (isValid && detectedDate) {
+                    alert(`Valid ${documentName} you may now proceed`);
+                    const dateInput = document.getElementById(dateInputId);
+                    if(dateInput) {
+                        const yyyy = detectedDate.getFullYear();
+                        const mm = String(detectedDate.getMonth() + 1).padStart(2, '0');
+                        const dd = String(detectedDate.getDate()).padStart(2, '0');
+                        dateInput.value = `${yyyy}-${mm}-${dd}`;
+                    }
+                } else {
+                    alert(`Invalid ${documentName}, try again with valid ${documentName} date`);
+                    input.value = ""; // Clear invalid file
+                    updateFileName(input);
+                }
+            } catch (e) {
+                console.error("OCR Error:", e);
+                alert("Failed to scan document. Please check the file and try again.");
+            } finally {
+                if(btn.innerText.startsWith("Scanning")) {
+                    btn.innerText = originalText;
+                    btn.style.color = 'var(--accent)';
+                }
             }
         }
 
@@ -2067,6 +2154,24 @@ try {
                     savingsEl.style.display = isYearly ? 'block' : 'none';
                 }
             });
+        }
+
+        function validateRegistrationForm() {
+            const permitDateInput = document.getElementById('permitExpiryDate');
+            if (permitDateInput && permitDateInput.value) {
+                const permitDate = new Date(permitDateInput.value);
+                const today = new Date();
+                today.setHours(0, 0, 0, 0); // Reset time to midnight for accurate date comparison
+                
+                if (permitDate < today) {
+                    alert("Invalid business permit, try again with valid business permit date");
+                    return false;
+                } else {
+                    alert("Valid business permit you may now proceed");
+                    return true;
+                }
+            }
+            return true;
         }
     </script>
     <script>

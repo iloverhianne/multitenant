@@ -253,7 +253,11 @@ $period = ucfirst($billing_cycle);
                 <input type="hidden" name="address" value="<?php echo htmlspecialchars($_POST['address'] ?? ''); ?>">
                 <input type="hidden" name="id_type" value="<?php echo htmlspecialchars($_POST['id_type'] ?? ''); ?>">
                 <input type="hidden" name="business_proof_url" value="<?php echo htmlspecialchars($_POST['business_proof_url'] ?? ''); ?>">
+                <input type="hidden" name="permit_expiry_date" value="<?php echo htmlspecialchars($_POST['permit_expiry_date'] ?? ''); ?>">
+                <input type="hidden" name="dti_proof_url" value="<?php echo htmlspecialchars($_POST['dti_proof_url'] ?? ''); ?>">
+                <input type="hidden" name="dti_expiry_date" value="<?php echo htmlspecialchars($_POST['dti_expiry_date'] ?? ''); ?>">
                 <input type="hidden" name="id_photo_url" value="<?php echo htmlspecialchars($_POST['id_photo_url'] ?? ''); ?>">
+                <input type="hidden" name="id_expiry_date" value="<?php echo htmlspecialchars($_POST['id_expiry_date'] ?? ''); ?>">
                 <input type="hidden" name="payment_method" id="hiddenPaymentMethod" value="card">
                 
                 <button type="submit" class="btn-pay" id="payButton">

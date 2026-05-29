@@ -24,7 +24,11 @@ try {
         "ALTER TABLE tenants ADD COLUMN slug VARCHAR(100) DEFAULT NULL AFTER status",
         "ALTER TABLE tenants ADD COLUMN id_type VARCHAR(50) DEFAULT NULL AFTER slug",
         "ALTER TABLE tenants ADD COLUMN business_proof_url VARCHAR(255) DEFAULT NULL AFTER id_type",
-        "ALTER TABLE tenants ADD COLUMN id_photo_url VARCHAR(255) DEFAULT NULL AFTER business_proof_url"
+        "ALTER TABLE tenants ADD COLUMN permit_expiry_date DATE DEFAULT NULL AFTER business_proof_url",
+        "ALTER TABLE tenants ADD COLUMN dti_proof_url VARCHAR(255) DEFAULT NULL AFTER permit_expiry_date",
+        "ALTER TABLE tenants ADD COLUMN dti_expiry_date DATE DEFAULT NULL AFTER dti_proof_url",
+        "ALTER TABLE tenants ADD COLUMN id_photo_url VARCHAR(255) DEFAULT NULL AFTER dti_expiry_date",
+        "ALTER TABLE tenants ADD COLUMN id_expiry_date DATE DEFAULT NULL AFTER id_photo_url"
     ];
     foreach ($migrations as $sql) {
         try { $db->exec($sql); } catch (PDOException $e) {}
@@ -42,7 +46,7 @@ try {
     // 1. Insert into Tenants
     $slug = strtolower(preg_replace('/[^a-zA-Z0-9]+/', '-', $shop_name)); // Create URL-friendly slug
     $slug = trim($slug, '-');
-    $stmt = $db->prepare("INSERT INTO tenants (shop_name, owner_name, email, address, status, slug, id_type, business_proof_url, id_photo_url) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)");
+    $stmt = $db->prepare("INSERT INTO tenants (shop_name, owner_name, email, address, status, slug, id_type, business_proof_url, permit_expiry_date, dti_proof_url, dti_expiry_date, id_photo_url, id_expiry_date) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?)");
     $stmt->execute([
         $shop_name, 
         $owner_name, 
@@ -51,7 +55,11 @@ try {
         $slug,
         $_POST['id_type'] ?? '',
         $_POST['business_proof_url'] ?? '',
-        $_POST['id_photo_url'] ?? ''
+        $_POST['permit_expiry_date'] ?? null,
+        $_POST['dti_proof_url'] ?? '',
+        $_POST['dti_expiry_date'] ?? null,
+        $_POST['id_photo_url'] ?? '',
+        $_POST['id_expiry_date'] ?? null
     ]);
     $last_tenant_id = $db->lastInsertId();
 

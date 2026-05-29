@@ -3682,7 +3682,8 @@ try {
     };
 
     window.processAppointment = function (id, status, reqMechName = null) {
-      if (status === 'CONFIRMED') {
+      const statusStr = (typeof status === 'string') ? status : String(status || '');
+      if (statusStr === 'CONFIRMED') {
         const idF = document.getElementById('confirm_appt_id');
         if (idF) idF.value = id;
         const display = document.getElementById('requested_mechanic_display');
@@ -3708,8 +3709,8 @@ try {
         }
         window.openModal('confirmApptModal');
       } else {
-        if (!confirm('Are you sure you want to ' + status.toLowerCase() + ' this appointment?')) return;
-        fetch('tenant-dashboard.php?action=update_appointment_status&id=' + id + '&status=' + status)
+        if (!confirm('Are you sure you want to ' + statusStr.toLowerCase() + ' this appointment?')) return;
+        fetch('tenant-dashboard.php?action=update_appointment_status&id=' + id + '&status=' + statusStr)
           .then(r => r.json()).then(data => { if (data.status === 'success') location.reload(); else alert(data.message); });
       }
     };
@@ -4750,10 +4751,11 @@ try {
         });
     };
     window.processShiftRequest = function (requestId, status) {
-      if (!confirm(`Are you sure you want to ${status.toLowerCase()} this request?`)) return;
+      const statusStr = (typeof status === 'string') ? status : String(status || '');
+      if (!confirm(`Are you sure you want to ${statusStr.toLowerCase()} this request?`)) return;
       const fd = new FormData();
       fd.append('request_id', requestId);
-      fd.append('status', status);
+      fd.append('status', statusStr);
       fetch('tenant-dashboard.php?action=process_shift_request', { method: 'POST', body: fd })
         .then(r => r.json())
         .then(data => {
