@@ -680,8 +680,6 @@ try {
           service_name VARCHAR(100) NOT NULL,
           description TEXT NULL,
           price DECIMAL(10,2) NOT NULL,
-          min_price DECIMAL(10,2) NULL,
-          max_price DECIMAL(10,2) NULL,
           category VARCHAR(50) NULL,
           estimated_time VARCHAR(50) NULL,
           status ENUM('ACTIVE', 'INACTIVE') DEFAULT 'ACTIVE',
@@ -693,15 +691,20 @@ try {
         } catch (Exception $e) {
         }
         try {
-          $db->exec("ALTER TABLE services ADD COLUMN min_price DECIMAL(10,2) NULL, ADD COLUMN max_price DECIMAL(10,2) NULL");
-        } catch (Exception $e) {
-        }
-        try {
           $db->exec("ALTER TABLE services ADD COLUMN category VARCHAR(50) NULL AFTER price");
         } catch (Exception $e) {
         }
         try {
           $db->exec("ALTER TABLE services ADD COLUMN estimated_time VARCHAR(50) NULL AFTER category");
+        } catch (Exception $e) {
+        }
+        // Tenant-defined price limits (tenant sets these, not superadmin)
+        try {
+          $db->exec("ALTER TABLE services ADD COLUMN tenant_min_price DECIMAL(10,2) DEFAULT NULL AFTER estimated_time");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE services ADD COLUMN tenant_max_price DECIMAL(10,2) DEFAULT NULL AFTER tenant_min_price");
         } catch (Exception $e) {
         }
       } catch (Exception $e) {
@@ -847,7 +850,7 @@ try {
         // Robust SYNC: Use PHP iteration to ensure all staff with role 'MECHANIC' are in the masterfile
         try {
           // Find all users who should be mechanics
-          $mechanicUsers = $db->prepare("SELECT user_id, tenant_id, name FROM users WHERE (role_id = 5 OR role_id IN (SELECT role_id FROM roles WHERE role_name = 'MECHANIC')) AND tenant_id IS NOT NULL");
+          $mechanicUsers = $db->prepare("SELECT user_id, tenant_id, name FROM users WHERE (role_id = 5 OR role_id IN (SELECT role_id FROM roles WHERE role_name = 'MECHANIC')) AND tenant_id IS NOT NULL AND (status IS NULL OR status != 'INACTIVE')");
           $mechanicUsers->execute();
           $all_m = $mechanicUsers->fetchAll(PDO::FETCH_ASSOC);
 
@@ -953,13 +956,9 @@ try {
 
       // Payments Table Healer/Creation
       try {
-        $db->exec("CREATE TABLE IF NOT EXISTS services (service_id INT AUTO_INCREMENT PRIMARY KEY, tenant_id INT, master_id INT DEFAULT NULL, service_name VARCHAR(100), description TEXT, price DECIMAL(10,2), min_price DECIMAL(10,2) NULL, max_price DECIMAL(10,2) NULL, category VARCHAR(50), estimated_time VARCHAR(50), status ENUM('ACTIVE', 'INACTIVE'), created_at DATETIME)");
+        $db->exec("CREATE TABLE IF NOT EXISTS services (service_id INT AUTO_INCREMENT PRIMARY KEY, tenant_id INT, master_id INT DEFAULT NULL, service_name VARCHAR(100), description TEXT, price DECIMAL(10,2), category VARCHAR(50), estimated_time VARCHAR(50), status ENUM('ACTIVE', 'INACTIVE'), created_at DATETIME)");
         try {
           $db->exec("ALTER TABLE services ADD COLUMN master_id INT DEFAULT NULL AFTER tenant_id");
-        } catch (Exception $e) {
-        }
-        try {
-          $db->exec("ALTER TABLE services ADD COLUMN min_price DECIMAL(10,2) NULL, ADD COLUMN max_price DECIMAL(10,2) NULL");
         } catch (Exception $e) {
         }
         $db->exec("CREATE TABLE IF NOT EXISTS payments (payment_id INT AUTO_INCREMENT PRIMARY KEY, tenant_id INT, amount DECIMAL(10,2), status VARCHAR(20))");
@@ -1370,7 +1369,7 @@ try {
         $db->exec("ALTER TABLE users ADD COLUMN profile_pic VARCHAR(255) NULL AFTER name");
       } catch (Exception $e) {
       }
-      $stmt = $db->prepare("SELECT user_id, name, email, profile_pic, role_id, status FROM users WHERE tenant_id = ? ORDER BY role_id ASC");
+      $stmt = $db->prepare("SELECT user_id, name, email, profile_pic, role_id, status FROM users WHERE tenant_id = ? AND (status IS NULL OR status != 'INACTIVE') ORDER BY role_id ASC");
       $stmt->execute([$tenant_id]);
       $staff_list = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -1528,40 +1527,36 @@ try {
           $name = trim($_POST['service_name'] ?? '');
           $desc = trim($_POST['description'] ?? '');
           $price = floatval($_POST['price'] ?? 0);
-          $min_price = (isset($_POST['min_price']) && $_POST['min_price'] !== '') ? floatval($_POST['min_price']) : null;
-          $max_price = (isset($_POST['max_price']) && $_POST['max_price'] !== '') ? floatval($_POST['max_price']) : null;
+          $tenantMin = !empty($_POST['tenant_min_price']) ? floatval($_POST['tenant_min_price']) : null;
+          $tenantMax = !empty($_POST['tenant_max_price']) ? floatval($_POST['tenant_max_price']) : null;
 
           if (empty($name)) {
             echo json_encode(['status' => 'error', 'message' => 'Service name is required.']);
             exit;
           }
 
-          $masterId = !empty($_POST['master_id']) ? intval($_POST['master_id']) : null;
-
-<<<<<<< HEAD
-          if ($enablePriceLimits && $min_price !== null && $max_price !== null) {
-              if ($price < $min_price || $price > $max_price) {
-                throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($min_price) . " and ₱" . number_format($max_price));
-=======
-          if ($masterId) {
-            $ms = $db->prepare("SELECT * FROM master_services WHERE master_id = ?");
-            $ms->execute([$masterId]);
-            $standard = $ms->fetch();
-            if ($standard) {
-              if ($price < $standard['min_price'] || $price > $standard['max_price']) {
-                throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($standard['min_price']) . " and ₱" . number_format($standard['max_price']));
->>>>>>> b06e76f6ed1f975805a82d2ac66b7861d774451c
-              }
+          // Validate against tenant-defined limits (if set)
+          if ($tenantMin !== null && $tenantMax !== null) {
+            if ($price < $tenantMin || $price > $tenantMax) {
+              throw new Exception("Price is outside your set range! Must be between ₱" . number_format($tenantMin, 2) . " and ₱" . number_format($tenantMax, 2));
+            }
           }
 
-          $stmt = $db->prepare("INSERT INTO services (tenant_id, master_id, service_name, description, price, min_price, max_price, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')");
-          if ($stmt->execute([$tenant_id, $masterId, $name, $desc, $price, $min_price, $max_price])) {
+          $masterId = !empty($_POST['master_id']) ? intval($_POST['master_id']) : null;
+          if ($masterId) {
+            $ms = $db->prepare("SELECT service_name FROM master_services WHERE master_id = ?");
+            $ms->execute([$masterId]);
+            $standard = $ms->fetch();
+            if ($standard) $name = $standard['service_name'];
+          }
+
+          $stmt = $db->prepare("INSERT INTO services (tenant_id, master_id, service_name, description, price, tenant_min_price, tenant_max_price, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')");
+          if ($stmt->execute([$tenant_id, $masterId, $name, $desc, $price, $tenantMin, $tenantMax])) {
             try {
               $log = $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'CRUD', ?)");
               $log->execute([$tenant_id, $_SESSION['user_id'] ?? 0, "Staff " . ($_SESSION['name'] ?? 'Unknown') . " added new service: $name (₱$price)"]);
             } catch (Exception $logErr) {
             }
-
             echo json_encode(['status' => 'success', 'message' => 'Service added successfully.']);
           } else {
             echo json_encode(['status' => 'error', 'message' => 'Database insert failed.']);
@@ -1578,8 +1573,8 @@ try {
           $name = trim($_POST['service_name'] ?? '');
           $desc = trim($_POST['description'] ?? '');
           $price = floatval($_POST['price'] ?? 0);
-          $min_price = (isset($_POST['min_price']) && $_POST['min_price'] !== '') ? floatval($_POST['min_price']) : null;
-          $max_price = (isset($_POST['max_price']) && $_POST['max_price'] !== '') ? floatval($_POST['max_price']) : null;
+          $tenantMin = !empty($_POST['tenant_min_price']) ? floatval($_POST['tenant_min_price']) : null;
+          $tenantMax = !empty($_POST['tenant_max_price']) ? floatval($_POST['tenant_max_price']) : null;
           $masterId = !empty($_POST['master_id']) ? intval($_POST['master_id']) : null;
 
           if (empty($name) || empty($id)) {
@@ -1587,24 +1582,18 @@ try {
             exit;
           }
 
-<<<<<<< HEAD
-          $checkTenant = $db->prepare("SELECT enable_price_limits FROM tenants WHERE tenant_id = ?");
-          $checkTenant->execute([$tenant_id]);
-          $enablePriceLimits = intval($checkTenant->fetchColumn() ?? 1);
+          // Validate against tenant-defined limits (if set)
+          if ($tenantMin !== null && $tenantMax !== null) {
+            if ($price < $tenantMin || $price > $tenantMax) {
+              throw new Exception("Price is outside your set range! Must be between ₱" . number_format($tenantMin, 2) . " and ₱" . number_format($tenantMax, 2));
+            }
+          }
 
-          if ($enablePriceLimits && $min_price !== null && $max_price !== null) {
-              if ($price < $min_price || $price > $max_price) {
-                throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($min_price) . " and ₱" . number_format($max_price));
-=======
           if ($masterId) {
-            $ms = $db->prepare("SELECT * FROM master_services WHERE master_id = ?");
+            $ms = $db->prepare("SELECT service_name FROM master_services WHERE master_id = ?");
             $ms->execute([$masterId]);
             $standard = $ms->fetch();
-            if ($standard) {
-              if ($price < $standard['min_price'] || $price > $standard['max_price']) {
-                throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($standard['min_price']) . " and ₱" . number_format($standard['max_price']));
->>>>>>> b06e76f6ed1f975805a82d2ac66b7861d774451c
-              }
+            if ($standard) $name = $standard['service_name'];
           }
 
           // AUTO-HEAL: Ensure description column exists
@@ -1613,14 +1602,13 @@ try {
           } catch (Exception $e) {
           }
 
-          $stmt = $db->prepare("UPDATE services SET master_id=?, service_name=?, description=?, price=?, min_price=?, max_price=? WHERE service_id=? AND tenant_id=?");
-          if ($stmt->execute([$masterId, $name, $desc, $price, $min_price, $max_price, $id, $tenant_id])) {
+          $stmt = $db->prepare("UPDATE services SET master_id=?, service_name=?, description=?, price=?, tenant_min_price=?, tenant_max_price=? WHERE service_id=? AND tenant_id=?");
+          if ($stmt->execute([$masterId, $name, $desc, $price, $tenantMin, $tenantMax, $id, $tenant_id])) {
             try {
               $log = $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'CRUD', ?)");
               $log->execute([$tenant_id, $_SESSION['user_id'] ?? 0, "Staff " . ($_SESSION['name'] ?? 'Unknown') . " updated service: $name (ID: $id)"]);
             } catch (Exception $logErr) {
             }
-
             echo json_encode(['status' => 'success', 'message' => 'Service updated successfully.']);
           } else {
             echo json_encode(['status' => 'error', 'message' => 'Database update failed.']);
@@ -1725,7 +1713,7 @@ try {
       }
 
       if ($_GET['action'] === 'fetch_services') {
-        $stmt = $db->prepare("SELECT s.*, m.min_price, m.max_price FROM services s LEFT JOIN master_services m ON s.master_id = m.master_id WHERE s.tenant_id = ? ORDER BY s.service_name ASC");
+        $stmt = $db->prepare("SELECT s.*, m.min_price AS master_min_price, m.max_price AS master_max_price FROM services s LEFT JOIN master_services m ON s.master_id = m.master_id WHERE s.tenant_id = ? ORDER BY s.service_name ASC");
         $stmt->execute([$tenant_id]);
         echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
         exit;
@@ -1853,7 +1841,7 @@ try {
           } catch (Exception $e) {
           }
 
-          $stmt = $db->prepare("SELECT u.user_id, u.name, u.email, u.profile_pic, r.role_name, u.status FROM users u JOIN roles r ON u.role_id = r.role_id WHERE u.tenant_id = ? ORDER BY u.email DESC");
+          $stmt = $db->prepare("SELECT u.user_id, u.name, u.email, u.profile_pic, r.role_name, u.status FROM users u JOIN roles r ON u.role_id = r.role_id WHERE u.tenant_id = ? AND (u.status IS NULL OR u.status != 'INACTIVE') ORDER BY u.email DESC");
           $stmt->execute([$tenant_id]);
           header('Content-Type: application/json');
           echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
@@ -2163,6 +2151,54 @@ try {
           }
 
           echo json_encode(['status' => 'success', 'message' => 'Mechanic status updated successfully.']);
+        } catch (Exception $e) {
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'delete_mechanic' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        try {
+          $auth_role = strtoupper($_SESSION['role'] ?? '');
+          if ($auth_role !== 'OWNER') {
+            throw new Exception("Unauthorized: Only shop owners can remove mechanics.");
+          }
+
+          $id = intval($_POST['mechanic_id'] ?? 0);
+          if (!$id) {
+            throw new Exception("Mechanic ID is required.");
+          }
+
+          // Check if mechanic has active jobs
+          $activeCheck = $db->prepare("SELECT COUNT(*) FROM repair_jobs WHERE mechanic_id = ? AND tenant_id = ? AND status = 'IN_PROGRESS'");
+          $activeCheck->execute([$id, $tenant_id]);
+          if ($activeCheck->fetchColumn() > 0) {
+            throw new Exception("Cannot remove: This mechanic has active repair jobs. Complete or reassign them first.");
+          }
+
+          // Get mechanic info before deletion
+          $infoStmt = $db->prepare("SELECT full_name, user_id FROM mechanics WHERE mechanic_id = ? AND tenant_id = ?");
+          $infoStmt->execute([$id, $tenant_id]);
+          $mechInfo = $infoStmt->fetch(PDO::FETCH_ASSOC);
+          $mechName = $mechInfo['full_name'] ?? 'Unknown Mechanic';
+          $mechUserId = $mechInfo['user_id'] ?? null;
+
+          // Delete from mechanics table
+          $stmt = $db->prepare("DELETE FROM mechanics WHERE mechanic_id = ? AND tenant_id = ?");
+          $stmt->execute([$id, $tenant_id]);
+
+          // Deactivate the linked user account if exists
+          if ($mechUserId) {
+            $db->prepare("UPDATE users SET status = 'INACTIVE' WHERE user_id = ? AND tenant_id = ?")->execute([$mechUserId, $tenant_id]);
+          }
+
+          // Audit log
+          try {
+            $log = $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'CRUD', ?)");
+            $log->execute([$tenant_id, $_SESSION['user_id'] ?? 0, "Removed mechanic: $mechName (ID: $id)"]);
+          } catch (Exception $logErr) {}
+
+          echo json_encode(['status' => 'success', 'message' => "Mechanic '$mechName' has been removed successfully."]);
         } catch (Exception $e) {
           echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
         }
@@ -3291,9 +3327,40 @@ try {
           if ($newStatus === 'COMPLETED')
             $timeUpdate = ", completed_at = NOW()";
 
+          // Auto-migrate schema for agreement proof if missing
+          try {
+              $db->exec("ALTER TABLE repair_jobs ADD COLUMN agreement_signature LONGTEXT NULL, ADD COLUMN agreement_proof_file VARCHAR(255) NULL");
+          } catch(Exception $e) {}
+
+          // Handle Signature and File Upload
+          $sig = $_POST['agreement_signature'] ?? '';
+          $proofFile = null;
+          
+          if(isset($_FILES['agreement_proof']) && $_FILES['agreement_proof']['error'] == 0) {
+              $proofName = time() . '_' . basename($_FILES['agreement_proof']['name']);
+              if(move_uploaded_file($_FILES['agreement_proof']['tmp_name'], 'uploads/' . $proofName)) {
+                  $proofFile = $proofName;
+              }
+          }
+
+          $extraUpdate = "";
+          $params = [$newStatus, $mechanicId, $bayId, $checklist];
+
+          if (!empty($sig)) {
+              $extraUpdate .= ", agreement_signature = ?";
+              $params[] = $sig;
+          }
+          if ($proofFile) {
+              $extraUpdate .= ", agreement_proof_file = ?";
+              $params[] = $proofFile;
+          }
+          
+          $params[] = $jobId;
+          $params[] = $tenant_id;
+
           // Update the job
-          $stmt = $db->prepare("UPDATE repair_jobs SET status = ?, mechanic_id = ?, bay_id = ?, checklist = ?, updated_at = NOW() $timeUpdate WHERE job_id = ? AND tenant_id = ?");
-          $stmt->execute([$newStatus, $mechanicId, $bayId, $checklist, $jobId, $tenant_id]);
+          $stmt = $db->prepare("UPDATE repair_jobs SET status = ?, mechanic_id = ?, bay_id = ?, checklist = ?, updated_at = NOW() $timeUpdate $extraUpdate WHERE job_id = ? AND tenant_id = ?");
+          $stmt->execute($params);
 
           $db->prepare("INSERT INTO repair_timeline (job_id, status_update, remarks, tenant_id, user_id) VALUES (?, ?, ?, ?, ?)")
             ->execute([$jobId, $newStatus, $remarks, $tenant_id, $_SESSION['user_id']]);
@@ -4018,59 +4085,6 @@ try {
       // Force initial sync to ensure base amount is captured
       window.syncPaymentParts();
 
-      // RECEIPT BREAKDOWN LOGIC
-      const receiptContainer = document.getElementById('paymentReceiptDetails');
-      const breakdownContent = document.getElementById('receiptBreakdownContent');
-      if (receiptContainer && breakdownContent) {
-          if (jobId) {
-              receiptContainer.style.display = 'block';
-              breakdownContent.innerHTML = '<div style="text-align:center;"><i class="fas fa-spinner fa-spin"></i> Loading Breakdown...</div>';
-              
-              fetch(`tenant-dashboard.php?action=get_job_details&id=${jobId}`)
-                  .then(r => r.json())
-                  .then(job => {
-                      if (!job) throw new Error("Job not found");
-                      
-                      let baseServiceName = job.service_name || 'Service Package';
-                      let baseServicePrice = parseFloat(job.service_price) || 0;
-                      
-                      fetch(`tenant-dashboard.php?action=fetch_job_parts&job_id=${jobId}`)
-                          .then(r => r.json())
-                          .then(parts => {
-                              let html = '<table style="width:100%; border-collapse:collapse; margin-bottom:10px;">';
-                              html += '<tr><th style="text-align:left; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px;">Description</th>';
-                              html += '<th style="text-align:right; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px;">Amount</th></tr>';
-                              
-                              // Base Service
-                              html += `<tr><td style="padding:5px 0;">${baseServiceName}</td>`;
-                              html += `<td style="text-align:right; padding:5px 0;">₱${baseServicePrice.toLocaleString(undefined, {minimumFractionDigits: 2})}</td></tr>`;
-                              
-                              let subtotal = baseServicePrice;
-                              
-                              // Additional Parts
-                              parts.forEach(p => {
-                                  if(p.approval_status === 'APPROVED') {
-                                      let itemTotal = parseFloat(p.total_price) || 0;
-                                      subtotal += itemTotal;
-                                      html += `<tr><td style="padding:5px 0; color:#94a3b8; font-size:0.8rem;">+ ${p.item_name} (x${p.quantity})</td>`;
-                                      html += `<td style="text-align:right; padding:5px 0; color:#94a3b8; font-size:0.8rem;">₱${itemTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</td></tr>`;
-                                  }
-                              });
-                              
-                              html += `<tr><th style="text-align:left; border-top:1px dashed rgba(255,255,255,0.2); padding-top:5px; margin-top:5px;">Job Subtotal</th>`;
-                              html += `<th style="text-align:right; border-top:1px dashed rgba(255,255,255,0.2); padding-top:5px; margin-top:5px;">₱${subtotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</th></tr>`;
-                              
-                              html += '</table>';
-                              breakdownContent.innerHTML = html;
-                          });
-                  }).catch(err => {
-                      breakdownContent.innerHTML = '<div style="color:var(--danger); text-align:center;">Failed to load breakdown.</div>';
-                  });
-          } else {
-              receiptContainer.style.display = 'none';
-          }
-      }
-
       if (typeof window.openModal === 'function') window.openModal('paymentModal');
     };
 
@@ -4227,18 +4241,30 @@ try {
         });
     };
 
-    window.editService = function (id, name, desc, price, masterId = null, minPrice = null, maxPrice = null) {
+    window.editService = function (id, name, desc, price, masterId = null, tenantMin = null, tenantMax = null) {
       if (document.getElementById('edit_service_id')) document.getElementById('edit_service_id').value = id;
       if (document.getElementById('edit_service_name')) document.getElementById('edit_service_name').value = name;
       if (document.getElementById('edit_service_desc')) document.getElementById('edit_service_desc').value = (desc === 'null' || !desc) ? '' : desc;
-      if (document.getElementById('edit_service_min_price')) document.getElementById('edit_service_min_price').value = (minPrice === null || minPrice === 'null') ? '' : minPrice;
-      if (document.getElementById('edit_service_max_price')) document.getElementById('edit_service_max_price').value = (maxPrice === null || maxPrice === 'null') ? '' : maxPrice;
 
       const priceInput = document.getElementById('edit_service_price');
+      const minInput = document.getElementById('edit_tenant_min_price');
+      const maxInput = document.getElementById('edit_tenant_max_price');
+
+      if (priceInput) {
+        priceInput.value = price;
+        priceInput.removeAttribute('min');
+        priceInput.removeAttribute('max');
+        priceInput.oninput = null;
+      }
+
+      // Populate tenant-defined price limits into the form fields
+      if (minInput) minInput.value = (tenantMin !== null && tenantMin !== 'null') ? tenantMin : '';
+      if (maxInput) maxInput.value = (tenantMax !== null && tenantMax !== 'null') ? tenantMax : '';
+
+      // Live validation hint based on tenant limits
       const form = document.getElementById('editServiceForm');
       const submitBtn = form ? form.querySelector('button[onclick*="saveEditService"]') : null;
       let hint = form ? form.querySelector('.price-hint') : null;
-
       if (!hint && form && priceInput) {
         hint = document.createElement('div');
         hint.className = 'price-hint';
@@ -4247,40 +4273,23 @@ try {
         priceInput.parentNode.appendChild(hint);
       }
 
-      if (priceInput) {
-        priceInput.value = price;
-        if (minPrice !== null && maxPrice !== null && parseFloat(minPrice) > 0) {
-          priceInput.min = minPrice;
-          priceInput.max = maxPrice;
-          priceInput.placeholder = `Range: ₱${parseFloat(minPrice).toLocaleString()} - ₱${parseFloat(maxPrice).toLocaleString()}`;
-
-          const validate = () => {
+      const tMin = parseFloat(tenantMin);
+      const tMax = parseFloat(tenantMax);
+      if (!isNaN(tMin) && !isNaN(tMax) && tMin > 0) {
+        if (hint) hint.innerHTML = `<i class="fas fa-info-circle"></i> Your shop's range: \u20b1${tMin.toLocaleString()} - \u20b1${tMax.toLocaleString()}`;
+        if (hint) hint.style.color = 'var(--accent)';
+        if (priceInput) {
+          priceInput.oninput = () => {
             const val = parseFloat(priceInput.value || 0);
-            const isInvalid = (val < parseFloat(minPrice) || val > parseFloat(maxPrice));
-            if (hint) {
-              hint.style.color = isInvalid ? '#ef4444' : 'var(--accent)';
-              hint.innerHTML = `<i class="fas fa-${isInvalid ? 'exclamation-triangle' : 'info-circle'}"></i> Recommended Price: ₱${parseFloat(minPrice).toLocaleString()} - ₱${parseFloat(maxPrice).toLocaleString()}`;
-            }
-            if (submitBtn) {
-              submitBtn.disabled = isInvalid;
-              submitBtn.style.opacity = isInvalid ? '0.5' : '1';
-              submitBtn.style.cursor = isInvalid ? 'not-allowed' : 'pointer';
-            }
+            const bad = val < tMin || val > tMax;
+            if (hint) { hint.style.color = bad ? '#ef4444' : 'var(--accent)'; hint.innerHTML = `<i class="fas fa-${bad ? 'exclamation-triangle' : 'info-circle'}"></i> Your shop's range: \u20b1${tMin.toLocaleString()} - \u20b1${tMax.toLocaleString()}`; }
+            if (submitBtn) { submitBtn.disabled = bad; submitBtn.style.opacity = bad ? '0.5' : '1'; submitBtn.style.cursor = bad ? 'not-allowed' : 'pointer'; }
           };
-          priceInput.oninput = validate;
-          validate();
-        } else {
-          priceInput.removeAttribute('min');
-          priceInput.removeAttribute('max');
-          priceInput.placeholder = "";
-          priceInput.oninput = null;
-          if (hint) hint.innerHTML = '';
-          if (submitBtn) {
-            submitBtn.disabled = false;
-            submitBtn.style.opacity = '1';
-            submitBtn.style.cursor = 'pointer';
-          }
+          priceInput.oninput();
         }
+      } else {
+        if (hint) hint.innerHTML = '';
+        if (submitBtn) { submitBtn.disabled = false; submitBtn.style.opacity = '1'; submitBtn.style.cursor = 'pointer'; }
       }
 
       const masterInput = document.getElementById('edit_service_master_id');
@@ -4457,6 +4466,20 @@ try {
 
               // REFRESH BILLING - Now that window.currentJobServicePrice is set
               if (window.refreshJobPartsList) window.refreshJobPartsList(id);
+              
+              const authStatus = document.getElementById('authProofStatus');
+              const authSection = document.getElementById('customerAuthSection');
+              if (authStatus) {
+                if (job.agreement_signature || job.agreement_proof_file) {
+                  authStatus.style.display = 'block';
+                  authStatus.innerHTML = `<i class="fas fa-check-circle"></i> Authorization Already on File 
+                    <br><a href="${job.agreement_proof_file ? 'uploads/'+job.agreement_proof_file : '#'}" target="_blank" style="color:#10b981; text-decoration:underline;">[View Proof File]</a>`;
+                  if (authSection) authSection.style.display = 'block';
+                } else {
+                  authStatus.style.display = 'none';
+                }
+              }
+              if(window.clearSignature) window.clearSignature();
             }
           });
 
@@ -4549,6 +4572,9 @@ try {
       fetch(`tenant-dashboard.php?action=fetch_job_parts&job_id=${jid}`)
         .then(r => r.json()).then(data => {
           window.currentlyAddedServiceIds = data.filter(p => p.service_id).map(p => parseInt(p.service_id));
+          const authSection = document.getElementById('customerAuthSection');
+          if (authSection) authSection.style.display = data.length > 0 ? 'block' : 'none';
+
           if (!data.length) {
             list.innerHTML = '<div style="text-align:center; color:var(--text-dim); font-size:0.8rem; padding:20px;">No parts recorded.</div>';
             if (bill) bill.innerText = '₱0.00';
@@ -4780,6 +4806,12 @@ try {
       const checked = [];
       document.querySelectorAll('.ann-chk:checked').forEach(c => checked.push(c.value));
       fd.append('checklist', checked.join(', '));
+      
+      const sigCanvas = document.getElementById('authSignaturePad');
+      if (sigCanvas && window.hasSignature) {
+          fd.append('agreement_signature', sigCanvas.toDataURL());
+      }
+
       fetch('tenant-dashboard.php?action=update_job_status', { method: 'POST', body: fd })
         .then(r => r.json()).then(data => {
           if (data.status === 'success') {
@@ -6916,13 +6948,16 @@ try {
           body.innerHTML = data.map(s => {
             const safeName = (s.service_name || '').replace(/'/g, "\\'");
             const safeDesc = (s.description || '').replace(/'/g, "\\'");
+            const priceRange = (s.tenant_min_price && s.tenant_max_price)
+              ? `<br><small style="color:var(--accent);font-size:0.72rem;">🔒 Range: ₱${parseFloat(s.tenant_min_price).toLocaleString()} – ₱${parseFloat(s.tenant_max_price).toLocaleString()}</small>`
+              : '';
             return `<tr>
               <td><strong>${s.service_name}</strong></td>
               <td><small>${s.description || 'No description'}</small></td>
-              <td>₱${parseFloat(s.price || 0).toLocaleString()}</td>
+              <td>₱${parseFloat(s.price || 0).toLocaleString()}${priceRange}</td>
               <td><span class="badge badge-active">ACTIVE</span></td>
               <td>
-                <button class="btn-outline" onclick="window.editService(${s.service_id}, '${safeName}', '${safeDesc}', ${s.price}, ${s.master_id || 'null'}, ${s.min_price || 'null'}, ${s.max_price || 'null'})">Edit</button>
+                <button class="btn-outline" onclick="window.editService(${s.service_id}, '${safeName}', '${safeDesc}', ${s.price}, ${s.master_id || 'null'}, ${s.tenant_min_price || 'null'}, ${s.tenant_max_price || 'null'})">Edit</button>
                 <button class="btn-outline" style="color:var(--danger); border-color:rgba(239,68,68,0.3); margin-left:5px;" onclick="window.deleteService(${s.service_id})">Delete</button>
               </td>
             </tr>`;
@@ -6966,13 +7001,17 @@ try {
       btn.innerText = 'Saving...';
       btn.disabled = true;
 
+      // Client-side validation against tenant-defined limits
       const priceInput = form.querySelector('input[name="price"]');
-      if (priceInput.min && priceInput.max) {
-        const val = parseFloat(priceInput.value);
-        const min = parseFloat(priceInput.min);
-        const max = parseFloat(priceInput.max);
-        if (val < min || val > max) {
-          showToast(`Price must be between ₱${min.toLocaleString()} and ₱${max.toLocaleString()}`, 'error');
+      const minInput = form.querySelector('input[name="tenant_min_price"]');
+      const maxInput = form.querySelector('input[name="tenant_max_price"]');
+      if (priceInput && minInput && maxInput && minInput.value !== '' && maxInput.value !== '') {
+        const val = parseFloat(priceInput.value || 0);
+        const tMin = parseFloat(minInput.value);
+        const tMax = parseFloat(maxInput.value);
+        if (val < tMin || val > tMax) {
+          showToast(`Price must be between ₱${tMin.toLocaleString('en-PH', {minimumFractionDigits:2})} and ₱${tMax.toLocaleString('en-PH', {minimumFractionDigits:2})}`, 'error');
+          btn.innerText = originalText; btn.disabled = false;
           return;
         }
       }
@@ -7003,39 +7042,35 @@ try {
       const nameEl = document.getElementById('edit_service_name');
       const descEl = document.getElementById('edit_service_desc');
       const priceEl = document.getElementById('edit_service_price');
+      const minEl = document.getElementById('edit_tenant_min_price');
+      const maxEl = document.getElementById('edit_tenant_max_price');
 
       if (!idEl || !nameEl || !priceEl) {
         showToast('System Error: Missing form fields in Edit Modal', 'error');
         return;
       }
 
-      const id = idEl.value;
-      const name = nameEl.value;
-      const desc = descEl ? descEl.value : '';
-      const price = priceEl.value;
+      const price = parseFloat(priceEl.value || 0);
+      const tenantMin = minEl && minEl.value !== '' ? parseFloat(minEl.value) : null;
+      const tenantMax = maxEl && maxEl.value !== '' ? parseFloat(maxEl.value) : null;
 
-      const priceInput = document.querySelector('#editServiceForm input[name="price"]');
-      if (priceInput && priceInput.min && priceInput.max) {
-        const val = parseFloat(priceInput.value);
-        const min = parseFloat(priceInput.min);
-        const max = parseFloat(priceInput.max);
-        if (val < min || val > max) {
-          showToast(`Price must be between ₱${min.toLocaleString()} and ₱${max.toLocaleString()}`, 'error');
+      // Client-side validation against tenant limits
+      if (tenantMin !== null && tenantMax !== null) {
+        if (price < tenantMin || price > tenantMax) {
+          showToast(`Price must be between ₱${tenantMin.toLocaleString()} and ₱${tenantMax.toLocaleString()}`, 'error');
           return;
         }
       }
 
       const fd = new FormData();
-      fd.append('service_id', id);
-      fd.append('service_name', name);
-      fd.append('description', desc);
-      fd.append('price', price);
+      fd.append('service_id', idEl.value);
+      fd.append('service_name', nameEl.value);
+      fd.append('description', descEl ? descEl.value : '');
+      fd.append('price', priceEl.value);
+      if (minEl && minEl.value !== '') fd.append('tenant_min_price', minEl.value);
+      if (maxEl && maxEl.value !== '') fd.append('tenant_max_price', maxEl.value);
       const masterInput = document.getElementById('edit_service_master_id');
       if (masterInput && masterInput.value) fd.append('master_id', masterInput.value);
-      const minPriceEl = document.getElementById('edit_service_min_price');
-      const maxPriceEl = document.getElementById('edit_service_max_price');
-      if (minPriceEl && minPriceEl.value !== '') fd.append('min_price', minPriceEl.value);
-      if (maxPriceEl && maxPriceEl.value !== '') fd.append('max_price', maxPriceEl.value);
 
       const btn = document.querySelector('#editServiceForm button[onclick*="saveEditService"]');
       const originalText = btn ? btn.innerText : 'Update Service';
@@ -7128,11 +7163,39 @@ try {
                 <?php if (strtoupper($role) === 'OWNER' || strtoupper($role) === 'MANAGER'): ?>
                 <button type="button" class="btn-outline" style="padding:6px 12px; font-size:0.75rem; border-color:var(--accent); color:var(--text-main); cursor:pointer; position:relative; z-index:10; pointer-events:auto !important;" onclick="window.openEditShiftModal(${m.mechanic_id}, '${m.shift_start}', '${m.shift_end}', '${m.display_name.replace(/'/g, "\\'")}', '${m.shift_days || 'Mon,Tue,Wed,Thu,Fri,Sat'}')">Edit Shift</button>
                 ${toggleBtn}
+                <?php if (strtoupper($role) === 'OWNER'): ?>
+                <button type="button" class="btn-outline" style="padding:6px 12px; font-size:0.75rem; border-color:#ef4444; color:#ef4444; cursor:pointer; position:relative; z-index:10; pointer-events:auto !important;" onclick="window.deleteMechanic(${m.mechanic_id}, '${m.display_name.replace(/'/g, "\\\'")}')" title="Remove this mechanic"><i class="fas fa-trash-alt" style="margin-right:3px;"></i>Remove</button>
+                <?php endif; ?>
                 <?php endif; ?>
               </div>
             </td>
           </tr>`;
         }).join('');
+      });
+    };
+
+    window.deleteMechanic = function (mechanicId, mechanicName) {
+      if (!confirm(`⚠️ Are you sure you want to permanently remove mechanic "${mechanicName}"? This will also deactivate their user account.`)) return;
+
+      const fd = new FormData();
+      fd.append('mechanic_id', mechanicId);
+
+      fetch('tenant-dashboard.php?action=delete_mechanic', {
+        method: 'POST',
+        body: fd
+      })
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'success') {
+          showToast(data.message, 'success');
+          window.refreshMechanicsList();
+        } else {
+          showToast(data.message || 'Failed to remove mechanic.', 'error');
+        }
+      })
+      .catch(err => {
+        console.error('Delete Mechanic Error:', err);
+        showToast('Network error while removing mechanic.', 'error');
       });
     };
 
@@ -8515,7 +8578,7 @@ try {
                 </span></td>
               <td>
                 <button class="btn-outline"
-                  onclick="editService(<?php echo $s['service_id']; ?>, '<?php echo addslashes($s['service_name']); ?>', '<?php echo addslashes($s['description']); ?>', <?php echo $s['price']; ?>, <?php echo $s['master_id'] ?? 'null'; ?>, <?php echo $s['min_price'] ?? 'null'; ?>, <?php echo $s['max_price'] ?? 'null'; ?>)">Edit</button>
+                  onclick="editService(<?php echo $s['service_id']; ?>, '<?php echo addslashes($s['service_name']); ?>', '<?php echo addslashes($s['description']); ?>', <?php echo $s['price']; ?>, <?php echo $s['master_id'] ?? 'null'; ?>, <?php echo $s['tenant_min_price'] ?? 'null'; ?>, <?php echo $s['tenant_max_price'] ?? 'null'; ?>)">Edit</button>
                 <button class="btn-outline"
                   style="color:var(--danger); border-color:rgba(239,68,68,0.3); margin-left: 5px;"
                   onclick="deleteService(<?php echo $s['service_id']; ?>)">Delete</button>
@@ -10461,22 +10524,27 @@ try {
           <textarea name="description" placeholder="What's included?"
             style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; min-height:90px; resize:none; box-sizing:border-box;"></textarea>
         </div>
-        <div style="margin-bottom:1.5rem; display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;">
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price (PHP)</label>
-            <input type="number" step="0.01" name="price" required placeholder="0.00"
-              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+        <div style="margin-bottom:1.5rem;">
+          <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price (PHP)</label>
+          <input type="number" step="0.01" name="price" id="add_service_price" required placeholder="0.00"
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+        </div>
+        <!-- Tenant-defined price limits -->
+        <div style="margin-bottom:1rem;">
+          <label style="display:block; margin-bottom:4px; font-size:0.82rem; color:var(--accent); font-weight:600;">&#128274; Set Your Price Limits <span style="color:#94a3b8; font-weight:400;">(optional — your shop's allowed range)</span></label>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+            <div>
+              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Min Price (&#8369;)</label>
+              <input type="number" step="0.01" name="tenant_min_price" id="add_tenant_min_price" placeholder="e.g. 500"
+                style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.7rem 0.9rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+            </div>
+            <div>
+              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Max Price (&#8369;)</label>
+              <input type="number" step="0.01" name="tenant_max_price" id="add_tenant_max_price" placeholder="e.g. 2000"
+                style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.7rem 0.9rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+            </div>
           </div>
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Min Price</label>
-            <input type="number" step="0.01" name="min_price" placeholder="Optional"
-              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Max Price</label>
-            <input type="number" step="0.01" name="max_price" placeholder="Optional"
-              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
+          <p style="margin:5px 0 0; font-size:0.74rem; color:#64748b;">If set, staff cannot save a price outside this range for this service.</p>
         </div>
         <button type="button" onclick="submitAddService()"
           style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1rem; border-radius:12px; font-size:1rem; font-weight:700; cursor:pointer;">Save
@@ -10509,22 +10577,27 @@ try {
           <textarea name="description" id="edit_service_desc"
             style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; min-height:90px; resize:none; box-sizing:border-box;"></textarea>
         </div>
-        <div style="margin-bottom:1.5rem; display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;">
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price (PHP)</label>
-            <input type="number" step="0.01" name="price" id="edit_service_price" required
-              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+        <div style="margin-bottom:1.5rem;">
+          <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price (PHP)</label>
+          <input type="number" step="0.01" name="price" id="edit_service_price" required
+            style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
+        </div>
+        <!-- Tenant-defined price limits -->
+        <div style="margin-bottom:1.5rem;">
+          <label style="display:block; margin-bottom:4px; font-size:0.82rem; color:var(--accent); font-weight:600;">&#128274; Your Price Limits <span style="color:#94a3b8; font-weight:400;">(optional — your shop's allowed range)</span></label>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+            <div>
+              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Min Price (&#8369;)</label>
+              <input type="number" step="0.01" name="tenant_min_price" id="edit_tenant_min_price" placeholder="e.g. 500"
+                style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.7rem 0.9rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+            </div>
+            <div>
+              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Max Price (&#8369;)</label>
+              <input type="number" step="0.01" name="tenant_max_price" id="edit_tenant_max_price" placeholder="e.g. 2000"
+                style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.7rem 0.9rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+            </div>
           </div>
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Min Price</label>
-            <input type="number" step="0.01" name="min_price" id="edit_service_min_price" placeholder="Optional"
-              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Max Price</label>
-            <input type="number" step="0.01" name="max_price" id="edit_service_max_price" placeholder="Optional"
-              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
+          <p style="margin:5px 0 0; font-size:0.74rem; color:#64748b;">If set, staff cannot save a price outside this range for this service.</p>
         </div>
         <button type="button" onclick="window.saveEditService()"
           style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1rem; border-radius:12px; font-size:1rem; font-weight:700; cursor:pointer;">Update
@@ -11725,6 +11798,27 @@ try {
                 <span id="totalOverallBill" style="font-size:1.2rem; font-weight:900; color:white;">₱0.00</span>
               </div>
 
+              <!-- Customer Authorization for Extras -->
+              <div id="customerAuthSection" style="display:none; margin-top:1.5rem; background:rgba(255,255,255,0.02); border:1px solid var(--glass-border); border-radius:15px; padding:1.2rem;">
+                <label style="display:block; margin-bottom:12px; font-size:0.8rem; color:var(--accent); font-weight:800; text-transform:uppercase; letter-spacing:1px;">Customer Authorization Proof (Optional)</label>
+                
+                <div id="authProofStatus" style="display:none; margin-bottom:12px; font-size:0.8rem; color:#10b981; font-weight:700;"><i class="fas fa-check-circle"></i> Authorization Already on File</div>
+
+                <!-- Signature Pad -->
+                <div style="margin-bottom:1rem;">
+                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                    <span style="font-size:0.75rem; color:var(--text-dim);">E-Signature:</span>
+                    <button type="button" onclick="window.clearSignature()" style="background:none; border:none; color:var(--danger); font-size:0.7rem; cursor:pointer; padding:0;">Clear / Re-sign</button>
+                  </div>
+                  <canvas id="authSignaturePad" width="350" height="150" style="background:white; border-radius:10px; width:100%; border:2px dashed rgba(255,255,255,0.2); touch-action:none;"></canvas>
+                </div>
+
+                <!-- File Upload -->
+                <div style="margin-bottom:0.5rem;">
+                  <span style="display:block; font-size:0.75rem; color:var(--text-dim); margin-bottom:5px;">Or Upload Proof (Chat Screenshot/Photo):</span>
+                  <input type="file" name="agreement_proof" accept="image/*" style="width:100%; font-size:0.8rem; color:white; background:rgba(0,0,0,0.2); padding:0.5rem; border-radius:8px; border:1px solid rgba(255,255,255,0.1);">
+                </div>
+              </div>
 
             </div>
           </div>
@@ -14437,6 +14531,69 @@ try {
 
       // INITIAL DATA LOAD
     })();
+
+    // Signature Pad Initialization
+    document.addEventListener('DOMContentLoaded', () => {
+      setTimeout(() => {
+        const canvas = document.getElementById('authSignaturePad');
+        if(canvas) {
+          const ctx = canvas.getContext('2d');
+          let isDrawing = false;
+          
+          function getPos(e) {
+              const rect = canvas.getBoundingClientRect();
+              if(e.touches) {
+                  return { x: e.touches[0].clientX - rect.left, y: e.touches[0].clientY - rect.top };
+              }
+              return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+          }
+
+          function startPosition(e) {
+              e.preventDefault();
+              isDrawing = true;
+              const pos = getPos(e);
+              ctx.beginPath();
+              ctx.moveTo(pos.x, pos.y);
+              window.hasSignature = true;
+          }
+
+          function endPosition() {
+              isDrawing = false;
+              ctx.beginPath();
+          }
+
+          function draw(e) {
+              if(!isDrawing) return;
+              e.preventDefault();
+              const pos = getPos(e);
+              ctx.lineWidth = 2;
+              ctx.lineCap = 'round';
+              ctx.strokeStyle = '#000';
+              ctx.lineTo(pos.x, pos.y);
+              ctx.stroke();
+              ctx.beginPath();
+              ctx.moveTo(pos.x, pos.y);
+          }
+
+          canvas.addEventListener('mousedown', startPosition);
+          canvas.addEventListener('mouseup', endPosition);
+          canvas.addEventListener('mousemove', draw);
+          
+          canvas.addEventListener('touchstart', startPosition, {passive: false});
+          canvas.addEventListener('touchend', endPosition);
+          canvas.addEventListener('touchmove', draw, {passive: false});
+        }
+      }, 1000);
+    });
+    
+    window.clearSignature = function() {
+        const canvas = document.getElementById('authSignaturePad');
+        if(canvas) {
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            window.hasSignature = false;
+        }
+    };
 
     window.addEventListener('load', () => {
       console.log("[RUNTIME] Initializing Dashboard Modules...");
