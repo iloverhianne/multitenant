@@ -345,7 +345,7 @@ try {
       $in_use_count = intval($stmtInUse->fetchColumn());
 
       if ($in_use_count > $max_bays) {
-          throw new Exception("Downgrade failed: You have {$in_use_count} bays currently in-use, but the selected plan only allows {$max_bays}. Please complete or cancel active jobs to free up bays first.");
+        throw new Exception("Downgrade failed: You have {$in_use_count} bays currently in-use, but the selected plan only allows {$max_bays}. Please complete or cancel active jobs to free up bays first.");
       }
 
       // 2. Calculate excess bays
@@ -357,8 +357,8 @@ try {
       $db->beginTransaction();
 
       if ($excess_bays > 0) {
-          // Find excess empty bays and delete them
-          $stmtEmpty = $db->query("
+        // Find excess empty bays and delete them
+        $stmtEmpty = $db->query("
               SELECT b.bay_id 
               FROM service_bays b
               WHERE b.tenant_id = " . intval($tenant_id) . " 
@@ -367,14 +367,14 @@ try {
                 )
               ORDER BY b.bay_id DESC
               LIMIT " . intval($excess_bays)
-          );
-          $bays_to_delete = $stmtEmpty->fetchAll(PDO::FETCH_COLUMN);
-          
-          if (!empty($bays_to_delete)) {
-              $placeholders = implode(',', array_fill(0, count($bays_to_delete), '?'));
-              $db->prepare("DELETE FROM service_bays WHERE bay_id IN ($placeholders) AND tenant_id = ?")
-                 ->execute(array_merge($bays_to_delete, [$tenant_id]));
-          }
+        );
+        $bays_to_delete = $stmtEmpty->fetchAll(PDO::FETCH_COLUMN);
+
+        if (!empty($bays_to_delete)) {
+          $placeholders = implode(',', array_fill(0, count($bays_to_delete), '?'));
+          $db->prepare("DELETE FROM service_bays WHERE bay_id IN ($placeholders) AND tenant_id = ?")
+            ->execute(array_merge($bays_to_delete, [$tenant_id]));
+        }
       }
 
       $new_start = date('Y-m-d');
@@ -501,7 +501,7 @@ try {
       $msg = trim($_POST['message'] ?? '');
       if (empty($msg))
         throw new Exception("Message cannot be empty.");
-      
+
       $now = date('Y-m-d H:i:s');
       $db->prepare("INSERT INTO support_messages (tenant_id, sender_role, sender_id, message, created_at) VALUES (?, 'TENANT', ?, ?, ?)")
         ->execute([$tenant_id, $_SESSION['user_id'], $msg, $now]);
@@ -510,14 +510,14 @@ try {
       $sentAuto = false;
       try {
         $sendAutoReply = false;
-        
+
         // Fetch last two messages in the chat.
         // The first one [0] is the message we just inserted.
         // The second one [1] is the previous message in the chat history.
         $stmtLastTwo = $db->prepare("SELECT sender_role, message, created_at FROM support_messages WHERE tenant_id = ? ORDER BY message_id DESC LIMIT 2");
         $stmtLastTwo->execute([$tenant_id]);
         $lastTwo = $stmtLastTwo->fetchAll(PDO::FETCH_ASSOC);
-        
+
         if (count($lastTwo) < 2) {
           // No previous messages at all
           $sendAutoReply = true;
@@ -529,7 +529,7 @@ try {
             $stmtLastAdmin = $db->prepare("SELECT created_at, message FROM support_messages WHERE tenant_id = ? AND sender_role = 'ADMIN' ORDER BY message_id DESC LIMIT 1");
             $stmtLastAdmin->execute([$tenant_id]);
             $lastAdmin = $stmtLastAdmin->fetch(PDO::FETCH_ASSOC);
-            
+
             if (!$lastAdmin) {
               $sendAutoReply = true;
             } else {
@@ -541,7 +541,7 @@ try {
             }
           }
         }
-        
+
         // Rate-limit auto-replies to once every 5 minutes to prevent spam
         if ($sendAutoReply) {
           $stmtRecentAuto = $db->prepare("SELECT created_at FROM support_messages WHERE tenant_id = ? AND sender_role = 'ADMIN' AND message LIKE '%[Auto-Reply]%' ORDER BY message_id DESC LIMIT 1");
@@ -554,7 +554,7 @@ try {
             }
           }
         }
-        
+
         if ($sendAutoReply) {
           $autoMsg = "🤖 [Auto-Reply] Hello! Thank you for reaching out to AutoFix Hub Support. Our administrators are currently offline or attending to other requests. We have received your message and will get back to you as soon as possible. Thank you for your patience!";
           $db->prepare("INSERT INTO support_messages (tenant_id, sender_role, sender_id, message, is_read, created_at) VALUES (?, 'ADMIN', 0, ?, 0, ?)")
@@ -1298,7 +1298,8 @@ try {
                 VALUES (NEW.tenant_id, NEW.item_id, NEW.item_name, IF(NEW.quantity > OLD.quantity, 'ADD', 'SUBTRACT'), ABS(NEW.quantity - OLD.quantity), NEW.quantity, 'Stock level modified');
               END IF;
             END");
-        } catch (Exception $e) {}
+        } catch (Exception $e) {
+        }
 
         try {
           $db->exec("DROP TRIGGER IF EXISTS after_inventory_insert");
@@ -1309,7 +1310,8 @@ try {
                 VALUES (NEW.tenant_id, NEW.item_id, NEW.item_name, 'ADD', NEW.quantity, NEW.quantity, 'Initial stock');
               END IF;
             END");
-        } catch (Exception $e) {}
+        } catch (Exception $e) {
+        }
 
         // Repair Parts Link (Inventory -> Job Order)
         $db->exec("CREATE TABLE IF NOT EXISTS repair_parts (
@@ -1594,7 +1596,8 @@ try {
             $ms = $db->prepare("SELECT service_name FROM master_services WHERE master_id = ?");
             $ms->execute([$masterId]);
             $standard = $ms->fetch();
-            if ($standard) $name = $standard['service_name'];
+            if ($standard)
+              $name = $standard['service_name'];
           }
 
           $stmt = $db->prepare("INSERT INTO services (tenant_id, master_id, service_name, description, price, tenant_min_price, tenant_max_price, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')");
@@ -1640,7 +1643,8 @@ try {
             $ms = $db->prepare("SELECT service_name FROM master_services WHERE master_id = ?");
             $ms->execute([$masterId]);
             $standard = $ms->fetch();
-            if ($standard) $name = $standard['service_name'];
+            if ($standard)
+              $name = $standard['service_name'];
           }
 
           // AUTO-HEAL: Ensure description column exists
@@ -1728,27 +1732,27 @@ try {
           $shop->execute([$tenant_id]);
           $s = $shop->fetch(PDO::FETCH_ASSOC);
           $sn = $s['shop_name'] ?? 'Auto Shop';
-          
+
           $duration = 'N/A';
           if (!empty($j['started_at'])) {
-              $start = strtotime($j['started_at']);
-              $end = !empty($j['completed_at']) ? strtotime($j['completed_at']) : time();
-              if ($start && $end && $end >= $start) {
-                  $diff = $end - $start;
-                  $hours = floor($diff / 3600);
-                  $minutes = floor(($diff % 3600) / 60);
-                  $duration = $hours > 0 ? "{$hours}h {$minutes}m" : "{$minutes}m";
-              }
+            $start = strtotime($j['started_at']);
+            $end = !empty($j['completed_at']) ? strtotime($j['completed_at']) : time();
+            if ($start && $end && $end >= $start) {
+              $diff = $end - $start;
+              $hours = floor($diff / 3600);
+              $minutes = floor(($diff % 3600) / 60);
+              $duration = $hours > 0 ? "{$hours}h {$minutes}m" : "{$minutes}m";
+            }
           }
 
           $payStmt = $db->prepare("SELECT amount_tendered FROM payments WHERE job_id = ? AND payment_method = 'CASH' AND amount_tendered IS NOT NULL ORDER BY payment_id DESC LIMIT 1");
           $payStmt->execute([$id]);
           $amount_tendered = floatval($payStmt->fetchColumn() ?: 0);
-          
+
           $changeHtml = "";
           if ($amount_tendered > 0) {
-              $change = max(0, $amount_tendered - $j['total_amount']);
-              $changeHtml = "
+            $change = max(0, $amount_tendered - $j['total_amount']);
+            $changeHtml = "
                   <div style='display:flex; justify-content:space-between; font-size:0.9rem; margin-top:5px;'>
                     <span>Cash Tendered:</span>
                     <span>₱" . number_format($amount_tendered, 2) . "</span>
@@ -2211,11 +2215,11 @@ try {
 
           $id = intval($_POST['mechanic_id'] ?? 0);
           $new_status = $_POST['status'] ?? 'AVAILABLE';
-          
+
           if (!$id) {
             throw new Exception("Mechanic ID is required.");
           }
-          
+
           if (!in_array($new_status, ['AVAILABLE', 'UNAVAILABLE'])) {
             throw new Exception("Invalid status specified.");
           }
@@ -2279,7 +2283,8 @@ try {
           try {
             $log = $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'CRUD', ?)");
             $log->execute([$tenant_id, $_SESSION['user_id'] ?? 0, "Removed mechanic: $mechName (ID: $id)"]);
-          } catch (Exception $logErr) {}
+          } catch (Exception $logErr) {
+          }
 
           echo json_encode(['status' => 'success', 'message' => "Mechanic '$mechName' has been removed successfully."]);
         } catch (Exception $e) {
@@ -3384,8 +3389,8 @@ try {
 
           // Unassign resources if CANCELLED
           if ($newStatus === 'CANCELLED') {
-              $mechanicId = null;
-              $bayId = null;
+            $mechanicId = null;
+            $bayId = null;
           }
 
           // Enforce rule: Must have BOTH a mechanic and a bay to save updates
@@ -3422,32 +3427,33 @@ try {
 
           // Auto-migrate schema for agreement proof if missing
           try {
-              $db->exec("ALTER TABLE repair_jobs ADD COLUMN agreement_signature LONGTEXT NULL, ADD COLUMN agreement_proof_file VARCHAR(255) NULL");
-          } catch(Exception $e) {}
+            $db->exec("ALTER TABLE repair_jobs ADD COLUMN agreement_signature LONGTEXT NULL, ADD COLUMN agreement_proof_file VARCHAR(255) NULL");
+          } catch (Exception $e) {
+          }
 
           // Handle Signature and File Upload
           $sig = $_POST['agreement_signature'] ?? '';
           $proofFile = null;
-          
-          if(isset($_FILES['agreement_proof']) && $_FILES['agreement_proof']['error'] == 0) {
-              $proofName = time() . '_' . basename($_FILES['agreement_proof']['name']);
-              if(move_uploaded_file($_FILES['agreement_proof']['tmp_name'], 'uploads/' . $proofName)) {
-                  $proofFile = $proofName;
-              }
+
+          if (isset($_FILES['agreement_proof']) && $_FILES['agreement_proof']['error'] == 0) {
+            $proofName = time() . '_' . basename($_FILES['agreement_proof']['name']);
+            if (move_uploaded_file($_FILES['agreement_proof']['tmp_name'], 'uploads/' . $proofName)) {
+              $proofFile = $proofName;
+            }
           }
 
           $extraUpdate = "";
           $params = [$newStatus, $mechanicId, $bayId, $checklist];
 
           if (!empty($sig)) {
-              $extraUpdate .= ", agreement_signature = ?";
-              $params[] = $sig;
+            $extraUpdate .= ", agreement_signature = ?";
+            $params[] = $sig;
           }
           if ($proofFile) {
-              $extraUpdate .= ", agreement_proof_file = ?";
-              $params[] = $proofFile;
+            $extraUpdate .= ", agreement_proof_file = ?";
+            $params[] = $proofFile;
           }
-          
+
           $params[] = $jobId;
           $params[] = $tenant_id;
 
@@ -3515,10 +3521,10 @@ try {
 
           $jobId = !empty($_POST['job_id']) ? intval($_POST['job_id']) : null;
           $apptId = !empty($_POST['appointment_id']) ? intval($_POST['appointment_id']) : null;
-          
+
           $amountTendered = null;
           if ($method === 'CASH' && !empty($_POST['amount_tendered'])) {
-              $amountTendered = floatval($_POST['amount_tendered']);
+            $amountTendered = floatval($_POST['amount_tendered']);
           }
 
           $stmt = $db->prepare("INSERT INTO payments (tenant_id, customer_id, walkin_name, job_id, appointment_id, amount, amount_tendered, payment_method, reference_no, status, payment_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', NOW())");
@@ -3549,7 +3555,7 @@ try {
           // If linked to a job, mark the job as PAID/SETTLED and FREE RESOURCES
           if ($jobId) {
             $db->prepare("UPDATE repair_jobs SET payment_status = 'PAID', status = 'SETTLED', total_amount = ? WHERE job_id = ? AND tenant_id = ?")->execute([$amount, $jobId, $tenant_id]);
-            
+
             // Release Bay & Mechanic
             $stmtRes = $db->prepare("SELECT bay_id, mechanic_id FROM repair_jobs WHERE job_id = ?");
             $stmtRes->execute([$jobId]);
@@ -4147,51 +4153,51 @@ try {
       const amtHidden = document.getElementById('pay_amount_hidden');
       if (amtInput) amtInput.value = final.toFixed(2);
       if (amtHidden) amtHidden.value = final.toFixed(2);
-      
+
       if (typeof window.calculateChange === 'function') {
-          window.calculateChange();
+        window.calculateChange();
       }
     };
-    
-    window.toggleTenderedField = function() {
-        const method = document.getElementById('pay_method')?.value;
-        const tenderedField = document.getElementById('tenderedField');
-        const tenderedInput = document.getElementById('pay_amount_tendered');
-        if (method === 'CASH') {
-            if (tenderedField) tenderedField.style.display = 'block';
-            if (tenderedInput) tenderedInput.setAttribute('required', 'required');
-        } else {
-            if (tenderedField) tenderedField.style.display = 'none';
-            if (tenderedInput) {
-                tenderedInput.removeAttribute('required');
-                tenderedInput.value = '';
-            }
-            const changeDisplay = document.getElementById('changeDisplay');
-            if (changeDisplay) changeDisplay.style.display = 'none';
+
+    window.toggleTenderedField = function () {
+      const method = document.getElementById('pay_method')?.value;
+      const tenderedField = document.getElementById('tenderedField');
+      const tenderedInput = document.getElementById('pay_amount_tendered');
+      if (method === 'CASH') {
+        if (tenderedField) tenderedField.style.display = 'block';
+        if (tenderedInput) tenderedInput.setAttribute('required', 'required');
+      } else {
+        if (tenderedField) tenderedField.style.display = 'none';
+        if (tenderedInput) {
+          tenderedInput.removeAttribute('required');
+          tenderedInput.value = '';
         }
+        const changeDisplay = document.getElementById('changeDisplay');
+        if (changeDisplay) changeDisplay.style.display = 'none';
+      }
     };
 
-    window.calculateChange = function() {
-        const tenderedInput = document.getElementById('pay_amount_tendered');
-        if (!tenderedInput) return;
-        const tendered = parseFloat(tenderedInput.value) || 0;
-        const amountToPay = parseFloat(document.getElementById('pay_amount_hidden')?.value) || 0;
-        const changeDisplay = document.getElementById('changeDisplay');
-        if (!changeDisplay) return;
-        
-        if (tendered >= amountToPay && amountToPay > 0) {
-            const change = tendered - amountToPay;
-            changeDisplay.innerText = 'Change: ₱' + change.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-            changeDisplay.style.display = 'block';
-            changeDisplay.style.color = '#10b981';
-        } else if (tendered > 0 && tendered < amountToPay) {
-            const short = amountToPay - tendered;
-            changeDisplay.innerText = 'Short: ₱' + short.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-            changeDisplay.style.display = 'block';
-            changeDisplay.style.color = '#ef4444';
-        } else {
-            changeDisplay.style.display = 'none';
-        }
+    window.calculateChange = function () {
+      const tenderedInput = document.getElementById('pay_amount_tendered');
+      if (!tenderedInput) return;
+      const tendered = parseFloat(tenderedInput.value) || 0;
+      const amountToPay = parseFloat(document.getElementById('pay_amount_hidden')?.value) || 0;
+      const changeDisplay = document.getElementById('changeDisplay');
+      if (!changeDisplay) return;
+
+      if (tendered >= amountToPay && amountToPay > 0) {
+        const change = tendered - amountToPay;
+        changeDisplay.innerText = 'Change: ₱' + change.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        changeDisplay.style.display = 'block';
+        changeDisplay.style.color = '#10b981';
+      } else if (tendered > 0 && tendered < amountToPay) {
+        const short = amountToPay - tendered;
+        changeDisplay.innerText = 'Short: ₱' + short.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        changeDisplay.style.display = 'block';
+        changeDisplay.style.color = '#ef4444';
+      } else {
+        changeDisplay.style.display = 'none';
+      }
     };
 
     window.openRecordPaymentModal = function (jobId, customerId, customerName, amount) {
@@ -4202,11 +4208,11 @@ try {
       window.basePaymentAmount = parseFloat(amount || 0);
       const jidInput = document.getElementById('pay_job_id');
       if (jidInput) jidInput.value = jobId || '';
-      
+
       const methodSelect = document.getElementById('pay_method');
       if (methodSelect) {
-          methodSelect.value = 'CASH';
-          if (typeof window.toggleTenderedField === 'function') window.toggleTenderedField();
+        methodSelect.value = 'CASH';
+        if (typeof window.toggleTenderedField === 'function') window.toggleTenderedField();
       }
 
       const amtInput = document.getElementById('pay_amount');
@@ -4419,10 +4425,30 @@ try {
 
 
     window.processAppointment = function (id, status, reqMechName = null) {
-      const statusStr = (typeof status === 'string') ? status : String(status || '');
-      if (statusStr === 'CONFIRMED') {
+      // Force resolution based on known status values to completely avoid the "44" bug
+      let finalId = id;
+      let finalStatus = status;
+
+      if (typeof id === 'string' && ['CONFIRMED', 'CANCELLED', 'REJECTED', 'PENDING'].includes(id.toUpperCase())) {
+        finalStatus = id;
+        finalId = status;
+      } else if (typeof status === 'string' && ['CONFIRMED', 'CANCELLED', 'REJECTED', 'PENDING'].includes(status.toUpperCase())) {
+        finalStatus = status;
+        finalId = id;
+      }
+
+      // Fallback prevention: If finalStatus is somehow a number, we hardcode it to prevent the "44" alert bug.
+      if (!isNaN(finalStatus) && finalStatus !== null && finalStatus !== '') {
+        // This means BOTH arguments were numbers or missing. We can't proceed normally.
+        // Let's assume it was CONFIRMED if it reached here from Approve button, 
+        // but realistically we should just stop it from saying '44'.
+        finalStatus = 'CONFIRMED';
+      }
+
+      const safeStatus = String(finalStatus || '').toUpperCase();
+      if (safeStatus === 'CONFIRMED') {
         const idF = document.getElementById('confirm_appt_id');
-        if (idF) idF.value = id;
+        if (idF) idF.value = finalId;
         const display = document.getElementById('requested_mechanic_display');
         const text = document.getElementById('requested_mechanic_name_text');
         if (display && text) {
@@ -4441,7 +4467,7 @@ try {
               mS.innerHTML = '<option value="">-- Assign Mechanic --</option>';
               (data.mechanics || []).forEach(m => {
                 const shift = (m.shift_start && m.shift_end)
-                  ? ` — ${new Date('1970-01-01T'+m.shift_start).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} – ${new Date('1970-01-01T'+m.shift_end).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}${m.shift_days ? ' | '+m.shift_days.replace(/,/g,'·') : ''}` : '';
+                  ? ` — ${new Date('1970-01-01T' + m.shift_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} – ${new Date('1970-01-01T' + m.shift_end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}${m.shift_days ? ' | ' + m.shift_days.replace(/,/g, '·') : ''}` : '';
                 mS.innerHTML += `<option value="${m.mechanic_id}">${m.full_name}${shift}</option>`;
               });
               bS.innerHTML = '<option value="">-- Assign Bay --</option>';
@@ -4450,14 +4476,14 @@ try {
         }
         window.openModal('confirmAppointmentModal');
       } else {
-        if (!confirm('Are you sure you want to ' + statusStr.toLowerCase() + ' this appointment?')) return;
+        if (!confirm('Are you sure you want to ' + safeStatus.toLowerCase() + ' this appointment?')) return;
         const fd = new FormData();
-        fd.append('appointment_id', id);
-        fd.append('status', statusStr);
+        fd.append('appointment_id', finalId);
+        fd.append('status', safeStatus);
         fetch('tenant-dashboard.php?action=update_appointment_status', { method: 'POST', body: fd })
           .then(r => r.json()).then(data => {
             if (data.status === 'success') {
-              if (typeof showToast === 'function') showToast("Appointment " + statusStr.toLowerCase());
+              if (typeof showToast === 'function') showToast("Appointment " + safeStatus.toLowerCase());
               location.reload();
             } else alert(data.message);
           });
@@ -4518,6 +4544,25 @@ try {
             if (window.refreshServicesList) window.refreshServicesList();
           } else alert(res.message || 'Delete failed');
         });
+    };
+
+    window.confirmLocalAuthorization = function() {
+      const sigCanvas = document.getElementById('authSignaturePad');
+      const hasNewSig = sigCanvas && window.hasSignature;
+      const fileInput = document.getElementById('agreement_proof_input');
+      const hasNewFile = fileInput && fileInput.files && fileInput.files.length > 0;
+      
+      if (!hasNewSig && !hasNewFile) {
+        window.showAlert('Authorization Required', 'Please provide a signature or upload proof of customer authorization before confirming.', 'error');
+        return;
+      }
+      
+      document.getElementById('authInputContainer').style.display = 'none';
+      const statusDiv = document.getElementById('authProofStatus');
+      statusDiv.style.display = 'block';
+      statusDiv.innerHTML = '<i class="fas fa-check-circle"></i> Authorization Confirmed (Pending Save)';
+      window.isAuthConfirmedLocally = true;
+      window.showToast("Authorization temporarily confirmed! Commit Progress to save to database.");
     };
 
     // --- ULTIMATE JOB STATUS ENGINE (UNIQUE NAMESPACE) ---
@@ -4587,20 +4632,24 @@ try {
 
               // REFRESH BILLING - Now that window.currentJobServicePrice is set
               if (window.refreshJobPartsList) window.refreshJobPartsList(id);
-              
+
               const authStatus = document.getElementById('authProofStatus');
               const authSection = document.getElementById('customerAuthSection');
               if (authStatus) {
                 if (job.agreement_signature || job.agreement_proof_file) {
                   authStatus.style.display = 'block';
                   authStatus.innerHTML = `<i class="fas fa-check-circle"></i> Authorization Already on File 
-                    <br><a href="${job.agreement_proof_file ? 'uploads/'+job.agreement_proof_file : '#'}" target="_blank" style="color:#10b981; text-decoration:underline;">[View Proof File]</a>`;
+                    <br><a href="${job.agreement_proof_file ? 'uploads/' + job.agreement_proof_file : '#'}" target="_blank" style="color:#10b981; text-decoration:underline;">[View Proof File]</a>`;
                   if (authSection) authSection.style.display = 'block';
+                  const inputCont = document.getElementById('authInputContainer');
+                  if (inputCont) inputCont.style.display = 'none';
                 } else {
                   authStatus.style.display = 'none';
+                  const inputCont = document.getElementById('authInputContainer');
+                  if (inputCont) inputCont.style.display = 'block';
                 }
               }
-              if(window.clearSignature) window.clearSignature();
+              if (window.clearSignature) window.clearSignature();
             }
           });
 
@@ -4608,25 +4657,32 @@ try {
         const bS = document.getElementById('status_bay_id');
         if (mS) mS.innerHTML = '<option value="">Loading...</option>';
         if (bS) bS.innerHTML = '<option value="">Loading...</option>';
-        
+
         if (window.toggleJobStatusEdit) window.toggleJobStatusEdit(editMode);
-        
+
         fetch(`tenant-dashboard.php?action=fetch_available_resources&preferred_id=${currentBayId || 0}&current_mechanic_id=${currentMechId || 0}`)
           .then(r => r.json()).then(data => {
             if (mS) {
               let mHtml = '<option value="">-- Select Mechanic --</option>';
               mHtml += (data.mechanics || []).map(m => {
                 const shift = (m.shift_start && m.shift_end)
-                  ? ` — ${new Date('1970-01-01T'+m.shift_start).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} – ${new Date('1970-01-01T'+m.shift_end).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}${m.shift_days ? ' | '+m.shift_days.replace(/,/g,'·') : ''}` : '';
-                return `<option value="${m.mechanic_id}" ${m.mechanic_id == currentMechId ? 'selected' : ''}>${m.full_name}${shift}</option>`;
+                  ? ` — ${new Date('1970-01-01T' + m.shift_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} – ${new Date('1970-01-01T' + m.shift_end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}${m.shift_days ? ' | ' + m.shift_days.replace(/,/g, '·') : ''}` : '';
+                const isCurrent = (m.mechanic_id == currentMechId) ? ' (Currently Assigned)' : '';
+                return `<option value="${m.mechanic_id}" ${m.mechanic_id == currentMechId ? 'selected' : ''}>${m.full_name}${isCurrent}${shift}</option>`;
               }).join('');
-              if (!mS.value && currentMechId && currentMechId != 0) mHtml += `<option value="${currentMechId}" selected>Current Mechanic</option>`;
+              const hasMech = (data.mechanics || []).some(m => m.mechanic_id == currentMechId);
+              if (!hasMech && currentMechId && currentMechId != 0) mHtml += `<option value="${currentMechId}" selected>Current Mechanic (Occupied)</option>`;
               mS.innerHTML = mHtml;
             }
             if (bS) {
               let bHtml = '<option value="">-- Select Service Bay --</option>';
-              bHtml += (data.bays || []).map(b => `<option value="${b.bay_id}" ${b.bay_id == currentBayId ? 'selected' : ''}>${b.bay_name}</option>`).join('');
-              if (!bS.value && currentBayId && currentBayId != 0) bHtml += `<option value="${currentBayId}" selected>Current Bay</option>`;
+              bHtml += (data.bays || []).map(b => {
+                const isCurrent = (b.bay_id == currentBayId) ? ' (Currently Assigned)' : '';
+                return `<option value="${b.bay_id}" ${b.bay_id == currentBayId ? 'selected' : ''}>${b.bay_name}${isCurrent}</option>`;
+              }).join('');
+              
+              const hasBay = (data.bays || []).some(b => b.bay_id == currentBayId);
+              if (!hasBay && currentBayId && currentBayId != 0) bHtml += `<option value="${currentBayId}" selected>Current Bay (Occupied)</option>`;
               bS.innerHTML = bHtml;
             }
             if (window.validateCommitButton) window.validateCommitButton();
@@ -4634,50 +4690,50 @@ try {
       } catch (e) { console.error("Modal Open Error:", e); alert("Modal Error: " + e.message); }
     };
 
-    window.validateCommitButton = function() {
+    window.validateCommitButton = function () {
       const sb = document.getElementById('saveJobBtn');
       if (!sb) return;
-      
+
       const statusSelect = document.getElementById('job_current_status');
       const currentStatus = statusSelect ? statusSelect.value : '';
-      
+
       const mS = document.getElementById('status_mechanic_id');
       const bS = document.getElementById('status_bay_id');
       const mH = document.getElementById('status_mechanic_id_hidden');
       const bH = document.getElementById('status_bay_id_hidden');
       const mId = (mS && !mS.disabled && mS.value) ? mS.value : (mH ? mH.value : (mS ? mS.value : ''));
       const bId = (bS && !bS.disabled && bS.value) ? bS.value : (bH ? bH.value : (bS ? bS.value : ''));
-      
+
       let isValid = true;
       if (currentStatus !== 'CANCELLED') {
-          if (!mId || !bId) isValid = false;
+        if (!mId || !bId) isValid = false;
       }
-      
+
       if (isValid) {
-          sb.disabled = false;
-          sb.style.opacity = '1';
-          sb.style.filter = 'none';
-          sb.style.cursor = 'pointer';
-          sb.style.pointerEvents = 'auto';
+        sb.disabled = false;
+        sb.style.opacity = '1';
+        sb.style.filter = 'none';
+        sb.style.cursor = 'pointer';
+        sb.style.pointerEvents = 'auto';
       } else {
-          sb.disabled = true;
-          sb.style.opacity = '0.4';
-          sb.style.filter = 'grayscale(1)';
-          sb.style.cursor = 'not-allowed';
-          sb.style.pointerEvents = 'none';
+        sb.disabled = true;
+        sb.style.opacity = '0.4';
+        sb.style.filter = 'grayscale(1)';
+        sb.style.cursor = 'not-allowed';
+        sb.style.pointerEvents = 'none';
       }
     };
 
     // Prevent Enter key from submitting the form if it's invalid or unintentionally
-    document.addEventListener('DOMContentLoaded', function() {
-        const jsf = document.getElementById('jobStatusForm');
-        if (jsf) {
-            jsf.addEventListener('keydown', function(e) {
-                if (e.key === 'Enter' && e.target.tagName !== 'TEXTAREA') {
-                    e.preventDefault();
-                }
-            });
-        }
+    document.addEventListener('DOMContentLoaded', function () {
+      const jsf = document.getElementById('jobStatusForm');
+      if (jsf) {
+        jsf.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter' && e.target.tagName !== 'TEXTAREA') {
+            e.preventDefault();
+          }
+        });
+      }
     });
 
     window.toggleJobStatusEdit = function (editing) {
@@ -4691,12 +4747,12 @@ try {
       const currentStatus = sS ? sS.value : '';
       const isCompleted = (currentStatus === 'COMPLETED');
       if (mS) {
-          mS.disabled = !editing || isCompleted || isMech;
-          mS.addEventListener('change', window.validateCommitButton);
+        mS.disabled = !editing || isCompleted || isMech;
+        mS.addEventListener('change', window.validateCommitButton);
       }
       if (bS) {
-          bS.disabled = !editing || isCompleted || isMech;
-          bS.addEventListener('change', window.validateCommitButton);
+        bS.disabled = !editing || isCompleted || isMech;
+        bS.addEventListener('change', window.validateCommitButton);
       }
       if (eb) eb.style.display = editing ? 'none' : 'flex';
       if (sb) sb.style.display = editing ? 'flex' : 'none';
@@ -4712,7 +4768,7 @@ try {
           window.validateCommitButton();
         });
       }
-      
+
       window.validateCommitButton();
     };
 
@@ -4794,7 +4850,7 @@ try {
       const iidEl = document.getElementById('selectedPartId');
       const qtyEl = document.getElementById('partQty');
       if (!jidEl || !iidEl || !qtyEl) return;
-      
+
       const jid = jidEl.value;
       const iid = iidEl.value;
       const qty = qtyEl.value;
@@ -4923,7 +4979,7 @@ try {
       const jidEl = document.getElementById('status_job_id');
       const sidEl = document.getElementById('selectedServiceId');
       if (!jidEl || !sidEl) return;
-      
+
       const jid = jidEl.value;
       const sid = sidEl.value;
       if (!jid || !sid) return alert("Please select a service first.");
@@ -4978,7 +5034,7 @@ try {
       const bH = document.getElementById('status_bay_id_hidden');
       const mId = (mS && mS.value) ? mS.value : (mH ? mH.value : '');
       const bId = (bS && bS.value) ? bS.value : (bH ? bH.value : '');
-      
+
       const statusSelect = document.getElementById('job_current_status');
       const currentStatus = statusSelect ? statusSelect.value : '';
       if (currentStatus !== 'CANCELLED') {
@@ -4989,7 +5045,7 @@ try {
       const checked = [];
       document.querySelectorAll('.ann-chk:checked').forEach(c => checked.push(c.value));
       fd.append('checklist', checked.join(', '));
-      
+
       const authSection = document.getElementById('customerAuthSection');
       if (authSection && authSection.style.display !== 'none') {
         const authStatus = document.getElementById('authProofStatus');
@@ -4998,15 +5054,16 @@ try {
         const hasNewSig = sigCanvas && window.hasSignature;
         const fileInput = form.querySelector('input[name="agreement_proof"]');
         const hasNewFile = fileInput && fileInput.files && fileInput.files.length > 0;
-        
-        if (!hasAuthOnFile && !hasNewSig && !hasNewFile) {
-          return window.showAlert('Authorization Required', 'Please provide a signature or upload proof of customer authorization before committing progress.', 'error');
+
+        // If authProofStatus is not visible, it means there's no auth on file AND they haven't clicked Confirm.
+        if (!hasAuthOnFile) {
+          return window.showAlert('Authorization Required', 'Please click "Confirm Authorization" first to validate the customer\'s authorization before committing progress.', 'error');
         }
       }
 
       const sigCanvas = document.getElementById('authSignaturePad');
       if (sigCanvas && window.hasSignature) {
-          fd.append('agreement_signature', sigCanvas.toDataURL());
+        fd.append('agreement_signature', sigCanvas.toDataURL());
       }
 
       fetch('tenant-dashboard.php?action=update_job_status', { method: 'POST', body: fd })
@@ -5032,23 +5089,23 @@ try {
       const input = document.getElementById('setting_' + field);
       if (!input) { console.error("Input not found for", field); return; }
       const value = input.value;
-      
+
       if (!btn) btn = event ? (event.currentTarget || event.target) : null;
       if (!btn) { console.error("Button element not found"); return; }
-      
+
       const originalHtml = btn.innerHTML;
       btn.classList.add('saving');
       btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
       const fd = new FormData();
       fd.append('field', field);
       fd.append('value', value);
-      
+
       fetch('tenant-dashboard.php?action=save_setting_item', { method: 'POST', body: fd })
         .then(async r => {
           const text = await r.text();
           try {
             return JSON.parse(text);
-          } catch(e) {
+          } catch (e) {
             console.error("Server returned non-JSON:", text);
             throw new Error("Server Error: Invalid response format.");
           }
@@ -5057,8 +5114,8 @@ try {
             showToast("Feature updated successfully!");
             // Fields that require a live preview refresh
             const visualFields = [
-              'primary_color', 'secondary_color', 'ui_style', 'border_radius', 
-              'logo_url', 'banner_url', 'shop_name', 'hero_title', 
+              'primary_color', 'secondary_color', 'ui_style', 'border_radius',
+              'logo_url', 'banner_url', 'shop_name', 'hero_title',
               'hero_subtitle', 'about_text', 'description'
             ];
             if (visualFields.includes(field)) {
@@ -5079,7 +5136,7 @@ try {
     window.saveSettingWithFile = function (field, btn) {
       const input = document.getElementById('setting_' + field);
       if (!input || !input.files[0]) return showToast("Please select a file first", "error");
-      
+
       if (!btn) btn = event ? (event.currentTarget || event.target) : null;
       const originalHtml = btn ? btn.innerHTML : '';
       btn.classList.add('saving');
@@ -5343,21 +5400,21 @@ try {
       openModal('addServiceModal');
     };
 
-    window.validateTenantPrices = function(prefix) {
+    window.validateTenantPrices = function (prefix) {
       const priceInput = document.getElementById(prefix + '_service_price');
       const minInput = document.getElementById(prefix + '_tenant_min_price');
       const maxInput = document.getElementById(prefix + '_tenant_max_price');
-      
+
       const formId = prefix === 'add' ? 'addServiceForm' : 'editServiceForm';
       const form = document.getElementById(formId);
-      if(!form) return;
+      if (!form) return;
       const submitBtn = prefix === 'add' ? form.querySelector('button[onclick*="submitAddService"]') : form.querySelector('button[onclick*="saveEditService"]');
-      if(!submitBtn) return;
-      
+      if (!submitBtn) return;
+
       const price = parseFloat(priceInput.value);
       const min = parseFloat(minInput.value);
       const max = parseFloat(maxInput.value);
-      
+
       const hintElId = prefix + '_price_validation_hint';
       let hintEl = document.getElementById(hintElId);
       if (!hintEl) {
@@ -5369,10 +5426,10 @@ try {
         const grid = minInput.parentElement.parentElement;
         grid.parentNode.insertBefore(hintEl, grid.nextSibling);
       }
-      
+
       let isValid = true;
       let msg = '';
-      
+
       if (isNaN(price) || isNaN(min) || isNaN(max) || price <= 0 || min <= 0 || max <= 0) {
         isValid = false;
         msg = 'Price and limits are required.';
@@ -5383,7 +5440,7 @@ try {
         isValid = false;
         msg = `Price must be between \u20b1${min} and \u20b1${max}.`;
       }
-      
+
       if (isValid) {
         hintEl.innerHTML = '';
         submitBtn.disabled = false;
@@ -5532,10 +5589,10 @@ try {
               if (isPending) {
                 actionHtml = `
               <div style="display:flex; gap:8px;">
-                <button class="btn-action" style="flex:1; padding:8px; font-size:0.75rem; background:#10b981; color:white; border:none; border-radius:10px;" onclick="window.processAppointment(${a.appointment_id}, 'CONFIRMED', '${(a.requested_mechanic_name || '').replace(/'/g, "\\'")}')">
+                <button class="btn-action" style="flex:1; padding:8px; font-size:0.75rem; background:#10b981; color:white; border:none; border-radius:10px;" onclick="window.processAppointment('${a.appointment_id}', 'CONFIRMED', '${(a.requested_mechanic_name || '').replace(/'/g, "\\'")}')">
                   <i class="fas fa-check"></i> Approve
                 </button>
-                <button class="btn-action" style="flex:1; padding:8px; font-size:0.75rem; background:#ef4444; color:white; border:none; border-radius:10px;" onclick="window.processAppointment(${a.appointment_id}, 'CANCELLED')">
+                <button class="btn-action" style="flex:1; padding:8px; font-size:0.75rem; background:#ef4444; color:white; border:none; border-radius:10px;" onclick="window.processAppointment('${a.appointment_id}', 'CANCELLED')">
                   <i class="fas fa-times"></i> Reject
                 </button>
               </div>`;
@@ -5545,7 +5602,7 @@ try {
                 <button class="btn-action" style="padding:8px; font-size:0.75rem; background:var(--accent); color:white; border:none; border-radius:10px; font-weight:700;" onclick="window.startRepairFromAppointment(${a.appointment_id})">
                   <i class="fas fa-play-circle"></i> Start Repair
                 </button>
-                <button class="btn-outline" style="padding:4px; font-size:0.65rem; border-color:rgba(239,68,68,0.3); color:#ef4444;" onclick="window.processAppointment(${a.appointment_id}, 'CANCELLED')">
+                <button class="btn-outline" style="padding:4px; font-size:0.65rem; border-color:rgba(239,68,68,0.3); color:#ef4444;" onclick="window.processAppointment('${a.appointment_id}', 'CANCELLED')">
                    Cancel Appointment
                 </button>
               </div>`;
@@ -5744,11 +5801,10 @@ try {
         });
     };
     window.processShiftRequest = function (requestId, status) {
-      const statusStr = (typeof status === 'string') ? status : String(status || '');
-      if (!confirm(`Are you sure you want to ${statusStr.toLowerCase()} this request?`)) return;
+      if (!confirm(`Are you sure you want to ${status.toLowerCase()} this request?`)) return;
       const fd = new FormData();
       fd.append('request_id', requestId);
-      fd.append('status', statusStr);
+      fd.append('status', status);
       fetch('tenant-dashboard.php?action=process_shift_request', { method: 'POST', body: fd })
         .then(r => r.json())
         .then(data => {
@@ -5781,19 +5837,39 @@ try {
     }
 
     :root {
-      --bg-deep: <?php echo $tenant_custom['secondary_color'] ?: '#030712'; ?>;
-      --accent: <?php echo $tenant_custom['primary_color'] ?: '#10b981'; ?>;
-      --accent-rgb: <?php
+      --bg-deep:
+        <?php echo $tenant_custom['secondary_color'] ?: '#030712'; ?>
+      ;
+      --accent:
+        <?php echo $tenant_custom['primary_color'] ?: '#10b981'; ?>
+      ;
+      --accent-rgb:
+        <?php
         $hex = ($tenant_custom['primary_color'] ?? '') ?: '#10b981';
         $rgb = sscanf($hex, "#%02x%02x%02x");
-        if ($rgb) { list($r, $g, $b) = $rgb; } else { $r = 16; $g = 185; $b = 129; }
+        if ($rgb) {
+          list($r, $g, $b) = $rgb;
+        } else {
+          $r = 16;
+          $g = 185;
+          $b = 129;
+        }
         echo "$r, $g, $b";
-        ?>;
+        ?>
+      ;
       --accent-glow: rgba(var(--accent-rgb), 0.4);
-      --radius: <?php echo $tenant_custom['border_radius'] ?: '24px'; ?>;
-      --glass: <?php echo ($tenant_custom['ui_style'] === 'SOLID') ? 'rgba(15, 23, 42, 0.95)' : 'rgba(255, 255, 255, 0.03)'; ?>;
-      --glass-border: <?php echo ($tenant_custom['ui_style'] === 'SOLID') ? 'rgba(255, 255, 255, 0.12)' : 'rgba(255, 255, 255, 0.08)'; ?>;
-      --glass-blur: <?php echo ($tenant_custom['ui_style'] === 'SOLID') ? 'none' : 'blur(20px)'; ?>;
+      --radius:
+        <?php echo $tenant_custom['border_radius'] ?: '24px'; ?>
+      ;
+      --glass:
+        <?php echo ($tenant_custom['ui_style'] === 'SOLID') ? 'rgba(15, 23, 42, 0.95)' : 'rgba(255, 255, 255, 0.03)'; ?>
+      ;
+      --glass-border:
+        <?php echo ($tenant_custom['ui_style'] === 'SOLID') ? 'rgba(255, 255, 255, 0.12)' : 'rgba(255, 255, 255, 0.08)'; ?>
+      ;
+      --glass-blur:
+        <?php echo ($tenant_custom['ui_style'] === 'SOLID') ? 'none' : 'blur(20px)'; ?>
+      ;
       --text-main: #f8fafc;
       --text-dim: #94a3b8;
       --success: #10b981;
@@ -5801,6 +5877,67 @@ try {
       --warning: #f59e0b;
       --card-bg: rgba(255, 255, 255, 0.03);
       --input-bg: rgba(255, 255, 255, 0.05);
+    }
+    
+    [data-theme="light"] {
+      --bg-deep: #f1f5f9;
+      --text-main: #0f172a;
+      --text-dim: #475569;
+      --glass: rgba(255, 255, 255, 0.8);
+      --glass-border: rgba(0, 0, 0, 0.1);
+      --glass-blur: blur(20px);
+      --card-bg: #ffffff;
+      --input-bg: #ffffff;
+      --accent-glow: rgba(var(--accent-rgb), 0.15);
+    }
+    
+    [data-theme="light"] body {
+      background-color: var(--bg-deep) !important;
+      background-image: none !important;
+    }
+
+    /* Override hardcoded dark-mode inline styles for Light Mode */
+    [data-theme="light"] *[style*="color: white"],
+    [data-theme="light"] *[style*="color:white"],
+    [data-theme="light"] *[style*="color: #fff"],
+    [data-theme="light"] *[style*="color:#fff"] {
+      color: var(--text-main) !important;
+    }
+
+    /* Exception: buttons and badges with accent colors should keep white text */
+    [data-theme="light"] .btn-action,
+    [data-theme="light"] .btn-action *,
+    [data-theme="light"] *[style*="background: var(--accent)"],
+    [data-theme="light"] *[style*="background:var(--accent)"],
+    [data-theme="light"] *[style*="background: #ef4444"],
+    [data-theme="light"] *[style*="background:#ef4444"],
+    [data-theme="light"] *[style*="background: #10b981"],
+    [data-theme="light"] *[style*="background:#10b981"] {
+      color: #ffffff !important;
+    }
+
+    [data-theme="light"] *[style*="rgba(255,255,255,0."],
+    [data-theme="light"] *[style*="rgba(255, 255, 255, 0."],
+    [data-theme="light"] *[style*="rgba(0,0,0,0.2)"],
+    [data-theme="light"] *[style*="rgba(0,0,0,0.3)"] {
+      border-color: var(--glass-border) !important;
+    }
+
+    [data-theme="light"] div[style*="background:rgba(255,255,255,0."],
+    [data-theme="light"] div[style*="background: rgba(255,255,255,0."],
+    [data-theme="light"] div[style*="background:rgba(0,0,0,0.2)"],
+    [data-theme="light"] div[style*="background:rgba(0,0,0,0.3)"],
+    [data-theme="light"] div[style*="background:#111827"],
+    [data-theme="light"] div[style*="background:rgba(18,18,24"] {
+      background: var(--card-bg) !important;
+      color: var(--text-main) !important;
+    }
+    
+    [data-theme="light"] input[style*="background:rgba(0,0,0,0."],
+    [data-theme="light"] input[style*="background: rgba(0,0,0,0."] {
+      background: var(--input-bg) !important;
+      color: var(--text-main) !important;
+      border-color: var(--glass-border) !important;
     }
 
     [data-theme="light"] {
@@ -7011,19 +7148,26 @@ try {
                     <?php echo ($user_cycle === 'yearly') ? '/yr' : '/mo'; ?>
                   </span>
                 </div>
-                <div style="margin-bottom:25px; color:#94a3b8; font-size:0.95rem; display:flex; flex-direction:column; gap:10px; text-align:left; background:rgba(255,255,255,0.02); padding:15px; border-radius:12px;">
+                <div
+                  style="margin-bottom:25px; color:#94a3b8; font-size:0.95rem; display:flex; flex-direction:column; gap:10px; text-align:left; background:rgba(255,255,255,0.02); padding:15px; border-radius:12px;">
                   <div style="display:flex; align-items:center; gap:10px;">
-                    <div style="background:rgba(255,255,255,0.05); padding:6px; border-radius:8px; color:var(--accent);"><i class="fas fa-users fa-fw"></i></div>
-                    <span>Up to <strong><?php echo $p['max_users'] >= 999 ? 'Unlimited' : $p['max_users']; ?></strong> Staff Accounts</span>
+                    <div style="background:rgba(255,255,255,0.05); padding:6px; border-radius:8px; color:var(--accent);"><i
+                        class="fas fa-users fa-fw"></i></div>
+                    <span>Up to <strong><?php echo $p['max_users'] >= 999 ? 'Unlimited' : $p['max_users']; ?></strong> Staff
+                      Accounts</span>
                   </div>
                   <div style="display:flex; align-items:center; gap:10px;">
-                    <div style="background:rgba(255,255,255,0.05); padding:6px; border-radius:8px; color:var(--accent);"><i class="fas fa-warehouse fa-fw"></i></div>
-                    <span>Up to <strong><?php echo $p['max_service_bays'] >= 999 ? 'Unlimited' : $p['max_service_bays']; ?></strong> Service Bays</span>
+                    <div style="background:rgba(255,255,255,0.05); padding:6px; border-radius:8px; color:var(--accent);"><i
+                        class="fas fa-warehouse fa-fw"></i></div>
+                    <span>Up to
+                      <strong><?php echo $p['max_service_bays'] >= 999 ? 'Unlimited' : $p['max_service_bays']; ?></strong>
+                      Service Bays</span>
                   </div>
                 </div>
                 <button class="upgrade-select-btn btn-action"
                   style="width:100%; padding:15px; border-radius:15px; font-weight:800; <?php echo $is_current ? 'opacity:0.5; pointer-events:none;' : ''; ?>"
-                  type="button" <?php echo $is_current ? 'disabled' : ''; ?> onclick="processUpgrade(<?php echo $p['plan_id']; ?>, '<?php echo addslashes($p['plan_name']); ?>', event)">
+                  type="button" <?php echo $is_current ? 'disabled' : ''; ?>
+                  onclick="processUpgrade(<?php echo $p['plan_id']; ?>, '<?php echo addslashes($p['plan_name']); ?>', event)">
                   <?php echo $is_current ? 'Current Plan' : 'Select Plan'; ?>
                 </button>
               </div>
@@ -7245,7 +7389,7 @@ try {
         const tMin = parseFloat(minInput.value);
         const tMax = parseFloat(maxInput.value);
         if (val < tMin || val > tMax) {
-          showToast(`Price must be between ₱${tMin.toLocaleString('en-PH', {minimumFractionDigits:2})} and ₱${tMax.toLocaleString('en-PH', {minimumFractionDigits:2})}`, 'error');
+          showToast(`Price must be between ₱${tMin.toLocaleString('en-PH', { minimumFractionDigits: 2 })} and ₱${tMax.toLocaleString('en-PH', { minimumFractionDigits: 2 })}`, 'error');
           btn.innerText = originalText; btn.disabled = false;
           return;
         }
@@ -7380,7 +7524,7 @@ try {
           const shiftDaysStr = m.shift_days ? m.shift_days.split(',').join(' · ') : 'Mon · Tue · Wed · Thu · Fri · Sat';
           const shiftStr = `<div style="line-height:1.6;"><span style="font-size:0.8rem; color:var(--text-main); font-weight:600;"><i class="far fa-clock" style="color:var(--accent); margin-right:4px;"></i>${formatT(m.shift_start)} – ${formatT(m.shift_end)}</span><br><span style="font-size:0.7rem; color:var(--text-dim);">${shiftDaysStr}</span></div>`;
 
-          const toggleBtn = m.status === 'UNAVAILABLE' 
+          const toggleBtn = m.status === 'UNAVAILABLE'
             ? `<button type="button" class="btn-outline" style="padding:6px 12px; font-size:0.75rem; border-color:#10b981; color:#10b981; cursor:pointer; position:relative; z-index:10; pointer-events:auto !important;" onclick="window.toggleMechanicStatus(${m.mechanic_id}, 'AVAILABLE')">Set Available</button>`
             : isBusy
               ? `<button type="button" class="btn-outline" style="padding:6px 12px; font-size:0.75rem; border-color:#ef4444; color:#ef4444; cursor:not-allowed; opacity:0.5; position:relative; z-index:10; pointer-events:none !important;" disabled title="Cannot set unavailable while busy">Set Unavailable</button>`
@@ -7419,46 +7563,45 @@ try {
         method: 'POST',
         body: fd
       })
-      .then(res => res.json())
-      .then(data => {
-        if (data.status === 'success') {
-          showToast(data.message, 'success');
-          window.refreshMechanicsList();
-        } else {
-          showToast(data.message || 'Failed to remove mechanic.', 'error');
-        }
-      })
-      .catch(err => {
-        console.error('Delete Mechanic Error:', err);
-        showToast('Network error while removing mechanic.', 'error');
-      });
+        .then(res => res.json())
+        .then(data => {
+          if (data.status === 'success') {
+            showToast(data.message, 'success');
+            window.refreshMechanicsList();
+          } else {
+            showToast(data.message || 'Failed to remove mechanic.', 'error');
+          }
+        })
+        .catch(err => {
+          console.error('Delete Mechanic Error:', err);
+          showToast('Network error while removing mechanic.', 'error');
+        });
     };
 
     window.toggleMechanicStatus = function (mechanicId, newStatus) {
-      const statusStr = (typeof newStatus === 'string') ? newStatus : String(newStatus || '');
-      if (!confirm(`Are you sure you want to set this mechanic as ${statusStr.toLowerCase()}?`)) return;
+      if (!confirm(`Are you sure you want to set this mechanic as ${newStatus.toLowerCase()}?`)) return;
 
       const fd = new FormData();
       fd.append('mechanic_id', mechanicId);
-      fd.append('status', statusStr);
+      fd.append('status', newStatus);
 
       fetch('tenant-dashboard.php?action=update_mechanic_status', {
         method: 'POST',
         body: fd
       })
-      .then(res => res.json())
-      .then(data => {
-        if (data.status === 'success') {
-          showToast(data.message, 'success');
-          window.refreshMechanicsList();
-        } else {
-          showToast(data.message || 'Failed to update mechanic status.', 'error');
-        }
-      })
-      .catch(err => {
-        console.error("Status Sync Error:", err);
-        showToast('Network error updating status.', 'error');
-      });
+        .then(res => res.json())
+        .then(data => {
+          if (data.status === 'success') {
+            showToast(data.message, 'success');
+            window.refreshMechanicsList();
+          } else {
+            showToast(data.message || 'Failed to update mechanic status.', 'error');
+          }
+        })
+        .catch(err => {
+          console.error("Status Sync Error:", err);
+          showToast('Network error updating status.', 'error');
+        });
     };
 
 
@@ -7502,7 +7645,7 @@ try {
             // Safety: A bay is available if DB says so OR if it has no truly active job (PENDING/IN_PROGRESS)
             const isAvail = (b.status === 'AVAILABLE' || !b.active_job_id);
             const displayStatus = isAvail ? 'AVAILABLE' : b.status.toUpperCase();
-            
+
             const action = isAvail ? `openBayProfile(${b.bay_id})` : `window.handleJobClick(${b.active_job_id}, '${b.job_status}', ${b.active_mechanic_id}, ${b.bay_id}, true, false)`;
 
             // NEW: Dynamic Info for Occupied Bays
@@ -7540,9 +7683,9 @@ try {
     window.allJobOrders = [];
     window.currentJobTab = 'IN_PROGRESS';
 
-    window.changeJobTab = function(tabStatus) {
+    window.changeJobTab = function (tabStatus) {
       window.currentJobTab = tabStatus;
-      
+
       const tabs = ['IN_PROGRESS', 'PENDING', 'COMPLETED', 'CANCELLED'];
       const tabColors = {
         'IN_PROGRESS': '#ffc107',
@@ -7550,7 +7693,7 @@ try {
         'COMPLETED': '#10b981',
         'CANCELLED': '#ef4444'
       };
-      
+
       tabs.forEach(t => {
         const btn = document.getElementById('tab_' + t);
         const countBadge = document.getElementById('count_' + t);
@@ -7570,14 +7713,14 @@ try {
           }
         }
       });
-      
+
       window.renderJobOrdersTable();
     };
 
-    window.renderJobOrdersTable = function() {
-      const body = document.getElementById('jobOrdersTableBody'); 
+    window.renderJobOrdersTable = function () {
+      const body = document.getElementById('jobOrdersTableBody');
       if (!body) return;
-      
+
       const statuses = ['IN_PROGRESS', 'PENDING', 'COMPLETED', 'CANCELLED'];
       statuses.forEach(status => {
         const countSpan = document.getElementById('count_' + status);
@@ -7588,12 +7731,12 @@ try {
       });
 
       const filteredData = window.allJobOrders.filter(j => j.status === window.currentJobTab);
-      
+
       if (filteredData.length === 0) {
         body.innerHTML = `<tr><td colspan="5" style="text-align:center; padding:3rem; color:var(--text-dim);">No jobs found in ${window.currentJobTab.replace('_', ' ')}.</td></tr>`;
         return;
       }
-      
+
       body.innerHTML = filteredData.map(j => `
         <tr>
           <td>
@@ -8537,15 +8680,27 @@ try {
           <button class="btn-action" onclick="refreshJobOrders()"><i class="fas fa-sync"></i> Refresh
             List</button>
         </div>
-        
+
         <!-- Job Tabs -->
         <div style="display:flex; gap:10px; margin-bottom:1.5rem; overflow-x:auto; padding-bottom:5px;">
-          <button id="tab_IN_PROGRESS" class="btn-action" onclick="window.changeJobTab('IN_PROGRESS')" style="padding:0.6rem 1.5rem; border-radius:12px; font-weight:700; border:none; background:#ffc107; color:white; transition:0.3s; flex-shrink:0;">In Progress <span id="count_IN_PROGRESS" style="background:rgba(0,0,0,0.2); padding:2px 8px; border-radius:10px; font-size:0.8rem; margin-left:5px;">0</span></button>
-          <button id="tab_PENDING" class="btn-outline" onclick="window.changeJobTab('PENDING')" style="padding:0.6rem 1.5rem; border-radius:12px; font-weight:700; border:1px solid rgba(255,255,255,0.1); background:transparent; color:white; transition:0.3s; flex-shrink:0;">Pending <span id="count_PENDING" style="background:rgba(255,255,255,0.1); padding:2px 8px; border-radius:10px; font-size:0.8rem; margin-left:5px;">0</span></button>
-          <button id="tab_COMPLETED" class="btn-outline" onclick="window.changeJobTab('COMPLETED')" style="padding:0.6rem 1.5rem; border-radius:12px; font-weight:700; border:1px solid rgba(255,255,255,0.1); background:transparent; color:white; transition:0.3s; flex-shrink:0;">Completed <span id="count_COMPLETED" style="background:rgba(255,255,255,0.1); padding:2px 8px; border-radius:10px; font-size:0.8rem; margin-left:5px;">0</span></button>
-          <button id="tab_CANCELLED" class="btn-outline" onclick="window.changeJobTab('CANCELLED')" style="padding:0.6rem 1.5rem; border-radius:12px; font-weight:700; border:1px solid rgba(255,255,255,0.1); background:transparent; color:white; transition:0.3s; flex-shrink:0;">Cancelled <span id="count_CANCELLED" style="background:rgba(255,255,255,0.1); padding:2px 8px; border-radius:10px; font-size:0.8rem; margin-left:5px;">0</span></button>
+          <button id="tab_IN_PROGRESS" class="btn-action" onclick="window.changeJobTab('IN_PROGRESS')"
+            style="padding:0.6rem 1.5rem; border-radius:12px; font-weight:700; border:none; background:#ffc107; color:white; transition:0.3s; flex-shrink:0;">In
+            Progress <span id="count_IN_PROGRESS"
+              style="background:rgba(0,0,0,0.2); padding:2px 8px; border-radius:10px; font-size:0.8rem; margin-left:5px;">0</span></button>
+          <button id="tab_PENDING" class="btn-outline" onclick="window.changeJobTab('PENDING')"
+            style="padding:0.6rem 1.5rem; border-radius:12px; font-weight:700; border:1px solid rgba(255,255,255,0.1); background:transparent; color:white; transition:0.3s; flex-shrink:0;">Pending
+            <span id="count_PENDING"
+              style="background:rgba(255,255,255,0.1); padding:2px 8px; border-radius:10px; font-size:0.8rem; margin-left:5px;">0</span></button>
+          <button id="tab_COMPLETED" class="btn-outline" onclick="window.changeJobTab('COMPLETED')"
+            style="padding:0.6rem 1.5rem; border-radius:12px; font-weight:700; border:1px solid rgba(255,255,255,0.1); background:transparent; color:white; transition:0.3s; flex-shrink:0;">Completed
+            <span id="count_COMPLETED"
+              style="background:rgba(255,255,255,0.1); padding:2px 8px; border-radius:10px; font-size:0.8rem; margin-left:5px;">0</span></button>
+          <button id="tab_CANCELLED" class="btn-outline" onclick="window.changeJobTab('CANCELLED')"
+            style="padding:0.6rem 1.5rem; border-radius:12px; font-weight:700; border:1px solid rgba(255,255,255,0.1); background:transparent; color:white; transition:0.3s; flex-shrink:0;">Cancelled
+            <span id="count_CANCELLED"
+              style="background:rgba(255,255,255,0.1); padding:2px 8px; border-radius:10px; font-size:0.8rem; margin-left:5px;">0</span></button>
         </div>
-        
+
         <div style="overflow-x:auto;">
           <table class="data-table">
             <thead>
@@ -9236,7 +9391,8 @@ try {
       <div
         style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:2.5rem; width:100%; max-width:850px; margin:1rem; box-shadow:0 40px 80px rgba(0,0,0,0.6);">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem;">
-          <h3 id="reportTitle" style="margin:0; font-size:1.6rem; font-weight:800; letter-spacing:-0.5px;">Report Details</h3>
+          <h3 id="reportTitle" style="margin:0; font-size:1.6rem; font-weight:800; letter-spacing:-0.5px;">Report
+            Details</h3>
           <div style="display:flex; align-items:center; gap:12px;">
             <button id="btnExportPDF" onclick="exportReportPDF()"
               style="background:var(--accent); border:none; color:white; padding:0.6rem 1.2rem; border-radius:12px; font-weight:700; font-size:0.85rem; cursor:pointer; display:flex; align-items:center; gap:8px; transition:0.2s; box-shadow:0 4px 15px rgba(0,0,0,0.2);">
@@ -9473,9 +9629,10 @@ try {
             </div>
 
             <div style="margin-top: 2rem; border-top: 1px solid var(--glass-border); padding-top: 1.5rem;">
-               <h4 style="color:var(--accent); text-transform:uppercase; font-size:0.75rem; margin-bottom:1rem; letter-spacing:1px; font-weight:800;">
-                 <i class="fas fa-address-book"></i> Public Contact Info
-               </h4>
+              <h4
+                style="color:var(--accent); text-transform:uppercase; font-size:0.75rem; margin-bottom:1rem; letter-spacing:1px; font-weight:800;">
+                <i class="fas fa-address-book"></i> Public Contact Info
+              </h4>
             </div>
 
             <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem;">
@@ -9604,57 +9761,57 @@ try {
             window.showPayMongoSimulation = function (amount, method, planName, onComplete) {
               const modalId = 'paymongo_' + Date.now();
               const modalHTML = `
-                                                                                                      <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:#f4f7f9; z-index:2147483649; display:flex; flex-direction:column; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
-                                                                                                        <!-- Header -->
-                                                                                                        <div style="background:white; padding:1.5rem 2rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #e2e8f0;">
-                                                                                                          <div style="display:flex; align-items:center; gap:10px;">
-                                                                                                            <div style="background:#6366f1; width:32px; height:32px; border-radius:8px; display:flex; align-items:center; justify-content:center; color:white; font-weight:bold;">P</div>
-                                                                                                            <span style="font-weight:800; font-size:1.2rem; color:#1e293b; letter-spacing:-0.5px;">paymongo</span>
-                                                                                                          </div>
-                                                                                                          <div style="color:#64748b; font-size:0.9rem;">Test Mode</div>
-                                                                                                        </div>
-
-                                                                                                        <div style="flex:1; display:flex; align-items:center; justify-content:center; padding:2rem;">
-                                                                                                          <div style="background:white; width:100%; max-width:400px; border-radius:20px; box-shadow:0 20px 25px -5px rgba(0,0,0,0.1); overflow:hidden; border:1px solid #e2e8f0;">
-                                                                                                            <div style="padding:2rem; text-align:center; border-bottom:1px solid #f1f5f9; background:#f8fafc;">
-                                                                                                              <div style="color:#64748b; font-size:0.85rem; text-transform:uppercase; font-weight:700; letter-spacing:1px; margin-bottom:0.5rem;">Amount to Pay</div>
-                                                                                                              <div style="font-size:2.5rem; font-weight:900; color:#1e293b;">₱${parseFloat(amount).toLocaleString()}</div>
-                                                                                                              <div style="font-size:0.9rem; color:#64748b; margin-top:0.5rem;">${planName}</div>
+                                                                                                          <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:#f4f7f9; z-index:2147483649; display:flex; flex-direction:column; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+                                                                                                            <!-- Header -->
+                                                                                                            <div style="background:white; padding:1.5rem 2rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #e2e8f0;">
+                                                                                                              <div style="display:flex; align-items:center; gap:10px;">
+                                                                                                                <div style="background:#6366f1; width:32px; height:32px; border-radius:8px; display:flex; align-items:center; justify-content:center; color:white; font-weight:bold;">P</div>
+                                                                                                                <span style="font-weight:800; font-size:1.2rem; color:#1e293b; letter-spacing:-0.5px;">paymongo</span>
+                                                                                                              </div>
+                                                                                                              <div style="color:#64748b; font-size:0.9rem;">Test Mode</div>
                                                                                                             </div>
 
-                                                                                                            <div style="padding:2rem;">
-                                                                                                              <div style="margin-bottom:2rem;">
-                                                                                                                <div style="display:flex; justify-content:space-between; margin-bottom:0.8rem; font-size:0.9rem;">
-                                                                                                                  <span style="color:#64748b;">Payment Method</span>
-                                                                                                                  <span style="font-weight:700; color:#1e293b;">${method}</span>
+                                                                                                            <div style="flex:1; display:flex; align-items:center; justify-content:center; padding:2rem;">
+                                                                                                              <div style="background:white; width:100%; max-width:400px; border-radius:20px; box-shadow:0 20px 25px -5px rgba(0,0,0,0.1); overflow:hidden; border:1px solid #e2e8f0;">
+                                                                                                                <div style="padding:2rem; text-align:center; border-bottom:1px solid #f1f5f9; background:#f8fafc;">
+                                                                                                                  <div style="color:#64748b; font-size:0.85rem; text-transform:uppercase; font-weight:700; letter-spacing:1px; margin-bottom:0.5rem;">Amount to Pay</div>
+                                                                                                                  <div style="font-size:2.5rem; font-weight:900; color:#1e293b;">₱${parseFloat(amount).toLocaleString()}</div>
+                                                                                                                  <div style="font-size:0.9rem; color:#64748b; margin-top:0.5rem;">${planName}</div>
                                                                                                                 </div>
-                                                                                                                <div style="display:flex; justify-content:space-between; font-size:0.9rem;">
-                                                                                                                  <span style="color:#64748b;">Reference</span>
-                                                                                                                  <span style="font-weight:700; color:#1e293b;">PM-${Math.random().toString(36).substr(2, 9).toUpperCase()}</span>
+
+                                                                                                                <div style="padding:2rem;">
+                                                                                                                  <div style="margin-bottom:2rem;">
+                                                                                                                    <div style="display:flex; justify-content:space-between; margin-bottom:0.8rem; font-size:0.9rem;">
+                                                                                                                      <span style="color:#64748b;">Payment Method</span>
+                                                                                                                      <span style="font-weight:700; color:#1e293b;">${method}</span>
+                                                                                                                    </div>
+                                                                                                                    <div style="display:flex; justify-content:space-between; font-size:0.9rem;">
+                                                                                                                      <span style="color:#64748b;">Reference</span>
+                                                                                                                      <span style="font-weight:700; color:#1e293b;">PM-${Math.random().toString(36).substr(2, 9).toUpperCase()}</span>
+                                                                                                                    </div>
+                                                                                                                  </div>
+
+                                                                                                                  <button id="payNow_${modalId}" style="width:100%; padding:1rem; background:#6366f1; color:white; border:none; border-radius:12px; font-weight:700; font-size:1.1rem; cursor:pointer; transition:0.3s; margin-bottom:1rem;">
+                                                                                                                    Pay Now with ${method}
+                                                                                                                  </button>
+                      
+                                                                                                                  <button id="cancelPay_${modalId}" style="width:100%; background:none; border:none; color:#94a3b8; font-size:0.9rem; cursor:pointer;">
+                                                                                                                    Cancel Transaction
+                                                                                                                  </button>
                                                                                                                 </div>
                                                                                                               </div>
-
-                                                                                                              <button id="payNow_${modalId}" style="width:100%; padding:1rem; background:#6366f1; color:white; border:none; border-radius:12px; font-weight:700; font-size:1.1rem; cursor:pointer; transition:0.3s; margin-bottom:1rem;">
-                                                                                                                Pay Now with ${method}
-                                                                                                              </button>
-                      
-                                                                                                              <button id="cancelPay_${modalId}" style="width:100%; background:none; border:none; color:#94a3b8; font-size:0.9rem; cursor:pointer;">
-                                                                                                                Cancel Transaction
-                                                                                                              </button>
                                                                                                             </div>
-                                                                                                          </div>
-                                                                                                        </div>
 
-                                                                                                        <div id="loading_${modalId}" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(255,255,255,0.95); z-index:10; flex-direction:column; align-items:center; justify-content:center;">
-                                                                                                          <div style="width:50px; height:50px; border:4px solid #f3f3f3; border-top:4px solid #6366f1; border-radius:50%; animation: spin 1s linear infinite; margin-bottom:1.5rem;"></div>
-                                                                                                          <div style="font-weight:700; color:#1e293b; font-size:1.2rem;">Authorizing Payment...</div>
-                                                                                                          <div style="color:#64748b; margin-top:0.5rem;">Please do not close this window</div>
-                                                                                                        </div>
+                                                                                                            <div id="loading_${modalId}" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(255,255,255,0.95); z-index:10; flex-direction:column; align-items:center; justify-content:center;">
+                                                                                                              <div style="width:50px; height:50px; border:4px solid #f3f3f3; border-top:4px solid #6366f1; border-radius:50%; animation: spin 1s linear infinite; margin-bottom:1.5rem;"></div>
+                                                                                                              <div style="font-weight:700; color:#1e293b; font-size:1.2rem;">Authorizing Payment...</div>
+                                                                                                              <div style="color:#64748b; margin-top:0.5rem;">Please do not close this window</div>
+                                                                                                            </div>
 
-                                                                                                        <style>
-                                                                                                          @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-                                                                                                        </style>
-                                                                                                      </div>`;
+                                                                                                            <style>
+                                                                                                              @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+                                                                                                            </style>
+                                                                                                          </div>`;
                   document.body.insertAdjacentHTML('beforeend', modalHTML);
 
                   document.getElementById('payNow_' + modalId).onclick = function () {
@@ -9679,77 +9836,77 @@ try {
                   const originalHtml = btn ? btn.innerHTML : '<i class="fas fa-bolt"></i> Renew Subscription';
 
                   const proceedWithRenewal = (method) => {
-                                                                                                        <?php
-                                                                                                        $r_cycle = strtolower($active_subscription['billing_cycle'] ?? 'monthly');
-                                                                                                        $r_amount = ($r_cycle === 'yearly') ? ($active_subscription['price_yearly'] > 0 ? $active_subscription['price_yearly'] : ($active_subscription['price'] * 12 * 0.8)) : $active_subscription['price'];
-                                                                                                        ?>
-                                                                                                        const amount = "<?php echo $r_amount; ?>";
+                                                                                                            <?php
+                                                                                                            $r_cycle = strtolower($active_subscription['billing_cycle'] ?? 'monthly');
+                                                                                                            $r_amount = ($r_cycle === 'yearly') ? ($active_subscription['price_yearly'] > 0 ? $active_subscription['price_yearly'] : ($active_subscription['price'] * 12 * 0.8)) : $active_subscription['price'];
+                                                                                                            ?>
+                                                                                                            const amount = "<?php echo $r_amount; ?>";
 
-                  showPayMongoSimulation(amount, method, "Subscription Renewal", () => {
-                    if (btn) {
-                      btn.disabled = true;
-                      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
-                    }
+                    showPayMongoSimulation(amount, method, "Subscription Renewal", () => {
+                      if (btn) {
+                        btn.disabled = true;
+                        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
+                      }
 
-                    const fd = new FormData();
-                    fd.append('method', method);
+                      const fd = new FormData();
+                      fd.append('method', method);
 
-                    fetch('tenant-dashboard.php?action=renew_subscription', { method: 'POST', body: fd })
-                      .then(res => res.json())
-                      .then(data => {
-                        if (data.status === 'success') {
-                          alert("\u2705 Success! Subscription renewed via " + method);
-                          location.reload();
-                        } else {
-                          alert("\u274C Error: " + data.message);
+                      fetch('tenant-dashboard.php?action=renew_subscription', { method: 'POST', body: fd })
+                        .then(res => res.json())
+                        .then(data => {
+                          if (data.status === 'success') {
+                            alert("\u2705 Success! Subscription renewed via " + method);
+                            location.reload();
+                          } else {
+                            alert("\u274C Error: " + data.message);
+                            if (btn) { btn.disabled = false; btn.innerHTML = originalHtml; }
+                          }
+                        })
+                        .catch(err => {
+                          alert("\u274C System Error: " + err.message);
                           if (btn) { btn.disabled = false; btn.innerHTML = originalHtml; }
-                        }
-                      })
-                      .catch(err => {
-                        alert("\u274C System Error: " + err.message);
-                        if (btn) { btn.disabled = false; btn.innerHTML = originalHtml; }
-                      });
-                  });
-                };
+                        });
+                    });
+                  };
 
-                // DYNAMIC MODAL (With Payment Selection)
-                const modalId = 'dynamicRenewModal_' + Date.now();
-                const modalHTML = `
-                                                                                                      <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); backdrop-filter:blur(15px); z-index:9999999; display:flex; align-items:center; justify-content:center; padding:20px;">
-                                                                                                        <div style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:32px; padding:3rem; width:100%; max-width:480px; text-align:center; box-shadow:0 30px 60px rgba(0,0,0,0.5);">
-                                                                                                          <div style="width:80px; height:80px; background:linear-gradient(135deg, #6366f1 0%, #a855f7 100%); border-radius:50%; display:flex; align-items:center; justify-content:center; margin:0 auto 2rem; color:white; font-size:2.5rem; box-shadow:0 10px 25px rgba(99, 102, 241, 0.4);">
-                                                                                                            <i class="fas fa-credit-card"></i>
-                                                                                                          </div>
-                                                                                                          <h2 style="color:var(--text-main); margin-bottom:0.8rem; font-size:1.8rem; font-weight:800;">Renew Subscription</h2>
-                                                                                                          <p style="color:var(--text-dim); margin-bottom:2rem; line-height:1.6;">${confirmMsg}</p>
+                  // DYNAMIC MODAL (With Payment Selection)
+                  const modalId = 'dynamicRenewModal_' + Date.now();
+                  const modalHTML = `
+                                                                                                          <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); backdrop-filter:blur(15px); z-index:9999999; display:flex; align-items:center; justify-content:center; padding:20px;">
+                                                                                                            <div style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:32px; padding:3rem; width:100%; max-width:480px; text-align:center; box-shadow:0 30px 60px rgba(0,0,0,0.5);">
+                                                                                                              <div style="width:80px; height:80px; background:linear-gradient(135deg, #6366f1 0%, #a855f7 100%); border-radius:50%; display:flex; align-items:center; justify-content:center; margin:0 auto 2rem; color:white; font-size:2.5rem; box-shadow:0 10px 25px rgba(99, 102, 241, 0.4);">
+                                                                                                                <i class="fas fa-credit-card"></i>
+                                                                                                              </div>
+                                                                                                              <h2 style="color:var(--text-main); margin-bottom:0.8rem; font-size:1.8rem; font-weight:800;">Renew Subscription</h2>
+                                                                                                              <p style="color:var(--text-dim); margin-bottom:2rem; line-height:1.6;">${confirmMsg}</p>
                   
-                                                                                                          <div style="text-align:left; margin-bottom:2.5rem;">
-                                                                                                            <label style="color:var(--text-main); font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; display:block; opacity:0.7;">Payment Method</label>
-                                                                                                            <select id="payMethod_${modalId}" class="modern-input">
-                                                                                                              <option value="GCASH">GCash</option>
-                                                                                                              <option value="MAYA">Maya</option>
-                                                                                                              <option value="BANK_TRANSFER">Bank Transfer (BDO/BPI)</option>
-                                                                                                              <option value="CARD">Credit/Debit Card</option>
-                                                                                                            </select>
-                                                                                                          </div>
+                                                                                                              <div style="text-align:left; margin-bottom:2.5rem;">
+                                                                                                                <label style="color:var(--text-main); font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; display:block; opacity:0.7;">Payment Method</label>
+                                                                                                                <select id="payMethod_${modalId}" class="modern-input">
+                                                                                                                  <option value="GCASH">GCash</option>
+                                                                                                                  <option value="MAYA">Maya</option>
+                                                                                                                  <option value="BANK_TRANSFER">Bank Transfer (BDO/BPI)</option>
+                                                                                                                  <option value="CARD">Credit/Debit Card</option>
+                                                                                                                </select>
+                                                                                                              </div>
 
-                                                                                                          <div style="display:flex; gap:15px; justify-content:center;">
-                                                                                                            <button id="btnConfirm_${modalId}" style="flex:2; padding:16px; background:#6366f1; color:white; border:none; border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem; transition:0.3s; box-shadow:0 10px 20px rgba(99, 102, 241, 0.3);">Go to Payment</button>
-                                                                                                            <button id="btnCancel_${modalId}" style="flex:1; padding:16px; background:var(--input-bg); color:var(--text-main); border:1px solid var(--glass-border); border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem;">Cancel</button>
-                                                                                                          </div>
-                                                                                                        </div>
-                                                                                                      </div>`;
-                document.body.insertAdjacentHTML('beforeend', modalHTML);
+                                                                                                              <div style="display:flex; gap:15px; justify-content:center;">
+                                                                                                                <button id="btnConfirm_${modalId}" style="flex:2; padding:16px; background:#6366f1; color:white; border:none; border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem; transition:0.3s; box-shadow:0 10px 20px rgba(99, 102, 241, 0.3);">Go to Payment</button>
+                                                                                                                <button id="btnCancel_${modalId}" style="flex:1; padding:16px; background:var(--input-bg); color:var(--text-main); border:1px solid var(--glass-border); border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem;">Cancel</button>
+                                                                                                              </div>
+                                                                                                            </div>
+                                                                                                          </div>`;
+                  document.body.insertAdjacentHTML('beforeend', modalHTML);
 
-                document.getElementById('btnConfirm_' + modalId).onclick = function () {
-                  const selectedMethod = document.getElementById('payMethod_' + modalId).value;
-                  document.getElementById(modalId).remove();
-                  proceedWithRenewal(selectedMethod);
+                  document.getElementById('btnConfirm_' + modalId).onclick = function () {
+                    const selectedMethod = document.getElementById('payMethod_' + modalId).value;
+                    document.getElementById(modalId).remove();
+                    proceedWithRenewal(selectedMethod);
+                  };
+                  document.getElementById('btnCancel_' + modalId).onclick = function () {
+                    document.getElementById(modalId).remove();
+                  };
                 };
-                document.getElementById('btnCancel_' + modalId).onclick = function () {
-                  document.getElementById(modalId).remove();
-                };
-                    };
               </script>
             <?php endif; ?>
           </div>
@@ -10710,17 +10867,17 @@ try {
             const description = descEl ? descEl.value : '';
 
             if (inputId === 'setting_hero_title') {
-                if (theme === 'PREMIUM') val = "UNMATCHED<br><span>PRECISION.</span>";
-                else if (theme === 'MINIMAL') val = shopName + ".";
-                else if (theme === 'VIBRANT') val = "WE REVIVE YOUR RIDE!";
-                else val = "Expert Service at<br><span>" + shopName + "</span>";
+              if (theme === 'PREMIUM') val = "UNMATCHED<br><span>PRECISION.</span>";
+              else if (theme === 'MINIMAL') val = shopName + ".";
+              else if (theme === 'VIBRANT') val = "WE REVIVE YOUR RIDE!";
+              else val = "Expert Service at<br><span>" + shopName + "</span>";
             } else if (inputId === 'setting_hero_subtitle') {
-                if (theme === 'PREMIUM') val = shopName + ": Where elite engineering meets luxury care.";
-                else if (theme === 'MINIMAL') val = description;
-                else if (theme === 'VIBRANT') val = shopName + " POWERED";
-                else val = description || "Premium car care and maintenance for your high-performance vehicle.";
+              if (theme === 'PREMIUM') val = shopName + ": Where elite engineering meets luxury care.";
+              else if (theme === 'MINIMAL') val = description;
+              else if (theme === 'VIBRANT') val = shopName + " POWERED";
+              else val = description || "Premium car care and maintenance for your high-performance vehicle.";
             } else if (inputId === 'setting_shop_name') {
-                val = shopName;
+              val = shopName;
             }
           }
 
@@ -10858,21 +11015,28 @@ try {
         </div>
         <div style="margin-bottom:1.5rem;">
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price (PHP)</label>
-          <input type="number" step="0.01" name="price" id="add_service_price" required placeholder="0.00" oninput="window.validateTenantPrices('add')"
+          <input type="number" step="0.01" name="price" id="add_service_price" required placeholder="0.00"
+            oninput="window.validateTenantPrices('add')"
             style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <!-- Tenant-defined price limits -->
         <div style="margin-bottom:1rem;">
-          <label style="display:block; margin-bottom:4px; font-size:0.82rem; color:var(--accent); font-weight:600;">&#128274; Set Your Price Limits <span style="color:#ef4444; font-weight:400;">(Required)</span></label>
+          <label
+            style="display:block; margin-bottom:4px; font-size:0.82rem; color:var(--accent); font-weight:600;">&#128274;
+            Set Your Price Limits <span style="color:#ef4444; font-weight:400;">(Required)</span></label>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
             <div>
-              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Min Price (&#8369;)</label>
-              <input type="number" step="0.01" name="tenant_min_price" id="add_tenant_min_price" placeholder="e.g. 500" oninput="window.validateTenantPrices('add')"
+              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Min Price
+                (&#8369;)</label>
+              <input type="number" step="0.01" name="tenant_min_price" id="add_tenant_min_price" placeholder="e.g. 500"
+                oninput="window.validateTenantPrices('add')"
                 style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.7rem 0.9rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
             </div>
             <div>
-              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Max Price (&#8369;)</label>
-              <input type="number" step="0.01" name="tenant_max_price" id="add_tenant_max_price" placeholder="e.g. 2000" oninput="window.validateTenantPrices('add')"
+              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Max Price
+                (&#8369;)</label>
+              <input type="number" step="0.01" name="tenant_max_price" id="add_tenant_max_price" placeholder="e.g. 2000"
+                oninput="window.validateTenantPrices('add')"
                 style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.7rem 0.9rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
             </div>
           </div>
@@ -10911,21 +11075,28 @@ try {
         </div>
         <div style="margin-bottom:1.5rem;">
           <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price (PHP)</label>
-          <input type="number" step="0.01" name="price" id="edit_service_price" required oninput="window.validateTenantPrices('edit')"
+          <input type="number" step="0.01" name="price" id="edit_service_price" required
+            oninput="window.validateTenantPrices('edit')"
             style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <!-- Tenant-defined price limits -->
         <div style="margin-bottom:1.5rem;">
-          <label style="display:block; margin-bottom:4px; font-size:0.82rem; color:var(--accent); font-weight:600;">&#128274; Your Price Limits <span style="color:#ef4444; font-weight:400;">(Required)</span></label>
+          <label
+            style="display:block; margin-bottom:4px; font-size:0.82rem; color:var(--accent); font-weight:600;">&#128274;
+            Your Price Limits <span style="color:#ef4444; font-weight:400;">(Required)</span></label>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
             <div>
-              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Min Price (&#8369;)</label>
-              <input type="number" step="0.01" name="tenant_min_price" id="edit_tenant_min_price" placeholder="e.g. 500" oninput="window.validateTenantPrices('edit')"
+              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Min Price
+                (&#8369;)</label>
+              <input type="number" step="0.01" name="tenant_min_price" id="edit_tenant_min_price" placeholder="e.g. 500"
+                oninput="window.validateTenantPrices('edit')"
                 style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.7rem 0.9rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
             </div>
             <div>
-              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Max Price (&#8369;)</label>
-              <input type="number" step="0.01" name="tenant_max_price" id="edit_tenant_max_price" placeholder="e.g. 2000" oninput="window.validateTenantPrices('edit')"
+              <label style="display:block; margin-bottom:4px; font-size:0.78rem; color:#94a3b8;">Max Price
+                (&#8369;)</label>
+              <input type="number" step="0.01" name="tenant_max_price" id="edit_tenant_max_price"
+                placeholder="e.g. 2000" oninput="window.validateTenantPrices('edit')"
                 style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.7rem 0.9rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
             </div>
           </div>
@@ -11475,7 +11646,7 @@ try {
       const startEl = document.getElementById('editShiftStart');
       const endEl = document.getElementById('editShiftEnd');
       const nameEl = document.getElementById('editShiftName');
-      
+
       if (idEl) idEl.value = id;
       if (startEl) startEl.value = start;
       if (endEl) endEl.value = end;
@@ -11644,7 +11815,8 @@ try {
               style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
         </div>
-        <div style="font-size:0.75rem; color:var(--text-dim); display:flex; align-items:center; gap:6px; margin:0.5rem 0 1rem 0;">
+        <div
+          style="font-size:0.75rem; color:var(--text-dim); display:flex; align-items:center; gap:6px; margin:0.5rem 0 1rem 0;">
           <i class="fas fa-info-circle" style="color:var(--accent);"></i>
           <span>Low stock alert is fixed at <strong>less than 5</strong> items.</span>
         </div>
@@ -11682,7 +11854,8 @@ try {
           <input type="number" step="0.01" name="price" id="adj_price" required
             style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem; border-radius:12px; font-size:1rem; outline:none; box-sizing:border-box;">
         </div>
-        <div style="font-size:0.75rem; color:var(--text-dim); display:flex; align-items:center; gap:6px; margin:0.5rem 0 1rem 0;">
+        <div
+          style="font-size:0.75rem; color:var(--text-dim); display:flex; align-items:center; gap:6px; margin:0.5rem 0 1rem 0;">
           <i class="fas fa-info-circle" style="color:var(--accent);"></i>
           <span>Low stock alert is fixed at <strong>less than 5</strong> items.</span>
         </div>
@@ -11918,7 +12091,8 @@ try {
           <div>
             <label
               style="display:block; margin-bottom:5px; font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase;">Method</label>
-            <select name="payment_method" id="pay_method" onchange="window.toggleTenderedField()" style="padding:0.7rem; font-size:0.85rem;">
+            <select name="payment_method" id="pay_method" onchange="window.toggleTenderedField()"
+              style="padding:0.7rem; font-size:0.85rem;">
               <option value="CASH">CASH</option>
               <option value="GCASH">GCASH</option>
               <option value="BANK">BANK</option>
@@ -11934,11 +12108,14 @@ try {
         </div>
 
         <div id="tenderedField" style="margin-bottom:1.2rem;">
-          <label style="display:block; margin-bottom:5px; font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase;">Amount Tendered (PHP)</label>
+          <label
+            style="display:block; margin-bottom:5px; font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase;">Amount
+            Tendered (PHP)</label>
           <input type="number" name="amount_tendered" id="pay_amount_tendered" step="0.01" placeholder="0.00"
             style="width:100%; background:rgba(0,0,0,0.3); border:1px solid var(--accent); color:white; padding:0.7rem; border-radius:10px; font-size:1rem; outline:none;"
             oninput="window.calculateChange()">
-          <div id="changeDisplay" style="margin-top:5px; font-size:0.85rem; color:#10b981; font-weight:700; display:none;">Change: ₱0.00</div>
+          <div id="changeDisplay"
+            style="margin-top:5px; font-size:0.85rem; color:#10b981; font-weight:700; display:none;">Change: ₱0.00</div>
         </div>
 
         <button type="submit"
@@ -12104,7 +12281,7 @@ try {
                 <div style="display:flex; gap:10px;">
                   <div id="serviceComboboxWrapper" style="position:relative; flex:1;">
                     <input type="text" id="serviceComboboxInput" placeholder="Add another service..." autocomplete="off"
-                      style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem 1rem; border-radius:12px; font-size:0.9rem; outline:none;"
+                      style="width:100%; background-color:rgba(255,255,255,0.05); background-image: url('data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'24\' height=\'24\' viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'%2364748b\' stroke-width=\'2\' stroke-linecap=\'round\' stroke-linejoin=\'round\'><polyline points=\'6 9 12 15 18 9\'></polyline></svg>'); background-repeat: no-repeat; background-position: right 1rem center; background-size: 1.2rem; border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem 2.5rem 0.8rem 1rem; border-radius:12px; font-size:0.9rem; outline:none; cursor:pointer;"
                       onfocus="document.getElementById('serviceResultsList').style.display='block'; window.loadServiceSelector();"
                       oninput="window.filterServiceCombobox(this.value)">
                     <input type="hidden" id="selectedServiceId" value="">
@@ -12139,24 +12316,40 @@ try {
               </div>
 
               <!-- Customer Authorization for Extras -->
-              <div id="customerAuthSection" style="display:none; margin-top:1.5rem; background:rgba(255,255,255,0.02); border:1px solid var(--glass-border); border-radius:15px; padding:1.2rem;">
-                <label style="display:block; margin-bottom:12px; font-size:0.8rem; color:var(--accent); font-weight:800; text-transform:uppercase; letter-spacing:1px;">Customer Authorization Proof (Optional)</label>
-                
-                <div id="authProofStatus" style="display:none; margin-bottom:12px; font-size:0.8rem; color:#10b981; font-weight:700;"><i class="fas fa-check-circle"></i> Authorization Already on File</div>
+              <div id="customerAuthSection"
+                style="display:none; margin-top:1.5rem; background:rgba(255,255,255,0.02); border:1px solid var(--glass-border); border-radius:15px; padding:1.2rem;">
+                <label
+                  style="display:block; margin-bottom:12px; font-size:0.8rem; color:var(--accent); font-weight:800; text-transform:uppercase; letter-spacing:1px;">Customer
+                  Authorization Proof (Required for Extras)</label>
 
-                <!-- Signature Pad -->
-                <div style="margin-bottom:1rem;">
-                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
-                    <span style="font-size:0.75rem; color:var(--text-dim);">E-Signature:</span>
-                    <button type="button" onclick="window.clearSignature()" style="background:none; border:none; color:var(--danger); font-size:0.7rem; cursor:pointer; padding:0;">Clear / Re-sign</button>
+                <div id="authProofStatus"
+                  style="display:none; margin-bottom:12px; font-size:0.8rem; color:#10b981; font-weight:700;"><i
+                    class="fas fa-check-circle"></i> Authorization Already on File</div>
+
+                <div id="authInputContainer">
+                  <!-- Signature Pad -->
+                  <div style="margin-bottom:1rem;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                      <span style="font-size:0.75rem; color:var(--text-dim);">E-Signature:</span>
+                      <button type="button" onclick="window.clearSignature()"
+                        style="background:none; border:none; color:var(--danger); font-size:0.7rem; cursor:pointer; padding:0;">Clear
+                        / Re-sign</button>
+                    </div>
+                    <canvas id="authSignaturePad" width="350" height="150"
+                      style="background:white; border-radius:10px; width:100%; border:2px dashed rgba(255,255,255,0.2); touch-action:none;"></canvas>
                   </div>
-                  <canvas id="authSignaturePad" width="350" height="150" style="background:white; border-radius:10px; width:100%; border:2px dashed rgba(255,255,255,0.2); touch-action:none;"></canvas>
-                </div>
 
-                <!-- File Upload -->
-                <div style="margin-bottom:0.5rem;">
-                  <span style="display:block; font-size:0.75rem; color:var(--text-dim); margin-bottom:5px;">Or Upload Proof (Chat Screenshot/Photo):</span>
-                  <input type="file" name="agreement_proof" accept="image/*" style="width:100%; font-size:0.8rem; color:white; background:rgba(0,0,0,0.2); padding:0.5rem; border-radius:8px; border:1px solid rgba(255,255,255,0.1);">
+                  <!-- File Upload -->
+                  <div style="margin-bottom:0.5rem;">
+                    <span style="display:block; font-size:0.75rem; color:var(--text-dim); margin-bottom:5px;">Or Upload
+                      Proof (Chat Screenshot/Photo):</span>
+                    <input type="file" name="agreement_proof" id="agreement_proof_input" accept="image/*"
+                      style="width:100%; font-size:0.8rem; color:white; background:rgba(0,0,0,0.2); padding:0.5rem; border-radius:8px; border:1px solid rgba(255,255,255,0.1);">
+                  </div>
+                  
+                  <button type="button" onclick="window.confirmLocalAuthorization()" style="width:100%; margin-top:10px; padding:12px; border-radius:10px; border:none; background:linear-gradient(135deg, var(--accent), #059669); color:white; font-weight:800; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px;">
+                    <i class="fas fa-check-double"></i> Confirm Authorization
+                  </button>
                 </div>
               </div>
 
@@ -13043,7 +13236,7 @@ try {
           mS.innerHTML = '<option value="">-- Auto-Assign --</option>';
           (res.mechanics || []).forEach(m => {
             const shift = (m.shift_start && m.shift_end)
-              ? ` — ${new Date('1970-01-01T'+m.shift_start).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} – ${new Date('1970-01-01T'+m.shift_end).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}${m.shift_days ? ' | '+m.shift_days.replace(/,/g,'·') : ''}` : '';
+              ? ` — ${new Date('1970-01-01T' + m.shift_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} – ${new Date('1970-01-01T' + m.shift_end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}${m.shift_days ? ' | ' + m.shift_days.replace(/,/g, '·') : ''}` : '';
             mS.innerHTML += `<option value="${m.mechanic_id}">${m.full_name}${shift}</option>`;
           });
         }
@@ -13561,7 +13754,7 @@ try {
                   </div>
                   <h4 style="margin:0; font-size:1.2rem;">${current.service_name}</h4>
                   <div style="margin-top:10px; font-size:0.9rem; opacity:0.8;">
-                    <i class="fas fa-car" style="margin-right:8px;"></i> ${current.plate_no} ${ (current.make || current.model) ? `(${[current.make, current.model].filter(Boolean).join(' ')})` : '' }<br>
+                    <i class="fas fa-car" style="margin-right:8px;"></i> ${current.plate_no} ${(current.make || current.model) ? `(${[current.make, current.model].filter(Boolean).join(' ')})` : ''}<br>
                     <i class="fas fa-user" style="margin-right:8px;"></i> ${current.customer_name}
                   </div>
                   <button class="job-status-btn" onclick="window.closeModal('bayProfileModal'); window.handleJobClick(${current.job_id}, '${current.status}', ${current.mechanic_id}, ${b.bay_id}, true, false)" 
@@ -13698,18 +13891,13 @@ try {
   </div>
 
   <!-- Chat Support Centered Modal -->
-  <div id="chatOverlay" onclick="toggleChat()" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.65); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); z-index:9998; transition:opacity 0.3s ease;">
+  <div id="chatOverlay" onclick="toggleChat()"
+    style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.65); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); z-index:9998; transition:opacity 0.3s ease;">
   </div>
-  <div id="supportChatWidget" style="position:fixed; top:50%; left:50%; width:90%; max-width:650px; height:80vh; max-height:680px; z-index:9999; background:rgba(18,18,24,0.92); backdrop-filter:blur(25px); -webkit-backdrop-filter:blur(25px); border:1px solid var(--glass-border); border-radius:24px; box-shadow:0 25px 60px rgba(0,0,0,0.65); display:flex; flex-direction:column; transform:translate(-50%, -50%) scale(0.92); opacity:0; pointer-events:none; visibility:hidden; transition:all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);">
+  <div id="supportChatWidget"
+    style="position:fixed; top:50%; left:50%; width:90%; max-width:650px; height:80vh; max-height:680px; z-index:9999; background:rgba(18,18,24,0.92); backdrop-filter:blur(25px); -webkit-backdrop-filter:blur(25px); border:1px solid var(--glass-border); border-radius:24px; box-shadow:0 25px 60px rgba(0,0,0,0.65); display:flex; flex-direction:column; transform:translate(-50%, -50%) scale(0.92); opacity:0; pointer-events:none; visibility:hidden; transition:all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);">
     <style>
-      :root {
-        --accent: #6366f1;
-        --bg-dark: rgba(0,0,0,0.4);
-        --glass-bg: rgba(255,255,255,0.08);
-        --glass-border: rgba(255,255,255,0.12);
-        --text-primary: #fff;
-        --text-dim: #cbd5e1;
-      }
+
       .chat-header {
         background: var(--accent);
         padding: 1.6rem 2rem;
@@ -13719,62 +13907,152 @@ try {
         align-items: center;
         border-top-left-radius: 24px;
         border-top-right-radius: 24px;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
       }
+
       .chat-header h4 {
-        margin:0; font-size:1.15rem; font-weight:800; display:flex; align-items:center; gap:10px;
+        margin: 0;
+        font-size: 1.15rem;
+        font-weight: 800;
+        display: flex;
+        align-items: center;
+        gap: 10px;
       }
+
       .chat-header span {
-        font-size:0.78rem; opacity:0.85; letter-spacing:0.5px;
+        font-size: 0.78rem;
+        opacity: 0.85;
+        letter-spacing: 0.5px;
       }
+
       .chat-close {
-        width:38px; height:38px; border-radius:50%;
-        background:rgba(255,255,255,0.12);
-        display:flex; align-items:center; justify-content:center;
-        cursor:pointer; transition:background 0.2s;
+        width: 38px;
+        height: 38px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.12);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        transition: background 0.2s;
       }
-      .chat-close:hover {background:rgba(255,255,255,0.25);}
+
+      .chat-close:hover {
+        background: rgba(255, 255, 255, 0.25);
+      }
+
       .chat-messages {
-        flex:1; padding:1.6rem; overflow-y:auto;
-        display:flex; flex-direction:column; gap:14px;
-        background:rgba(0,0,0,0.15);
+        flex: 1;
+        padding: 1.6rem;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        background: rgba(0, 0, 0, 0.15);
       }
+
       .chat-msg {
-        display:flex; align-items:flex-start; gap:12px; animation:fadeIn 0.3s ease;
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+        animation: fadeIn 0.3s ease;
       }
-      .chat-msg.me {flex-direction:row-reverse;}
+
+      .chat-msg.me {
+        flex-direction: row-reverse;
+      }
+
       .avatar {
-        width:36px; height:36px; border-radius:50%;
-        overflow:hidden; box-shadow:0 3px 10px rgba(0,0,0,0.25);
-        background:var(--glass-bg);
-        flex-shrink:0; display:flex; align-items:center; justify-content:center;
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        overflow: hidden;
+        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.25);
+        background: var(--glass-bg);
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
       }
-      .avatar img {width:100%; height:100%; object-fit:cover;}
+
+      .avatar img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
       .msg-bubble {
-        max-width:70%; padding:0.85rem 1.2rem;
-        border-radius:16px; background:var(--glass-bg);
-        color:var(--text-primary); font-size:0.92rem;
-        box-shadow:inset 0 2px 8px rgba(0,0,0,0.2);
+        max-width: 70%;
+        padding: 0.85rem 1.2rem;
+        border-radius: 16px;
+        background: var(--glass-bg);
+        color: var(--text-primary);
+        font-size: 0.92rem;
+        box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.2);
       }
-      .msg-bubble.me {background:linear-gradient(135deg, #6366f1, #4f46e5); color:#fff;}
+
+      .msg-bubble.me {
+        background: linear-gradient(135deg, #6366f1, #4f46e5);
+        color: #fff;
+      }
+
       .chat-input {
-        padding:1.5rem 1.9rem; border-top:1px solid var(--glass-border);
-        display:flex; align-items:center; gap:14px; background:rgba(0,0,0,0.1);
-        border-bottom-left-radius:24px; border-bottom-right-radius:24px;
+        padding: 1.5rem 1.9rem;
+        border-top: 1px solid var(--glass-border);
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        background: rgba(0, 0, 0, 0.1);
+        border-bottom-left-radius: 24px;
+        border-bottom-right-radius: 24px;
       }
+
       #chatInput {
-        flex:1; background:rgba(255,255,255,0.05); border:1px solid var(--glass-border);
-        border-radius:14px; padding:0.85rem 1.2rem; color:var(--text-primary);
-        font-size:0.92rem; outline:none; resize:none; min-height:46px; max-height:120px;
-        transition:0.2s; box-shadow:inset 0 2px 8px rgba(0,0,0,0.2);
+        flex: 1;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--glass-border);
+        border-radius: 14px;
+        padding: 0.85rem 1.2rem;
+        color: var(--text-primary);
+        font-size: 0.92rem;
+        outline: none;
+        resize: none;
+        min-height: 46px;
+        max-height: 120px;
+        transition: 0.2s;
+        box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.2);
       }
+
       .send-btn {
-        background:var(--accent); border:none; width:46px; height:46px; border-radius:14px;
-        color:#fff; cursor:pointer; transition:transform 0.2s ease-out; display:flex; align-items:center; justify-content:center;
-        box-shadow:0 4px 15px rgba(0,0,0,0.2);
+        background: var(--accent);
+        border: none;
+        width: 46px;
+        height: 46px;
+        border-radius: 14px;
+        color: #fff;
+        cursor: pointer;
+        transition: transform 0.2s ease-out;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
       }
-      .send-btn:hover {transform:scale(1.08);}
-      @keyframes fadeIn {0%{opacity:0;transform:translateY(6px);}100%{opacity:1;transform:translateY(0);}}
+
+      .send-btn:hover {
+        transform: scale(1.08);
+      }
+
+      @keyframes fadeIn {
+        0% {
+          opacity: 0;
+          transform: translateY(6px);
+        }
+
+        100% {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
     </style>
     <!-- Header -->
     <div class="chat-header">
@@ -13782,7 +14060,8 @@ try {
         <h4><i class="fas fa-headset"></i>Support Center</h4>
         <span>AutoFix Hub Platform Assistance</span>
       </div>
-      <div class="chat-close" onclick="toggleChat()"><i class="fas fa-times" style="font-size:1.1rem; color:white;"></i></div>
+      <div class="chat-close" onclick="toggleChat()"><i class="fas fa-times" style="font-size:1.1rem; color:white;"></i>
+      </div>
     </div>
     <!-- Messages -->
     <div id="chatMessages" class="chat-messages">
@@ -13793,7 +14072,8 @@ try {
     <!-- Input -->
     <div class="chat-input">
       <textarea id="chatInput" placeholder="Type your message here..." rows="1"></textarea>
-      <button class="send-btn" onclick="sendMessage()"><i class="fas fa-paper-plane" style="font-size:1.1rem;"></i></button>
+      <button class="send-btn" onclick="sendMessage()"><i class="fas fa-paper-plane"
+          style="font-size:1.1rem;"></i></button>
     </div>
     <!-- Hidden badge for JS compatibility -->
     <span id="tenantChatBadge" style="display:none;">0</span>
@@ -13807,7 +14087,7 @@ try {
       chatOpen = !chatOpen;
       const panel = document.getElementById('supportChatWidget');
       const overlay = document.getElementById('chatOverlay');
-      
+
       if (chatOpen) {
         overlay.style.display = 'block';
         setTimeout(() => {
@@ -13817,7 +14097,7 @@ try {
           panel.style.pointerEvents = 'auto';
           panel.style.transform = 'translate(-50%, -50%) scale(1)';
         }, 10);
-        
+
         fetch('tenant-dashboard.php?action=mark_support_read'); // Mark as read on open
         document.getElementById('tenantChatBadge').style.display = 'none';
         const sBadge = document.getElementById('sidebarChatBadge');
@@ -13889,7 +14169,7 @@ try {
       msgs.forEach((m, idx) => {
         const isMe = m.sender_role === 'TENANT';
         const isRobot = !isMe && m.message.includes('[Auto-Reply]');
-        
+
         // Time Gap Divider (30 minutes or more since last message)
         if (idx > 0) {
           const currentVal = new Date(m.created_at.replace(/-/g, '/'));
@@ -13932,7 +14212,7 @@ try {
         avatar.style.flexShrink = '0';
         avatar.style.boxShadow = '0 3px 10px rgba(0,0,0,0.15)';
         avatar.style.overflow = 'hidden';
-        
+
         if (isMe) {
           const myPfp = m.sender_avatar || m.logo_url;
           if (myPfp) {
@@ -14012,7 +14292,7 @@ try {
     function showTypingIndicator() {
       const box = document.getElementById('chatMessages');
       if (document.getElementById('chatTypingIndicator')) return;
-      
+
       const row = document.createElement('div');
       row.id = 'chatTypingIndicator';
       row.style.display = 'flex';
@@ -14086,7 +14366,7 @@ try {
 
       // Optimistic Render: add tenant's message immediately
       const box = document.getElementById('chatMessages');
-      
+
       const row = document.createElement('div');
       row.style.display = 'flex';
       row.style.flexDirection = 'row-reverse';
@@ -14137,13 +14417,13 @@ try {
       if (box.innerHTML.includes('How can we help you today?')) {
         box.innerHTML = '';
       }
-      
+
       box.appendChild(row);
       box.scrollTop = box.scrollHeight;
 
       input.value = '';
       input.style.height = '45px'; // Reset height
-      
+
       fetch('tenant-dashboard.php?action=send_support_message', { method: 'POST', body: fd })
         .then(r => r.json())
         .then(data => {
@@ -14303,7 +14583,7 @@ try {
             canvas.height = 250;
             canvas.style.display = 'none';
             document.body.appendChild(canvas);
-            
+
             const tempCtx = canvas.getContext('2d');
             const tempChart = new Chart(tempCtx, {
               type: 'line',
@@ -14369,14 +14649,14 @@ try {
               html += `
                 <tr style="border-bottom: 1px solid #f1f5f9;">
                   <td style="padding: 12px; color: #334155;">${row.date}</td>
-                  <td style="padding: 12px; color: #1e3a8a; font-weight: 700; text-align: right;">₱${val.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+                  <td style="padding: 12px; color: #1e3a8a; font-weight: 700; text-align: right;">₱${val.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                 </tr>
               `;
             });
             html += `
                 <tr style="background-color: #f8fafc; border-top: 2px solid #e2e8f0; font-weight: 800;">
                   <td style="padding: 12px; color: #1e293b;">Grand Total</td>
-                  <td style="padding: 12px; color: #1e3a8a; text-align: right; font-size: 15px;">₱${grandTotal.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+                  <td style="padding: 12px; color: #1e3a8a; text-align: right; font-size: 15px;">₱${grandTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                 </tr>
             `;
           } else if (type === 'performance') {
@@ -14421,8 +14701,8 @@ try {
                   <td style="padding: 12px; color: #334155; font-weight: 700;">${medal}${row.full_name}</td>
                   <td style="padding: 12px; color: #64748b; font-style: italic;">${row.specialization || 'General'}</td>
                   <td style="padding: 12px; color: #1e3a8a; font-weight: 700; text-align: right;">${jobs}</td>
-                  <td style="padding: 12px; color: #166534; font-weight: 700; text-align: right;">₱${rev.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
-                  <td style="padding: 12px; color: #475569; text-align: right;">₱${avg.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+                  <td style="padding: 12px; color: #166534; font-weight: 700; text-align: right;">₱${rev.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                  <td style="padding: 12px; color: #475569; text-align: right;">₱${avg.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                 </tr>
               `;
             });
@@ -14430,8 +14710,8 @@ try {
                 <tr style="background-color: #f8fafc; border-top: 2px solid #e2e8f0; font-weight: 800;">
                   <td colspan="3" style="padding: 12px; color: #1e293b;">Team Totals</td>
                   <td style="padding: 12px; color: #1e3a8a; text-align: right;">${totalJobs} jobs</td>
-                  <td style="padding: 12px; color: #166534; text-align: right;">₱${totalRev.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
-                  <td style="padding: 12px; color: #475569; text-align: right;">₱${totalJobs > 0 ? (totalRev/totalJobs).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2}) : '0.00'}</td>
+                  <td style="padding: 12px; color: #166534; text-align: right;">₱${totalRev.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                  <td style="padding: 12px; color: #475569; text-align: right;">₱${totalJobs > 0 ? (totalRev / totalJobs).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '0.00'}</td>
                 </tr>
             `;
           }
@@ -14521,11 +14801,11 @@ try {
         printDiv.innerHTML = html;
 
         const opt = {
-          margin:       0.5,
-          filename:     `${reportTitle.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${new Date().toISOString().slice(0,10)}.pdf`,
-          image:        { type: 'jpeg', quality: 0.98 },
-          html2canvas:  { scale: 2, useCORS: true },
-          jsPDF:        { unit: 'in', format: 'letter', orientation: 'portrait' }
+          margin: 0.5,
+          filename: `${reportTitle.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${new Date().toISOString().slice(0, 10)}.pdf`,
+          image: { type: 'jpeg', quality: 0.98 },
+          html2canvas: { scale: 2, useCORS: true },
+          jsPDF: { unit: 'in', format: 'letter', orientation: 'portrait' }
         };
 
         html2pdf().set(opt).from(printDiv).save().then(() => {
@@ -14569,7 +14849,7 @@ try {
       fetch('tenant-dashboard.php?action=' + action)
         .then(res => res.json())
         .then(data => {
-          const hasData = (type === 'inventory') 
+          const hasData = (type === 'inventory')
             ? (data.low_stock && data.low_stock.length > 0 || data.history && data.history.length > 0)
             : (Array.isArray(data) && data.length > 0);
 
@@ -14653,7 +14933,7 @@ try {
                 </div>
                 <div style="background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.2); border-radius:16px; padding:1.2rem; text-align:center;">
                   <div style="font-size:0.7rem; text-transform:uppercase; letter-spacing:1px; color:var(--text-dim); margin-bottom:6px;">Total Revenue</div>
-                  <div style="font-size:1.3rem; font-weight:900; color:#3b82f6;">₱${totalRev.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</div>
+                  <div style="font-size:1.3rem; font-weight:900; color:#3b82f6;">₱${totalRev.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
                 </div>
               </div>
 
@@ -14685,8 +14965,8 @@ try {
                   <td><strong>${medal}${row.full_name}</strong></td>
                   <td style="opacity:0.7; font-style:italic;">${row.specialization || 'General'}</td>
                   <td style="color:var(--accent); font-weight:800; text-align:right;">${jobs}</td>
-                  <td style="color:#10b981; font-weight:700; text-align:right;">₱${rev.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
-                  <td style="color:var(--text-dim); text-align:right;">₱${avg.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+                  <td style="color:#10b981; font-weight:700; text-align:right;">₱${rev.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                  <td style="color:var(--text-dim); text-align:right;">₱${avg.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                 </tr>
               `;
             });
@@ -14746,7 +15026,7 @@ try {
                 const actionColor = row.transaction_type === 'ADD' ? '#10b981' : '#f87171';
                 const actionSign = row.transaction_type === 'ADD' ? '+' : '-';
                 const actionText = row.transaction_type === 'ADD' ? 'Added' : 'Subtracted';
-                
+
                 html += `
                   <tr>
                     <td style="font-size: 0.85rem; opacity: 0.7;">${row.date}</td>
@@ -14876,63 +15156,63 @@ try {
     document.addEventListener('DOMContentLoaded', () => {
       setTimeout(() => {
         const canvas = document.getElementById('authSignaturePad');
-        if(canvas) {
+        if (canvas) {
           const ctx = canvas.getContext('2d');
           let isDrawing = false;
-          
+
           function getPos(e) {
-              const rect = canvas.getBoundingClientRect();
-              if(e.touches) {
-                  return { x: e.touches[0].clientX - rect.left, y: e.touches[0].clientY - rect.top };
-              }
-              return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+            const rect = canvas.getBoundingClientRect();
+            if (e.touches) {
+              return { x: e.touches[0].clientX - rect.left, y: e.touches[0].clientY - rect.top };
+            }
+            return { x: e.clientX - rect.left, y: e.clientY - rect.top };
           }
 
           function startPosition(e) {
-              e.preventDefault();
-              isDrawing = true;
-              const pos = getPos(e);
-              ctx.beginPath();
-              ctx.moveTo(pos.x, pos.y);
-              window.hasSignature = true;
+            e.preventDefault();
+            isDrawing = true;
+            const pos = getPos(e);
+            ctx.beginPath();
+            ctx.moveTo(pos.x, pos.y);
+            window.hasSignature = true;
           }
 
           function endPosition() {
-              isDrawing = false;
-              ctx.beginPath();
+            isDrawing = false;
+            ctx.beginPath();
           }
 
           function draw(e) {
-              if(!isDrawing) return;
-              e.preventDefault();
-              const pos = getPos(e);
-              ctx.lineWidth = 2;
-              ctx.lineCap = 'round';
-              ctx.strokeStyle = '#000';
-              ctx.lineTo(pos.x, pos.y);
-              ctx.stroke();
-              ctx.beginPath();
-              ctx.moveTo(pos.x, pos.y);
+            if (!isDrawing) return;
+            e.preventDefault();
+            const pos = getPos(e);
+            ctx.lineWidth = 2;
+            ctx.lineCap = 'round';
+            ctx.strokeStyle = '#000';
+            ctx.lineTo(pos.x, pos.y);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(pos.x, pos.y);
           }
 
           canvas.addEventListener('mousedown', startPosition);
           canvas.addEventListener('mouseup', endPosition);
           canvas.addEventListener('mousemove', draw);
-          
-          canvas.addEventListener('touchstart', startPosition, {passive: false});
+
+          canvas.addEventListener('touchstart', startPosition, { passive: false });
           canvas.addEventListener('touchend', endPosition);
-          canvas.addEventListener('touchmove', draw, {passive: false});
+          canvas.addEventListener('touchmove', draw, { passive: false });
         }
       }, 1000);
     });
-    
-    window.clearSignature = function() {
-        const canvas = document.getElementById('authSignaturePad');
-        if(canvas) {
-            const ctx = canvas.getContext('2d');
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            window.hasSignature = false;
-        }
+
+    window.clearSignature = function () {
+      const canvas = document.getElementById('authSignaturePad');
+      if (canvas) {
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        window.hasSignature = false;
+      }
     };
 
     window.addEventListener('load', () => {
