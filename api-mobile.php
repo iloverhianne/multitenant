@@ -396,7 +396,7 @@ try {
         $refId = $_POST['ref_id'] ?? null; // Usually the appointment_id
 
         // 1. Insert into payments table
-        $stmt = $db->prepare("INSERT INTO payments (tenant_id, customer_id, amount, payment_method, payment_type, status, ref_id, created_at) VALUES (?, ?, ?, ?, ?, 'SUCCESS', ?, NOW())");
+        $stmt = $db->prepare("INSERT INTO payments (tenant_id, customer_id, amount, payment_method, payment_type, status, appointment_id, created_at) VALUES (?, ?, ?, ?, ?, 'SUCCESS', ?, NOW())");
         $stmt->execute([$tid, $cid, $amt, $method, $type, $refId]);
 
         // 2. Update Appointment Status if refId is provided
