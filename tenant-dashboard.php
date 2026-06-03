@@ -3,6 +3,7 @@
 ob_start();
 date_default_timezone_set('Asia/Manila');
 require_once 'db-config.php';
+require_once 'mailer-service.php';
 
 // Force No-Cache
 header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
@@ -196,6 +197,12 @@ try {
       $db->prepare("INSERT INTO tenant_subscriptions (tenant_id, plan_id, billing_cycle, start_date, end_date, status) VALUES (?, 2, 'monthly', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 30 DAY), 'ACTIVE')")
         ->execute([$tenant_id]);
     }
+    
+    // Auto-heal new columns
+    try { $db->exec("ALTER TABLE tenants ADD COLUMN gcash_name VARCHAR(100) NULL, ADD COLUMN gcash_number VARCHAR(50) NULL"); } catch (Exception $e) {}
+    try { $db->exec("ALTER TABLE payments ADD COLUMN proof_image VARCHAR(255) NULL"); } catch (Exception $e) {}
+    try { $db->exec("ALTER TABLE repair_jobs ADD COLUMN payment_token VARCHAR(64) NULL"); } catch (Exception $e) {}
+    
   } catch (Exception $e) { /* Silently heal */
   }
 
@@ -1138,6 +1145,12 @@ try {
             $db->exec("ALTER TABLE repair_parts MODIFY item_id INT NULL");
           } catch (Exception $e) {
           }
+          try {
+            $db->exec("ALTER TABLE repair_parts ADD COLUMN approval_status VARCHAR(20) DEFAULT 'APPROVED'");
+            $db->exec("ALTER TABLE repair_parts ADD COLUMN approval_token VARCHAR(64) NULL");
+            $db->exec("ALTER TABLE repair_parts ADD COLUMN customer_signature LONGTEXT NULL");
+          } catch (Exception $e) {
+          }
 
           $db->exec("CREATE TABLE IF NOT EXISTS repair_jobs (
       job_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -1516,7 +1529,9 @@ try {
                       j.customer_id,
                       COALESCE(c.full_name, j.walkin_name, 'Walk-in') AS customer_name,
                       (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE ((j.appointment_id > 0 AND appointment_id = j.appointment_id) OR (j.job_id > 0 AND job_id = j.job_id)) AND status IN ('SUCCESS', 'COMPLETED')) AS paid_amount,
-                      (j.total_amount - (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE ((j.appointment_id > 0 AND appointment_id = j.appointment_id) OR (j.job_id > 0 AND job_id = j.job_id)) AND status IN ('SUCCESS', 'COMPLETED'))) AS balance_amount
+                      (j.total_amount - (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE ((j.appointment_id > 0 AND appointment_id = j.appointment_id) OR (j.job_id > 0 AND job_id = j.job_id)) AND status IN ('SUCCESS', 'COMPLETED'))) AS balance_amount,
+                      (SELECT proof_image FROM payments WHERE ((j.appointment_id > 0 AND appointment_id = j.appointment_id) OR (j.job_id > 0 AND job_id = j.job_id)) AND status = 'PENDING' ORDER BY created_at DESC LIMIT 1) AS pending_payment_proof,
+                      (SELECT payment_id FROM payments WHERE ((j.appointment_id > 0 AND appointment_id = j.appointment_id) OR (j.job_id > 0 AND job_id = j.job_id)) AND status = 'PENDING' ORDER BY created_at DESC LIMIT 1) AS pending_payment_id
                     FROM repair_jobs j
                     LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id
                     LEFT JOIN vehicles v2 ON v2.vehicle_id = (
@@ -1807,17 +1822,21 @@ try {
           $dateStarted = 'N/A';
           $dateFinished = 'N/A';
 
-          if (!empty($j['started_at'])) {
-            $start = strtotime($j['started_at']);
-            $dateStarted = date('M d, Y h:i A', $start);
+          $start_time = !empty($j['started_at']) ? strtotime($j['started_at']) : strtotime($j['created_at']);
+          $dateStarted = date('M d, Y h:i A', $start_time);
 
-            $end = !empty($j['completed_at']) ? strtotime($j['completed_at']) : (in_array($j['status'], ['COMPLETED', 'SETTLED']) && !empty($j['updated_at']) ? strtotime($j['updated_at']) : 0);
-            if ($end > 0) {
-              $dateFinished = date('M d, Y h:i A', $end);
-            }
+          $end_time = 0;
+          if (!empty($j['completed_at'])) {
+            $end_time = strtotime($j['completed_at']);
+          } elseif (in_array($j['status'], ['COMPLETED', 'SETTLED'])) {
+            $end_time = !empty($j['updated_at']) ? strtotime($j['updated_at']) : time();
+          }
 
-            if ($start && $end && $end >= $start) {
-              $diff = $end - $start;
+          if ($end_time > 0) {
+            $dateFinished = date('M d, Y h:i A', $end_time);
+            
+            if ($end_time >= $start_time) {
+              $diff = $end_time - $start_time;
               $hours = floor($diff / 3600);
               $minutes = floor(($diff % 3600) / 60);
               $duration = $hours > 0 ? "{$hours}h {$minutes}m" : "{$minutes}m";
@@ -1896,6 +1915,7 @@ try {
                   <p><strong>Vehicle:</strong> " . trim(($j['make'] ?? '') . ' ' . ($j['model'] ?? '')) . "</p>
                   <p><strong>Mechanic:</strong> {$j['mechanic_name']}</p>
                   <p><strong>Duration:</strong> {$duration}</p>
+                  <p><strong>Mode of Payment:</strong> " . ($final_payment['payment_method'] ?? 'N/A') . "</p>
                   <div style='margin:1rem 0; border-top:1px solid #eee; border-bottom:1px solid #eee; padding:10px 0;'>
                     $breakdownHtml
                   </div>
@@ -2635,7 +2655,7 @@ try {
 
           // Sync Job Total for accuracy
           try {
-            $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
+            $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id AND (approval_status = 'APPROVED' OR approval_status IS NULL)), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
           } catch (Exception $ex) {
           }
 
@@ -2674,7 +2694,7 @@ try {
           $db->commit();
 
           // Sync Job Total
-          $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
+          $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id AND (approval_status = 'APPROVED' OR approval_status IS NULL)), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
 
           echo json_encode(['status' => 'success', 'message' => 'Service added to job.']);
         } catch (Exception $e) {
@@ -2703,7 +2723,7 @@ try {
 
           // Sync Job Total for accuracy
           try {
-            $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
+            $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id AND (approval_status = 'APPROVED' OR approval_status IS NULL)), 0)) WHERE j.job_id = ? AND j.tenant_id = ? AND j.status != 'SETTLED'")->execute([$jid, $tenant_id]);
           } catch (Exception $ex) {
           }
 
@@ -2711,6 +2731,101 @@ try {
         } catch (Exception $e) {
           if ($db->inTransaction())
             $db->rollBack();
+          echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+        }
+        exit;
+      }
+
+      if ($_GET['action'] === 'add_pending_job_items' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        try {
+          $jid = intval($_POST['job_id'] ?? 0);
+          $items = json_decode($_POST['items'] ?? '[]', true);
+          if (empty($items)) throw new Exception("No items to add.");
+
+          // Generate Token
+          $token = bin2hex(random_bytes(32));
+          
+          $db->beginTransaction();
+
+          // Fetch Job & Customer info for email
+          $jStmt = $db->prepare("SELECT j.*, t.shop_name, c.email, c.full_name, v.plate_no 
+                                FROM repair_jobs j 
+                                LEFT JOIN tenants t ON j.tenant_id = t.tenant_id
+                                LEFT JOIN customers c ON j.customer_id = c.customer_id
+                                LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id
+                                WHERE j.job_id = ? AND j.tenant_id = ?");
+          $jStmt->execute([$jid, $tenant_id]);
+          $job = $jStmt->fetch(PDO::FETCH_ASSOC);
+
+          if (!$job) throw new Exception("Job not found.");
+          if (empty($job['email'])) throw new Exception("Customer has no email address on record. Cannot send approval link.");
+
+          $addedItemsHtml = "<ul>";
+
+          $pStmt = $db->prepare("INSERT INTO repair_parts (job_id, tenant_id, item_id, service_id, quantity, unit_price, total_price, approval_status, approval_token) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)");
+          
+          foreach ($items as $item) {
+             $qty = intval($item['qty'] ?? 1);
+             if ($item['type'] === 'part') {
+                $iid = intval($item['id']);
+                $iStmt = $db->prepare("SELECT item_name, price, quantity as stock FROM inventory WHERE item_id = ? AND tenant_id = ?");
+                $iStmt->execute([$iid, $tenant_id]);
+                $inv = $iStmt->fetch(PDO::FETCH_ASSOC);
+                if (!$inv) throw new Exception("Invalid part.");
+                if ($inv['stock'] < $qty) throw new Exception("Insufficient stock for " . $inv['item_name']);
+                
+                $total = $inv['price'] * $qty;
+                $pStmt->execute([$jid, $tenant_id, $iid, null, $qty, $inv['price'], $total, $token]);
+                
+                $addedItemsHtml .= "<li>{$qty}x {$inv['item_name']} - ₱" . number_format($total, 2) . "</li>";
+             } else if ($item['type'] === 'service') {
+                $sid = intval($item['id']);
+                $sStmt = $db->prepare("SELECT service_name, price FROM services WHERE service_id = ? AND tenant_id = ?");
+                $sStmt->execute([$sid, $tenant_id]);
+                $srv = $sStmt->fetch(PDO::FETCH_ASSOC);
+                if (!$srv) throw new Exception("Invalid service.");
+                
+                $total = $srv['price'] * $qty;
+                $pStmt->execute([$jid, $tenant_id, null, $sid, $qty, $srv['price'], $total, $token]);
+                
+                $addedItemsHtml .= "<li>{$qty}x {$srv['service_name']} (Service) - ₱" . number_format($total, 2) . "</li>";
+             }
+          }
+          $addedItemsHtml .= "</ul>";
+
+          $db->commit();
+
+          // Send Email
+          require_once 'mailer-service.php';
+          $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? "https://" : "http://";
+          $domain = $_SERVER['HTTP_HOST'];
+          $approvalLink = $protocol . $domain . "/customer-approval.php?token=" . $token;
+
+          $subject = "Action Required: Approval for Additional Parts/Services";
+          $html = "
+          <div style='font-family: sans-serif; padding: 20px; color: #333;'>
+            <h2>Hello {$job['full_name']},</h2>
+            <p>Your mechanic at <strong>{$job['shop_name']}</strong> has requested additional parts and services for your vehicle ({$job['plate_no']}).</p>
+            <h3>Requested Additions:</h3>
+            {$addedItemsHtml}
+            <p>Please review and approve these additions so we can proceed with the repairs.</p>
+            <br>
+            <a href='{$approvalLink}&action=approve' style='background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block; margin-right: 10px;'>Approve Items</a>
+            <a href='{$approvalLink}&action=deny' style='background-color: #ef4444; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;'>Reject Items</a>
+            <br><br>
+            <p>If the buttons don't work, copy and paste this link into your browser:<br>
+            <a href='{$approvalLink}'>{$approvalLink}</a></p>
+            <p>Thank you,<br>AutoFix Hub Team</p>
+          </div>";
+
+          $mailSent = Mailer::sendHTML($job['email'], $subject, $html);
+          if (!$mailSent) {
+             throw new Exception("Items pending, but failed to send email. Please ensure the email is valid.");
+          }
+
+          echo json_encode(['status' => 'success', 'message' => 'Approval email sent successfully.']);
+        } catch (Exception $e) {
+          if ($db->inTransaction()) $db->rollBack();
           echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
         }
         exit;
@@ -2890,7 +3005,9 @@ try {
             'opening_hours',
             'address',
             'facebook_url',
-            'instagram_url'
+            'instagram_url',
+            'gcash_name',
+            'gcash_number'
           ];
 
           if (!in_array($field, $allowedFields)) {
@@ -3020,11 +3137,15 @@ try {
             }
           }
 
+          $gcashName = trim($_POST['gcash_name'] ?? '');
+          $gcashNumber = trim($_POST['gcash_number'] ?? '');
+
           $stmt = $db->prepare("UPDATE tenants SET 
             shop_name = ?, logo_url = ?, primary_color = ?, secondary_color = ?, 
             phone = ?, description = ?, address = ?, ui_style = ?, border_radius = ?,
             hero_title = ?, hero_subtitle = ?, banner_url = ?, about_text = ?, 
-            opening_hours = ?, facebook_url = ?, instagram_url = ?, staff_announcement = ?
+            opening_hours = ?, facebook_url = ?, instagram_url = ?, staff_announcement = ?,
+            gcash_name = ?, gcash_number = ?
             WHERE tenant_id = ?");
           $stmt->execute([
             $shopName,
@@ -3044,6 +3165,8 @@ try {
             $fb,
             $ig,
             $staffAnn,
+            $gcashName,
+            $gcashNumber,
             $tenant_id
           ]);
 
@@ -3364,7 +3487,7 @@ try {
             }
 
             // Update total amount of the job to include these new parts/services
-            $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id), 0)) WHERE j.job_id = ? AND j.tenant_id = ?")->execute([$newJobId, $tenant_id]);
+            $db->prepare("UPDATE repair_jobs j SET total_amount = (COALESCE((SELECT price FROM services WHERE service_id = j.service_id), 0) + COALESCE((SELECT SUM(total_price) FROM repair_parts WHERE job_id = j.job_id AND (approval_status = 'APPROVED' OR approval_status IS NULL)), 0)) WHERE j.job_id = ? AND j.tenant_id = ?")->execute([$newJobId, $tenant_id]);
           }
 
           // 4. Initial Timeline
@@ -3685,6 +3808,62 @@ try {
             }
           }
 
+          // Trigger email if job is COMPLETED
+          if ($newStatus === 'COMPLETED') {
+              $tokenQuery = $db->prepare("SELECT payment_token FROM repair_jobs WHERE job_id = ?");
+              $tokenQuery->execute([$jobId]);
+              $paymentToken = $tokenQuery->fetchColumn();
+              
+              if (!$paymentToken) {
+                  $paymentToken = bin2hex(random_bytes(16));
+                  $db->prepare("UPDATE repair_jobs SET payment_token = ? WHERE job_id = ?")->execute([$paymentToken, $jobId]);
+              }
+              
+              $stmtJob = $db->prepare("SELECT j.*, c.email, c.full_name, v.plate_no, t.shop_name 
+                                       FROM repair_jobs j
+                                       LEFT JOIN customers c ON j.customer_id = c.customer_id
+                                       LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id
+                                       LEFT JOIN tenants t ON j.tenant_id = t.tenant_id
+                                       WHERE j.job_id = ?");
+              $stmtJob->execute([$jobId]);
+              $jobDetails = $stmtJob->fetch(PDO::FETCH_ASSOC);
+              
+              if ($jobDetails && !empty($jobDetails['email'])) {
+                  $paidStmt = $db->prepare("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE job_id = ? AND status IN ('SUCCESS', 'COMPLETED')");
+                  $paidStmt->execute([$jobId]);
+                  $paidAmount = floatval($paidStmt->fetchColumn());
+                  $balance = max(0, floatval($jobDetails['total_amount']) - $paidAmount);
+                  
+                  $shopName = htmlspecialchars($jobDetails['shop_name']);
+                  $plateNo = htmlspecialchars($jobDetails['plate_no'] ?: $jobDetails['walkin_plate'] ?: 'N/A');
+                  $customerName = htmlspecialchars($jobDetails['full_name']);
+                  
+                  $paymentLink = "http://multitenant.infinityfree.me/customer-payment.php?token=" . $paymentToken;
+                  $subject = "Your Vehicle is Ready for Pickup - " . $shopName;
+                  $html = "
+                  <div style='font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden;'>
+                      <div style='background-color: #10b981; padding: 20px; text-align: center; color: white;'>
+                          <h2 style='margin: 0;'>Service Completed!</h2>
+                      </div>
+                      <div style='padding: 20px;'>
+                          <p>Hi <strong>{$customerName}</strong>,</p>
+                          <p>Great news! The service for your vehicle (<strong>{$plateNo}</strong>) has been completed by our mechanics at <strong>{$shopName}</strong> and is now ready for pickup.</p>
+                          <div style='background-color: #f3f4f6; padding: 15px; border-radius: 6px; margin: 20px 0;'>
+                              <h3 style='margin-top: 0; color: #374151;'>Payment Details</h3>
+                              <p style='margin: 5px 0;'><strong>Total Balance:</strong> PHP " . number_format($balance, 2) . "</p>
+                          </div>
+                          <p>You can pay your balance directly at the shop when you pick up your vehicle. Or, if you prefer, you can pay online (e.g., via GCash) and upload your receipt to save time.</p>
+                          <div style='text-align: center; margin: 30px 0;'>
+                              <a href='{$paymentLink}' style='background-color: #4f46e5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;'>Pay Online (Optional)</a>
+                          </div>
+                          <p>Thank you for choosing {$shopName}!</p>
+                      </div>
+                  </div>";
+                  
+                  Mailer::sendHTML($jobDetails['email'], $subject, $html);
+              }
+          }
+
           echo json_encode(['status' => 'success', 'message' => "Job status and resources updated."]);
         } catch (Exception $e) {
           echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
@@ -3725,8 +3904,15 @@ try {
             $amountTendered = floatval($_POST['amount_tendered']);
           }
 
-          $stmt = $db->prepare("INSERT INTO payments (tenant_id, customer_id, walkin_name, job_id, appointment_id, amount, amount_tendered, payment_method, reference_no, status, payment_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', NOW())");
-          $stmt->execute([$tenant_id, $finalCustomerId, $finalWalkinName, $jobId, $apptId, $amount, $amountTendered, $method, $ref]);
+          $pendingPaymentId = !empty($_POST['pending_payment_id']) ? intval($_POST['pending_payment_id']) : null;
+
+          if ($pendingPaymentId) {
+            $stmt = $db->prepare("UPDATE payments SET status = 'COMPLETED', payment_method = ?, reference_no = ?, amount = ? WHERE payment_id = ? AND tenant_id = ?");
+            $stmt->execute([$method, $ref, $amount, $pendingPaymentId, $tenant_id]);
+          } else {
+            $stmt = $db->prepare("INSERT INTO payments (tenant_id, customer_id, walkin_name, job_id, appointment_id, amount, amount_tendered, payment_method, reference_no, status, payment_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', NOW())");
+            $stmt->execute([$tenant_id, $finalCustomerId, $finalWalkinName, $jobId, $apptId, $amount, $amountTendered, $method, $ref]);
+          }
 
           // Handle Inventory & Official Parts logging
           $fullDataJson = $_POST['parts_json'] ?? '{"parts":[], "services":[]}';
@@ -4402,10 +4588,39 @@ try {
       }
     };
 
-    window.openRecordPaymentModal = function (jobId, customerId, customerName, amount) {
+    window.openRecordPaymentModal = function (jobId, customerId, customerName, amount, pendingProof = '', pendingId = '') {
       console.log("[PAYMENT] Opening Modal. Job:", jobId, "Base Amount:", amount);
       const form = document.getElementById('addPaymentForm');
       if (form) form.reset();
+
+      const alertBox = document.getElementById('pendingPaymentAlert');
+      const pendingInput = document.getElementById('pay_pending_payment_id');
+      const btnViewProof = document.getElementById('btnViewProof');
+      const submitBtn = form ? form.querySelector('button[type="submit"]') : null;
+
+      if (pendingId) {
+        if (alertBox) alertBox.style.display = 'block';
+        if (pendingInput) pendingInput.value = pendingId;
+        if (submitBtn) {
+            submitBtn.innerText = 'Approve Payment';
+            submitBtn.style.background = '#eab308';
+            submitBtn.style.color = '#000';
+        }
+        if (btnViewProof) {
+            btnViewProof.onclick = () => {
+                document.getElementById('proofViewerImage').src = 'uploads/' + pendingProof;
+                document.getElementById('proofViewerModal').style.display = 'flex';
+            };
+        }
+      } else {
+        if (alertBox) alertBox.style.display = 'none';
+        if (pendingInput) pendingInput.value = '';
+        if (submitBtn) {
+            submitBtn.innerText = 'Complete Payment';
+            submitBtn.style.background = 'linear-gradient(135deg,#6366f1,#8b5cf6)';
+            submitBtn.style.color = 'white';
+        }
+      }
 
       window.basePaymentAmount = parseFloat(amount || 0);
       const jidInput = document.getElementById('pay_job_id');
@@ -5127,18 +5342,42 @@ try {
           list.innerHTML = primaryHtml + data.map(p => {
             const itemTotal = parseFloat(p.total_price) || 0;
             const itemUnit = parseFloat(p.unit_price) || 0;
-            total += itemTotal;
-            return `<div style="display:flex; justify-content:space-between; align-items:center; background:var(--input-bg); padding:10px 15px; border-radius:12px; border:1px solid var(--glass-border); margin-bottom:8px;">
+            
+            let statusBadge = '';
+            let isStrikethrough = false;
+            let amountColor = 'var(--accent)';
+            
+            if (p.approval_status === 'PENDING') {
+               statusBadge = '<span style="background:var(--warning); color:white; padding:2px 6px; border-radius:4px; font-size:0.6rem; font-weight:800; margin-left:8px;">PENDING</span>';
+            } else if (p.approval_status === 'DENIED') {
+               statusBadge = '<span style="background:var(--danger); color:white; padding:2px 6px; border-radius:4px; font-size:0.6rem; font-weight:800; margin-left:8px;">DENIED</span>';
+               isStrikethrough = true;
+               amountColor = 'var(--text-dim)';
+            } else {
+               if (p.customer_signature && p.customer_signature.trim() !== '') {
+                   statusBadge = `<span style="background:var(--success); color:white; padding:2px 6px; border-radius:4px; font-size:0.6rem; font-weight:800; margin-left:8px; cursor:pointer;" onclick="window.viewSignature('${p.customer_signature}')" title="Click to view signature"><i class="fas fa-signature"></i> SIGNED</span>`;
+               }
+               total += itemTotal;
+            }
+            
+            return `<div style="display:flex; justify-content:space-between; align-items:center; background:var(--input-bg); padding:10px 15px; border-radius:12px; border:1px solid var(--glass-border); margin-bottom:8px; opacity:${isStrikethrough ? '0.6' : '1'};">
                       <div style="flex:1;">
-                        <div style="font-weight:700; font-size:0.85rem; color:var(--text-main);">${p.item_name}</div>
+                        <div style="font-weight:700; font-size:0.85rem; color:var(--text-main); text-decoration:${isStrikethrough ? 'line-through' : 'none'};">${p.item_name} ${statusBadge}</div>
                         <div style="font-size:0.7rem; color:var(--text-dim);">${p.service_id ? 'Labor / Service' : `${p.quantity} units @ ₱${itemUnit.toLocaleString()}`}</div>
                       </div>
                       <div style="display:flex; align-items:center; gap:12px;">
-                        <div style="font-weight:800; color:var(--accent); font-size:0.9rem;">₱${itemTotal.toLocaleString()}</div>
+                        <div style="font-weight:800; color:${amountColor}; font-size:0.9rem; text-decoration:${isStrikethrough ? 'line-through' : 'none'};">₱${itemTotal.toLocaleString()}</div>
                         <i class="fas fa-times-circle" onclick="window.removePartFromJob(${p.rp_id}, ${jid})" style="color:var(--danger); cursor:pointer;"></i>
                       </div>
                     </div>`;
           }).join('');
+          
+          if (!window.viewSignature) {
+            window.viewSignature = function(dataUrl) {
+                const win = window.open();
+                win.document.write('<title>Customer Signature</title><body style="margin:0;display:flex;justify-content:center;align-items:center;background:#f3f4f6;"><img src="' + dataUrl + '" style="max-width:100%; border: 1px solid #ccc; padding: 20px; background: white; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);" /></body>');
+            };
+          }
           if (bill) bill.innerText = '₱' + total.toLocaleString(undefined, { minimumFractionDigits: 2 });
           const overall = document.getElementById('totalOverallBill');
           if (overall) {
@@ -5156,6 +5395,103 @@ try {
             }
             overall.innerHTML = text;
           }
+        });
+    };
+
+    window.pendingJobItems = [];
+
+    window.queuePendingItem = function(type) {
+      if (type === 'part') {
+        const iidEl = document.getElementById('selectedPartId');
+        const qtyEl = document.getElementById('partQty');
+        const inputEl = document.getElementById('partComboboxInput');
+        if (!iidEl || !qtyEl || !iidEl.value || !qtyEl.value) return showToast("Please select a part and quantity", "error");
+        
+        window.pendingJobItems.push({
+          type: 'part',
+          id: iidEl.value,
+          qty: qtyEl.value,
+          name: inputEl.value
+        });
+        iidEl.value = '';
+        inputEl.value = '';
+        qtyEl.value = '1';
+      } else if (type === 'service') {
+        const sidEl = document.getElementById('selectedServiceId');
+        const inputEl = document.getElementById('serviceComboboxInput');
+        if (!sidEl || !sidEl.value) return showToast("Please select a service", "error");
+        
+        window.pendingJobItems.push({
+          type: 'service',
+          id: sidEl.value,
+          qty: 1,
+          name: inputEl.value
+        });
+        sidEl.value = '';
+        inputEl.value = '';
+      }
+      window.renderPendingItems();
+    };
+
+    window.renderPendingItems = function() {
+      const container = document.getElementById('pendingAdditionsContainer');
+      const list = document.getElementById('pendingAdditionsList');
+      if (window.pendingJobItems.length === 0) {
+        container.style.display = 'none';
+        list.innerHTML = '';
+        return;
+      }
+      container.style.display = 'block';
+      list.innerHTML = window.pendingJobItems.map((item, idx) => `
+        <div style="display:flex; justify-content:space-between; align-items:center; background:rgba(0,0,0,0.2); padding:8px 12px; border-radius:8px; margin-bottom:5px;">
+          <span style="color:white; font-size:0.85rem;">${item.qty}x ${item.name}</span>
+          <button type="button" onclick="window.removePendingItem(${idx})" style="background:none; border:none; color:var(--danger); cursor:pointer;"><i class="fas fa-times"></i></button>
+        </div>
+      `).join('');
+    };
+
+    window.removePendingItem = function(idx) {
+      window.pendingJobItems.splice(idx, 1);
+      window.renderPendingItems();
+    };
+
+    window.sendEmailConfirmation = function() {
+      const jidEl = document.getElementById('status_job_id');
+      if (!jidEl || !jidEl.value) return;
+      if (window.pendingJobItems.length === 0) return showToast("No items queued for approval.", "error");
+      
+      const btn = document.querySelector('#pendingAdditionsContainer button');
+      if (btn) {
+         btn.disabled = true;
+         btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Sending...';
+      }
+      
+      const fd = new FormData();
+      fd.append('job_id', jidEl.value);
+      fd.append('items', JSON.stringify(window.pendingJobItems));
+      
+      showToast("Sending email...", "info");
+      
+      fetch('tenant-dashboard.php?action=add_pending_job_items', { method: 'POST', body: fd })
+        .then(r => r.json()).then(data => {
+          if (btn) {
+             btn.disabled = false;
+             btn.innerHTML = '<i class="fas fa-paper-plane"></i> Send Email Confirmation';
+          }
+          if (data.status === 'success') {
+            showToast(data.message, "success");
+            window.pendingJobItems = [];
+            window.renderPendingItems();
+            window.refreshJobPartsList(jidEl.value);
+          } else {
+            alert(data.message);
+          }
+        }).catch(err => {
+          if (btn) {
+             btn.disabled = false;
+             btn.innerHTML = '<i class="fas fa-paper-plane"></i> Send Email Confirmation';
+          }
+          alert("Failed to send email. Ensure the customer has a valid email.");
         });
     };
 
@@ -5817,8 +6153,9 @@ try {
                 <td><small>${p.reference_no || p.ref_id || '---'}</small> (${p.payment_method || p.payment_type || 'N/A'})</td>
                 <td>₱${parseFloat(p.amount || 0).toLocaleString()}</td>
                 <td>${new Date(p.payment_date).toLocaleDateString()}</td>
-                <td><span class="badge badge-active">${p.status}</span></td>
+                <td><span class="badge ${p.status === 'PENDING' ? 'badge-warning' : 'badge-active'}">${p.status}</span></td>
                 <td>
+                  ${p.status === 'PENDING' && p.proof_image ? `<button class="btn-action" style="padding:4px 10px; font-size:0.75rem;" onclick="window.viewPaymentReceipt(${p.payment_id}, '${p.proof_image}')"><i class="fas fa-search"></i> Verify</button>` : ''}
                   ${p.job_id ? `<button class="btn-outline" style="padding:4px 10px; font-size:0.75rem;" onclick="window.viewJobReceipt(${p.job_id})"><i class="fas fa-file-invoice"></i> Receipt</button>` : `<span style="color:#666; font-size:0.75rem;">N/A</span>`}
                 </td>
               </tr>
@@ -9985,6 +10322,35 @@ try {
               </button>
             </div>
 
+            <div style="margin-top: 2rem; border-top: 1px solid var(--glass-border); padding-top: 1.5rem;">
+              <h4
+                style="color:var(--accent); text-transform:uppercase; font-size:0.75rem; margin-bottom:1rem; letter-spacing:1px; font-weight:800;">
+                <i class="fas fa-wallet"></i> Online Payment Info
+              </h4>
+            </div>
+
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem;">
+              <div class="form-group">
+                <label>GCash Account Name</label>
+                <input type="text" name="gcash_name" id="setting_gcash_name"
+                  value="<?php echo htmlspecialchars($tenant_custom['gcash_name'] ?? ''); ?>" placeholder="e.g. Juan Dela Cruz"
+                  style="font-size:0.8rem;" onfocus="highlightInPreview('gcash_name')">
+                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('gcash_name', this)">
+                  <i class="fas fa-save"></i> Save Name
+                </button>
+              </div>
+              <div class="form-group">
+                <label>GCash Number</label>
+                <input type="text" name="gcash_number" id="setting_gcash_number"
+                  value="<?php echo htmlspecialchars($tenant_custom['gcash_number'] ?? ''); ?>"
+                  placeholder="e.g. 09123456789" style="font-size:0.8rem;"
+                  onfocus="highlightInPreview('gcash_number')">
+                <button type="button" class="feature-save-btn" onclick="saveSingleSetting('gcash_number', this)">
+                  <i class="fas fa-save"></i> Save Number
+                </button>
+              </div>
+            </div>
+
             <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 1.5rem;">
               <div class="form-group">
                 <label><i class="fab fa-facebook"></i> Facebook Page URL</label>
@@ -12413,6 +12779,12 @@ try {
       <form id="addPaymentForm">
         <input type="hidden" name="job_id" id="pay_job_id">
         <input type="hidden" name="appointment_id" id="pay_appointment_id">
+        <input type="hidden" name="pending_payment_id" id="pay_pending_payment_id">
+
+        <div id="pendingPaymentAlert" style="display:none; margin-bottom:1rem; background:rgba(234,179,8,0.1); border:1px solid #eab308; padding:1rem; border-radius:12px; text-align:center;">
+            <div style="color:#eab308; font-weight:800; font-size:0.9rem; margin-bottom:8px;"><i class="fas fa-exclamation-circle"></i> Pending Online Payment</div>
+            <button type="button" id="btnViewProof" style="background:#eab308; color:#000; border:none; padding:5px 12px; border-radius:6px; font-weight:700; cursor:pointer; font-size:0.8rem;">View Proof of Payment</button>
+        </div>
 
         <div style="margin-bottom:0.8rem;">
           <label
@@ -12681,9 +13053,8 @@ try {
                     <input type="number" id="partQty" value="1" min="1"
                       style="flex:1; background:none; border:none; color:white; padding:0.8rem 0; font-weight:800; outline:none; text-align:center;">
                   </div>
-                  <button type="button" onclick="window.addPartToJob()"
-                    style="flex:1.5; background:var(--accent); color:white; border:none; border-radius:10px; padding:0.8rem; font-weight:800; cursor:pointer; box-shadow:0 5px 15px var(--accent-glow);">Add
-                    to Job</button>
+                  <button type="button" onclick="window.queuePendingItem('part')"
+                    style="flex:1.5; background:rgba(255,255,255,0.1); color:white; border:none; border-radius:10px; padding:0.8rem; font-weight:800; cursor:pointer;">Queue Part</button>
                 </div>
               </div>
 
@@ -12703,9 +13074,17 @@ try {
                       style="display:none; position:absolute; top:110%; left:0; width:100%; background:#1f2937; border:1px solid rgba(255,255,255,0.1); border-radius:12px; max-height:200px; overflow-y:auto; z-index:10001; padding:5px;">
                     </div>
                   </div>
-                  <button type="button" onclick="window.addServiceToJob()"
-                    style="background:rgba(255,255,255,0.1); color:white; border:none; border-radius:12px; padding:0 15px; font-weight:700; cursor:pointer;">Add</button>
+                  <button type="button" onclick="window.queuePendingItem('service')"
+                    style="background:rgba(255,255,255,0.1); color:white; border:none; border-radius:12px; padding:0 15px; font-weight:700; cursor:pointer;">Queue Service</button>
                 </div>
+              </div>
+              
+              <div id="pendingAdditionsContainer" style="display:none; margin-bottom:1.5rem; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.1); border-radius:15px; padding:12px;">
+                <label style="display:block; margin-bottom:8px; font-size:0.8rem; color:var(--warning); font-weight:800; text-transform:uppercase;">Queued for Approval</label>
+                <div id="pendingAdditionsList" style="display:flex; flex-direction:column; gap:5px; margin-bottom:10px;"></div>
+                <button type="button" onclick="window.sendEmailConfirmation()" style="width:100%; padding:10px; border-radius:10px; background:linear-gradient(135deg, var(--accent), #059669); color:white; border:none; font-weight:800; cursor:pointer; box-shadow:0 5px 15px var(--accent-glow);">
+                  <i class="fas fa-paper-plane"></i> Send Email Confirmation
+                </button>
               </div>
 
               <div id="jobPartsList"
@@ -12729,44 +13108,7 @@ try {
                 <span id="totalOverallBill" style="font-size:1.2rem; font-weight:900; color:white;">₱0.00</span>
               </div>
 
-              <!-- Customer Authorization for Extras -->
-              <div id="customerAuthSection"
-                style="display:none; margin-top:1.5rem; background:rgba(255,255,255,0.02); border:1px solid var(--glass-border); border-radius:15px; padding:1.2rem;">
-                <label
-                  style="display:block; margin-bottom:12px; font-size:0.8rem; color:var(--accent); font-weight:800; text-transform:uppercase; letter-spacing:1px;">Customer
-                  Authorization Proof (Required for Extras)</label>
 
-                <div id="authProofStatus"
-                  style="display:none; margin-bottom:12px; font-size:0.8rem; color:#10b981; font-weight:700;"><i
-                    class="fas fa-check-circle"></i> Authorization Already on File</div>
-
-                <div id="authInputContainer">
-                  <!-- Signature Pad -->
-                  <div style="margin-bottom:1rem;">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
-                      <span style="font-size:0.75rem; color:var(--text-dim);">E-Signature:</span>
-                      <button type="button" onclick="window.clearSignature()"
-                        style="background:none; border:none; color:var(--danger); font-size:0.7rem; cursor:pointer; padding:0;">Clear
-                        / Re-sign</button>
-                    </div>
-                    <canvas id="authSignaturePad" width="350" height="150"
-                      style="background:white; border-radius:10px; width:100%; border:2px dashed rgba(255,255,255,0.2); touch-action:none;"></canvas>
-                  </div>
-
-                  <!-- File Upload -->
-                  <div style="margin-bottom:0.5rem;">
-                    <span style="display:block; font-size:0.75rem; color:var(--text-dim); margin-bottom:5px;">Or Upload
-                      Proof (Chat Screenshot/Photo):</span>
-                    <input type="file" name="agreement_proof" id="agreement_proof_input" accept="image/*"
-                      style="width:100%; font-size:0.8rem; color:white; background:rgba(0,0,0,0.2); padding:0.5rem; border-radius:8px; border:1px solid rgba(255,255,255,0.1);">
-                  </div>
-
-                  <button type="button" onclick="window.confirmLocalAuthorization()"
-                    style="width:100%; margin-top:10px; padding:12px; border-radius:10px; border:none; background:linear-gradient(135deg, var(--accent), #059669); color:white; font-weight:800; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px;">
-                    <i class="fas fa-check-double"></i> Confirm Authorization
-                  </button>
-                </div>
-              </div>
 
             </div>
           </div>
@@ -13885,9 +14227,9 @@ try {
                   <td style="color:white; font-weight:700;">₱${parseFloat(j.balance_amount ?? j.total_amount ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
                   <td><span class="badge ${j.status === 'COMPLETED' ? 'badge-active' : (j.status === 'IN_PROGRESS' ? 'badge-warning' : 'badge-pending')}">${j.status}</span></td>
                   <td>
-                    <button class="btn-action" style="padding:5px 15px; font-size:0.75rem; background:var(--accent); color:white; border:none; border-radius:8px; cursor:pointer;" 
-                      onclick="window.openRecordPaymentModal(${j.job_id}, '${j.customer_id}', '${j.customer_name}', ${j.balance_amount ?? j.total_amount ?? 0})">
-                      Collect
+                    <button class="btn-action" style="padding:5px 15px; font-size:0.75rem; background:${j.pending_payment_id ? '#eab308' : 'var(--accent)'}; color:${j.pending_payment_id ? '#000' : 'white'}; border:none; border-radius:8px; cursor:pointer; font-weight:800;" 
+                      onclick="window.openRecordPaymentModal(${j.job_id}, '${j.customer_id}', '${j.customer_name}', ${j.balance_amount ?? j.total_amount ?? 0}, '${j.pending_payment_proof || ''}', '${j.pending_payment_id || ''}')">
+                      ${j.pending_payment_id ? 'Review Payment' : 'Collect'}
                     </button>
                   </td>
                 </tr>
