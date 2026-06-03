@@ -368,7 +368,7 @@ $theme = $shop['ui_style'] ?: 'GLASS';
             <a href="#services">Services</a>
             <a href="#about">About</a>
             <a href="customer-portal.php?id=<?php echo urlencode($slug); ?>" class="btn-login-nav">Customer App</a>
-            <a href="customer-register.php?id=<?php echo urlencode($slug); ?>" class="btn-register">Register</a>
+            <a href="customer-register.php?id=<?php echo urlencode($slug); ?>" class="btn-register">Register as Customer</a>
             <a href="login.php?from=tenant&tid=<?php echo urlencode($shop['tenant_id']); ?>" style="opacity: 0.6; font-size: 0.7rem; color: var(--text-dim); text-decoration: none;">Staff</a>
         </div>
     </nav>

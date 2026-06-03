@@ -1256,6 +1256,8 @@ try {
           quantity INT DEFAULT 0,
           unit VARCHAR(20) DEFAULT 'pcs',
           price DECIMAL(10,2) DEFAULT 0,
+          min_price DECIMAL(10,2) DEFAULT 0,
+          max_price DECIMAL(10,2) DEFAULT 0,
           stock_threshold INT DEFAULT 5,
           status VARCHAR(20) DEFAULT 'IN_STOCK',
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1264,6 +1266,14 @@ try {
         // Ensure columns exist if table was created previously with older schema
         try {
           $db->exec("ALTER TABLE inventory ADD COLUMN price DECIMAL(10,2) DEFAULT 0");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE inventory ADD COLUMN min_price DECIMAL(10,2) DEFAULT 0");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE inventory ADD COLUMN max_price DECIMAL(10,2) DEFAULT 0");
         } catch (Exception $e) {
         }
         try {
@@ -1383,16 +1393,23 @@ try {
 
       // Service Bays with active job info
       $stmt = $db->prepare("SELECT b.*, 
-                   (SELECT job_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status IN ('PENDING', 'IN_PROGRESS') ORDER BY created_at DESC LIMIT 1) as active_job_id,
-                   (SELECT status FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status IN ('PENDING', 'IN_PROGRESS') ORDER BY created_at DESC LIMIT 1) as job_status,
-                   (SELECT mechanic_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status IN ('PENDING', 'IN_PROGRESS') ORDER BY created_at DESC LIMIT 1) as active_mechanic_id,
-                   (SELECT COALESCE(v.plate_no, r.walkin_plate) FROM repair_jobs r LEFT JOIN vehicles v ON r.vehicle_id = v.vehicle_id WHERE r.bay_id = b.bay_id AND r.tenant_id = b.tenant_id AND r.status IN ('PENDING', 'IN_PROGRESS') ORDER BY r.created_at DESC LIMIT 1) as plate_no,
-                   (SELECT m.full_name FROM repair_jobs r JOIN mechanics m ON r.mechanic_id = m.mechanic_id WHERE r.bay_id = b.bay_id AND r.tenant_id = b.tenant_id AND r.status IN ('PENDING', 'IN_PROGRESS') ORDER BY r.created_at DESC LIMIT 1) as mechanic_name
+                   (SELECT job_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status = 'IN_PROGRESS' ORDER BY created_at DESC LIMIT 1) as active_job_id,
+                   (SELECT status FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status = 'IN_PROGRESS' ORDER BY created_at DESC LIMIT 1) as job_status,
+                   (SELECT mechanic_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status = 'IN_PROGRESS' ORDER BY created_at DESC LIMIT 1) as active_mechanic_id,
+                   (SELECT COALESCE(v.plate_no, r.walkin_plate) FROM repair_jobs r LEFT JOIN vehicles v ON r.vehicle_id = v.vehicle_id WHERE r.bay_id = b.bay_id AND r.tenant_id = b.tenant_id AND r.status = 'IN_PROGRESS' ORDER BY r.created_at DESC LIMIT 1) as plate_no,
+                   (SELECT m.full_name FROM repair_jobs r JOIN mechanics m ON r.mechanic_id = m.mechanic_id WHERE r.bay_id = b.bay_id AND r.tenant_id = b.tenant_id AND r.status = 'IN_PROGRESS' ORDER BY r.created_at DESC LIMIT 1) as mechanic_name
                    FROM service_bays b 
                    WHERE b.tenant_id = ? 
                    ORDER BY b.bay_id ASC");
       $stmt->execute([$tenant_id]);
-      $bays_list = $stmt->fetchAll(PDO::FETCH_ASSOC);
+      $all_bays = $stmt->fetchAll(PDO::FETCH_ASSOC);
+      $bays_list = [];
+      foreach ($all_bays as $index => $bay) {
+          $is_avail = ($bay['status'] === 'AVAILABLE' || empty($bay['active_job_id']));
+          if ($index < $bay_limit || !$is_avail) {
+              $bays_list[] = $bay;
+          }
+      }
 
       // Mechanics
       $stmt = $db->prepare("SELECT m.*, 
@@ -1549,6 +1566,7 @@ try {
                       COALESCE(v.make, v2.make, '') AS make,
                       COALESCE(v.model, v2.model, j.walkin_model, '---') AS model,
                       COALESCE(s.service_name, 'General Repair') AS service_name,
+                      COALESCE(j.completed_at, j.updated_at, j.created_at) AS completed_at,
                       j.created_at,
                       j.total_amount,
                       j.customer_id,
@@ -1714,7 +1732,7 @@ try {
                                COALESCE(v.plate_no, v2.plate_no, j.walkin_plate) as plate_no, 
                                COALESCE(v.make, v2.make, '') as make, 
                                COALESCE(v.model, v2.model, j.walkin_model) as model, 
-                               s.service_name,
+                               s.service_name, s.price as service_price,
                                COALESCE(m.full_name, 'N/A') as mechanic_name
                                FROM repair_jobs j 
                                LEFT JOIN customers c ON j.customer_id = c.customer_id 
@@ -1728,15 +1746,52 @@ try {
           if (!$j)
             exit("Receipt not found.");
 
+          $partsStmt = $db->prepare("SELECT rp.*, i.item_name, s.service_name as extra_service_name 
+                                     FROM repair_parts rp 
+                                     LEFT JOIN inventory i ON rp.item_id = i.item_id 
+                                     LEFT JOIN services s ON rp.service_id = s.service_id 
+                                     WHERE rp.job_id = ?");
+          $partsStmt->execute([$id]);
+          $parts = $partsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+          $breakdownHtml = "";
+          if (!empty($j['service_name'])) {
+              $price = floatval($j['service_price'] ?? 0);
+              $breakdownHtml .= "
+                  <div style='display:flex; justify-content:space-between; margin-bottom:5px;'>
+                      <span>{$j['service_name']}</span>
+                      <span>₱" . number_format($price, 2) . "</span>
+                  </div>";
+          }
+          foreach ($parts as $p) {
+              $name = !empty($p['item_name']) ? $p['item_name'] : (!empty($p['extra_service_name']) ? $p['extra_service_name'] : 'Unknown Item');
+              $qty = intval($p['quantity']);
+              $total = floatval($p['total_price']);
+              $breakdownHtml .= "
+                  <div style='display:flex; justify-content:space-between; margin-bottom:5px; font-size:0.85rem; color:#444;'>
+                      <span>{$qty}x {$name}</span>
+                      <span>₱" . number_format($total, 2) . "</span>
+                  </div>";
+          }
+
           $shop = $db->prepare("SELECT shop_name, address, phone FROM tenants WHERE tenant_id = ?");
           $shop->execute([$tenant_id]);
           $s = $shop->fetch(PDO::FETCH_ASSOC);
           $sn = $s['shop_name'] ?? 'Auto Shop';
 
           $duration = 'N/A';
+          $dateStarted = 'N/A';
+          $dateFinished = 'N/A';
+          
           if (!empty($j['started_at'])) {
             $start = strtotime($j['started_at']);
-            $end = !empty($j['completed_at']) ? strtotime($j['completed_at']) : time();
+            $dateStarted = date('M d, Y h:i A', $start);
+            
+            $end = !empty($j['completed_at']) ? strtotime($j['completed_at']) : (in_array($j['status'], ['COMPLETED', 'SETTLED']) && !empty($j['updated_at']) ? strtotime($j['updated_at']) : 0);
+            if ($end > 0) {
+                $dateFinished = date('M d, Y h:i A', $end);
+            }
+            
             if ($start && $end && $end >= $start) {
               $diff = $end - $start;
               $hours = floor($diff / 3600);
@@ -1772,16 +1827,16 @@ try {
                 </div>
                 <div style='font-size:0.9rem; line-height:1.6;'>
                   <p><strong>Job ID:</strong> #{$j['job_id']}</p>
-                  <p><strong>Date:</strong> " . date('M d, Y h:i A', strtotime($j['created_at'])) . "</p>
+                  <p><strong>Date Created:</strong> " . date('M d, Y h:i A', strtotime($j['created_at'])) . "</p>
+                  <p><strong>Date Started:</strong> {$dateStarted}</p>
+                  <p><strong>Date Finished:</strong> {$dateFinished}</p>
                   <p><strong>Customer:</strong> " . ($j['customer'] ?: $j['walkin_name']) . "</p>
                   <p><strong>Plate:</strong> " . ($j['plate_no'] ?: $j['walkin_plate']) . "</p>
+                  <p><strong>Vehicle:</strong> " . trim(($j['make'] ?? '') . ' ' . ($j['model'] ?? '')) . "</p>
                   <p><strong>Mechanic:</strong> {$j['mechanic_name']}</p>
                   <p><strong>Duration:</strong> {$duration}</p>
                   <div style='margin:1rem 0; border-top:1px solid #eee; border-bottom:1px solid #eee; padding:10px 0;'>
-                    <div style='display:flex; justify-content:space-between;'>
-                      <span>{$j['service_name']}</span>
-                      <strong>₱" . number_format($j['total_amount'], 2) . "</strong>
-                    </div>
+                    $breakdownHtml
                   </div>
                   <div style='display:flex; justify-content:space-between; font-size:1.1rem; font-weight:bold;'>
                     <span>TOTAL:</span>
@@ -1993,16 +2048,24 @@ try {
       }
       if ($_GET['action'] === 'fetch_bays') {
         $stmt = $db->prepare("SELECT b.*, 
-                   (SELECT job_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status IN ('PENDING', 'IN_PROGRESS') ORDER BY created_at DESC LIMIT 1) as active_job_id,
-                   (SELECT status FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status IN ('PENDING', 'IN_PROGRESS') ORDER BY created_at DESC LIMIT 1) as job_status,
-                   (SELECT mechanic_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status IN ('PENDING', 'IN_PROGRESS') ORDER BY created_at DESC LIMIT 1) as active_mechanic_id,
-                   (SELECT COALESCE(v.plate_no, r.walkin_plate) FROM repair_jobs r LEFT JOIN vehicles v ON r.vehicle_id = v.vehicle_id WHERE r.bay_id = b.bay_id AND r.tenant_id = b.tenant_id AND r.status IN ('PENDING', 'IN_PROGRESS') ORDER BY r.created_at DESC LIMIT 1) as plate_no,
-                   (SELECT m.full_name FROM repair_jobs r JOIN mechanics m ON r.mechanic_id = m.mechanic_id WHERE r.bay_id = b.bay_id AND r.tenant_id = b.tenant_id AND r.status IN ('PENDING', 'IN_PROGRESS') ORDER BY r.created_at DESC LIMIT 1) as mechanic_name
+                   (SELECT job_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status = 'IN_PROGRESS' ORDER BY created_at DESC LIMIT 1) as active_job_id,
+                   (SELECT status FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status = 'IN_PROGRESS' ORDER BY created_at DESC LIMIT 1) as job_status,
+                   (SELECT mechanic_id FROM repair_jobs WHERE bay_id = b.bay_id AND tenant_id = b.tenant_id AND status = 'IN_PROGRESS' ORDER BY created_at DESC LIMIT 1) as active_mechanic_id,
+                   (SELECT COALESCE(v.plate_no, r.walkin_plate) FROM repair_jobs r LEFT JOIN vehicles v ON r.vehicle_id = v.vehicle_id WHERE r.bay_id = b.bay_id AND r.tenant_id = b.tenant_id AND r.status = 'IN_PROGRESS' ORDER BY r.created_at DESC LIMIT 1) as plate_no,
+                   (SELECT m.full_name FROM repair_jobs r JOIN mechanics m ON r.mechanic_id = m.mechanic_id WHERE r.bay_id = b.bay_id AND r.tenant_id = b.tenant_id AND r.status = 'IN_PROGRESS' ORDER BY r.created_at DESC LIMIT 1) as mechanic_name
                    FROM service_bays b 
                    WHERE b.tenant_id = ? 
                    ORDER BY b.bay_id ASC");
-        $stmt->execute([$tenant_id]);
-        echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
+         $stmt->execute([$tenant_id]);
+         $all_bays = $stmt->fetchAll(PDO::FETCH_ASSOC);
+         $bays_list = [];
+         foreach ($all_bays as $index => $bay) {
+             $is_avail = ($bay['status'] === 'AVAILABLE' || empty($bay['active_job_id']));
+             if ($index < $bay_limit || !$is_avail) {
+                 $bays_list[] = $bay;
+             }
+         }
+         echo json_encode($bays_list);
         exit;
       }
 
@@ -2028,7 +2091,7 @@ try {
                    LEFT JOIN vehicles v ON r.vehicle_id = v.vehicle_id
                    LEFT JOIN customers c ON r.customer_id = c.customer_id
                    LEFT JOIN services s ON r.service_id = s.service_id
-                   WHERE r.bay_id = ? AND r.tenant_id = ? AND r.status IN ('PENDING', 'IN_PROGRESS')
+                   WHERE r.bay_id = ? AND r.tenant_id = ? AND r.status = 'IN_PROGRESS'
                    ORDER BY r.created_at DESC LIMIT 1");
         $stmt->execute([$bay_id, $tenant_id]);
         $current_job = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -2368,12 +2431,18 @@ try {
           $brand = trim($_POST['brand'] ?? '');
           $qty = intval($_POST['quantity'] ?? 0);
           $price = floatval($_POST['price'] ?? 0);
+          $min_price = floatval($_POST['min_price'] ?? 0);
+          $max_price = floatval($_POST['max_price'] ?? 0);
 
           if (empty($item_name))
             throw new Exception("Item name is required.");
+            
+          if ($max_price > 0 && ($price < $min_price || $price > $max_price)) {
+            throw new Exception("Price must be between ₱" . number_format($min_price, 2) . " and ₱" . number_format($max_price, 2));
+          }
 
-          $stmt = $db->prepare("INSERT INTO inventory (tenant_id, item_code, item_name, brand, quantity, price, stock_threshold, status) VALUES (?, ?, ?, ?, ?, ?, 5, 'IN_STOCK')");
-          $stmt->execute([$tenant_id, $item_code, $item_name, $brand, $qty, $price]);
+          $stmt = $db->prepare("INSERT INTO inventory (tenant_id, item_code, item_name, brand, quantity, price, min_price, max_price, stock_threshold, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 5, 'IN_STOCK')");
+          $stmt->execute([$tenant_id, $item_code, $item_name, $brand, $qty, $price, $min_price, $max_price]);
 
           echo json_encode(['status' => 'success', 'message' => 'Item added to inventory.']);
         } catch (Exception $e) {
@@ -2608,9 +2677,15 @@ try {
           $itemId = intval($_POST['item_id'] ?? 0);
           $newQty = intval($_POST['quantity'] ?? 0);
           $newPrice = floatval($_POST['price'] ?? 0);
+          $minPrice = floatval($_POST['min_price'] ?? 0);
+          $maxPrice = floatval($_POST['max_price'] ?? 0);
 
-          $stmt = $db->prepare("UPDATE inventory SET quantity = ?, price = ?, stock_threshold = 5 WHERE item_id = ? AND tenant_id = ?");
-          $stmt->execute([$newQty, $newPrice, $itemId, $tenant_id]);
+          if ($maxPrice > 0 && ($newPrice < $minPrice || $newPrice > $maxPrice)) {
+            throw new Exception("Price must be between ₱" . number_format($minPrice, 2) . " and ₱" . number_format($maxPrice, 2));
+          }
+
+          $stmt = $db->prepare("UPDATE inventory SET quantity = ?, price = ?, min_price = ?, max_price = ?, stock_threshold = 5 WHERE item_id = ? AND tenant_id = ?");
+          $stmt->execute([$newQty, $newPrice, $minPrice, $maxPrice, $itemId, $tenant_id]);
 
           echo json_encode(['status' => 'success', 'message' => 'Stock adjusted successfully.']);
         } catch (Exception $e) {
@@ -3218,18 +3293,37 @@ try {
           $prefBayId = intval($_GET['preferred_id'] ?? 0);
 
           // Consolidated resource fetching: Show only mechanics with 0 IN_PROGRESS jobs (plus the current one) and who are NOT UNAVAILABLE (unless currently assigned)
+          $isAppt = isset($_GET['is_appt']) && $_GET['is_appt'] == '1';
+          $inProgressCheck = $isAppt ? "1=1" : "(
+                                (SELECT COUNT(*) FROM repair_jobs WHERE mechanic_id = m.mechanic_id AND status = 'IN_PROGRESS' AND tenant_id = m.tenant_id) = 0
+                                OR m.mechanic_id = ?
+                            )";
+                            
+          $shiftCheck = "1=1";
+          if ($isAppt && !empty($_GET['appt_date']) && !empty($_GET['appt_time']) && $_GET['appt_date'] !== 'null' && $_GET['appt_time'] !== 'null') {
+              $apptDate = $_GET['appt_date'];
+              $apptTime = $_GET['appt_time'];
+              $dayOfWeek = date('D', strtotime($apptDate)); // 'Mon', 'Tue', etc.
+              
+              // Only assign if they have no shift data, or if the appointment falls within their shift
+              $shiftCheck = "(m.shift_days IS NULL OR m.shift_days = '' OR m.shift_days LIKE '%$dayOfWeek%') 
+                             AND (m.shift_start IS NULL OR m.shift_end IS NULL OR (m.shift_start <= '$apptTime' AND m.shift_end >= '$apptTime'))";
+          }
+          
           $mechanicQuery = "SELECT m.mechanic_id, COALESCE(m.full_name, u.name, 'Expert Mechanic') as full_name, m.shift_start, m.shift_end, m.shift_days
                             FROM mechanics m 
                             LEFT JOIN users u ON m.user_id = u.user_id
                             WHERE m.tenant_id = ? 
                             AND (m.status != 'UNAVAILABLE' OR m.mechanic_id = ?)
-                            AND (
-                                (SELECT COUNT(*) FROM repair_jobs WHERE mechanic_id = m.mechanic_id AND status = 'IN_PROGRESS' AND tenant_id = m.tenant_id) = 0
-                                OR m.mechanic_id = ?
-                            )
+                            AND $inProgressCheck
+                            AND $shiftCheck
                             ORDER BY m.full_name ASC";
           $mStmt = $db->prepare($mechanicQuery);
-          $mStmt->execute([$tenant_id, $prefMechId, $prefMechId]);
+          if ($isAppt) {
+              $mStmt->execute([$tenant_id, $prefMechId]);
+          } else {
+              $mStmt->execute([$tenant_id, $prefMechId, $prefMechId]);
+          }
 
           // Filter out OCCUPIED bays, but keep the current/preferred one selectable
           $bayQuery = "SELECT bay_id, bay_name, status FROM service_bays WHERE tenant_id = ? AND (status = 'AVAILABLE' OR bay_id = ?) ORDER BY bay_id ASC";
@@ -3277,11 +3371,11 @@ try {
                       LEFT JOIN vehicles v ON a.vehicle_id = v.vehicle_id 
                       LEFT JOIN vehicles v2 ON a.customer_id = v2.customer_id AND v.vehicle_id IS NULL
                       LEFT JOIN services s ON a.service_id = s.service_id 
-                      WHERE a.tenant_id = ? AND a.mechanic_id = ? 
+                      WHERE a.tenant_id = ? AND (a.mechanic_id = ? OR a.requested_mechanic_id = ?)
                       AND a.status = 'CONFIRMED'
                       AND (a.appointment_date >= CURDATE())
                       ORDER BY a.appointment_date ASC, a.appointment_time ASC");
-          $stmt->execute([$tenant_id, $m_id]);
+          $stmt->execute([$tenant_id, $m_id, $m_id]);
           echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
         } catch (Exception $e) {
           echo json_encode([]);
@@ -3400,20 +3494,22 @@ try {
             }
           }
 
-          // Validation: If resource changed, check availability
-          if ($mechanicId != $old['mechanic_id']) {
-            $mechCheck = $db->prepare("SELECT status FROM mechanics WHERE mechanic_id = ? AND tenant_id = ?");
-            $mechCheck->execute([$mechanicId, $tenant_id]);
-            if ($mechCheck->fetchColumn() === 'BUSY') {
-              throw new Exception("Selection Error: The newly selected mechanic is currently busy.");
-            }
-          }
-          if ($bayId != $old['bay_id']) {
-            $bayCheck = $db->prepare("SELECT status FROM service_bays WHERE bay_id = ? AND tenant_id = ?");
-            $bayCheck->execute([$bayId, $tenant_id]);
-            if ($bayCheck->fetchColumn() === 'OCCUPIED') {
-              throw new Exception("Selection Error: The newly selected service bay is already occupied.");
-            }
+          // Validation: Check if resources are busy with ANOTHER job before going IN_PROGRESS
+          if ($newStatus === 'IN_PROGRESS') {
+              if ($mechanicId) {
+                  $mechBusy = $db->prepare("SELECT COUNT(*) FROM repair_jobs WHERE mechanic_id = ? AND status = 'IN_PROGRESS' AND job_id != ? AND tenant_id = ?");
+                  $mechBusy->execute([$mechanicId, $jobId, $tenant_id]);
+                  if ($mechBusy->fetchColumn() > 0) {
+                      throw new Exception("Conflict Error: The assigned mechanic is currently working on another in-progress job.");
+                  }
+              }
+              if ($bayId) {
+                  $bayBusy = $db->prepare("SELECT COUNT(*) FROM repair_jobs WHERE bay_id = ? AND status = 'IN_PROGRESS' AND job_id != ? AND tenant_id = ?");
+                  $bayBusy->execute([$bayId, $jobId, $tenant_id]);
+                  if ($bayBusy->fetchColumn() > 0) {
+                      throw new Exception("Conflict Error: The assigned service bay is currently occupied by another in-progress job.");
+                  }
+              }
           }
 
           $checklist = $_POST['checklist'] ?? null;
@@ -3554,7 +3650,7 @@ try {
 
           // If linked to a job, mark the job as PAID/SETTLED and FREE RESOURCES
           if ($jobId) {
-            $db->prepare("UPDATE repair_jobs SET payment_status = 'PAID', status = 'SETTLED', total_amount = ? WHERE job_id = ? AND tenant_id = ?")->execute([$amount, $jobId, $tenant_id]);
+            $db->prepare("UPDATE repair_jobs SET payment_status = 'PAID', status = 'SETTLED', total_amount = ?, completed_at = IFNULL(completed_at, NOW()) WHERE job_id = ? AND tenant_id = ?")->execute([$amount, $jobId, $tenant_id]);
 
             // Release Bay & Mechanic
             $stmtRes = $db->prepare("SELECT bay_id, mechanic_id FROM repair_jobs WHERE job_id = ?");
@@ -4424,7 +4520,7 @@ try {
     };
 
 
-    window.processAppointment = function (id, status, reqMechName = null) {
+    window.processAppointment = function (id, status, reqMechName = null, apptDate = null, apptTime = null) {
       // Force resolution based on known status values to completely avoid the "44" bug
       let finalId = id;
       let finalStatus = status;
@@ -4462,7 +4558,11 @@ try {
         if (mS && bS) {
           mS.innerHTML = '<option>Loading...</option>';
           bS.innerHTML = '<option>Loading...</option>';
-          fetch('tenant-dashboard.php?action=fetch_available_resources')
+          let fetchUrl = 'tenant-dashboard.php?action=fetch_available_resources&is_appt=1';
+          if (apptDate) fetchUrl += '&appt_date=' + encodeURIComponent(apptDate);
+          if (apptTime) fetchUrl += '&appt_time=' + encodeURIComponent(apptTime);
+          
+          fetch(fetchUrl)
             .then(r => r.json()).then(data => {
               mS.innerHTML = '<option value="">-- Assign Mechanic --</option>';
               (data.mechanics || []).forEach(m => {
@@ -4546,23 +4646,34 @@ try {
         });
     };
 
-    window.confirmLocalAuthorization = function() {
+    window.confirmLocalAuthorization = function () {
       const sigCanvas = document.getElementById('authSignaturePad');
       const hasNewSig = sigCanvas && window.hasSignature;
       const fileInput = document.getElementById('agreement_proof_input');
       const hasNewFile = fileInput && fileInput.files && fileInput.files.length > 0;
-      
+
       if (!hasNewSig && !hasNewFile) {
         window.showAlert('Authorization Required', 'Please provide a signature or upload proof of customer authorization before confirming.', 'error');
         return;
       }
-      
+
       document.getElementById('authInputContainer').style.display = 'none';
       const statusDiv = document.getElementById('authProofStatus');
       statusDiv.style.display = 'block';
       statusDiv.innerHTML = '<i class="fas fa-check-circle"></i> Authorization Confirmed (Pending Save)';
       window.isAuthConfirmedLocally = true;
       window.showToast("Authorization temporarily confirmed! Commit Progress to save to database.");
+    };
+
+    window.viewProofImage = function (src) {
+      const modal = document.getElementById('proofViewerModal');
+      const img = document.getElementById('proofViewerImage');
+      if (modal && img) {
+        img.src = src;
+        document.body.appendChild(modal);
+        modal.style.setProperty('display', 'flex', 'important');
+        modal.style.setProperty('z-index', '2147483647', 'important');
+      }
     };
 
     // --- ULTIMATE JOB STATUS ENGINE (UNIQUE NAMESPACE) ---
@@ -4638,8 +4749,15 @@ try {
               if (authStatus) {
                 if (job.agreement_signature || job.agreement_proof_file) {
                   authStatus.style.display = 'block';
+                  let proofSrc = '';
+                  if (job.agreement_proof_file) {
+                    proofSrc = 'uploads/' + job.agreement_proof_file;
+                  } else if (job.agreement_signature) {
+                    proofSrc = job.agreement_signature;
+                  }
+
                   authStatus.innerHTML = `<i class="fas fa-check-circle"></i> Authorization Already on File 
-                    <br><a href="${job.agreement_proof_file ? 'uploads/' + job.agreement_proof_file : '#'}" target="_blank" style="color:#10b981; text-decoration:underline;">[View Proof File]</a>`;
+                    <br><a href="#" onclick="window.viewProofImage('${proofSrc}'); return false;" style="color:#10b981; text-decoration:underline; font-weight:600;">[View Proof File]</a>`;
                   if (authSection) authSection.style.display = 'block';
                   const inputCont = document.getElementById('authInputContainer');
                   if (inputCont) inputCont.style.display = 'none';
@@ -4680,7 +4798,7 @@ try {
                 const isCurrent = (b.bay_id == currentBayId) ? ' (Currently Assigned)' : '';
                 return `<option value="${b.bay_id}" ${b.bay_id == currentBayId ? 'selected' : ''}>${b.bay_name}${isCurrent}</option>`;
               }).join('');
-              
+
               const hasBay = (data.bays || []).some(b => b.bay_id == currentBayId);
               if (!hasBay && currentBayId && currentBayId != 0) bHtml += `<option value="${currentBayId}" selected>Current Bay (Occupied)</option>`;
               bS.innerHTML = bHtml;
@@ -4705,20 +4823,43 @@ try {
       const bId = (bS && !bS.disabled && bS.value) ? bS.value : (bH ? bH.value : (bS ? bS.value : ''));
 
       let isValid = true;
+      let errorReason = '';
       if (currentStatus !== 'CANCELLED') {
-        if (!mId || !bId) isValid = false;
+        if (!mId || !bId) {
+          isValid = false;
+        } else if (currentStatus === 'IN_PROGRESS') {
+           const mOpt = mS && mS.options[mS.selectedIndex];
+           const bOpt = bS && bS.options[bS.selectedIndex];
+           if (mOpt && mOpt.text.includes('(Occupied)')) {
+               isValid = false;
+               errorReason = 'Mechanic is Occupied';
+           } else if (bOpt && bOpt.text.includes('(Occupied)')) {
+               isValid = false;
+               errorReason = 'Bay is Occupied';
+           }
+        }
       }
 
       if (isValid) {
         sb.disabled = false;
+        sb.innerHTML = '<i class="fas fa-save"></i> <span>Commit Progress</span>';
         sb.style.opacity = '1';
         sb.style.filter = 'none';
         sb.style.cursor = 'pointer';
         sb.style.pointerEvents = 'auto';
       } else {
         sb.disabled = true;
-        sb.style.opacity = '0.4';
-        sb.style.filter = 'grayscale(1)';
+        if (errorReason) {
+            sb.innerHTML = `<i class="fas fa-exclamation-circle"></i> <span>${errorReason}</span>`;
+            sb.style.opacity = '0.9';
+            sb.style.filter = 'none';
+            sb.style.background = 'linear-gradient(135deg, #ef4444, #b91c1c)';
+        } else {
+            sb.innerHTML = '<i class="fas fa-save"></i> <span>Commit Progress</span>';
+            sb.style.opacity = '0.4';
+            sb.style.filter = 'grayscale(1)';
+            sb.style.background = 'linear-gradient(135deg, var(--accent), #059669)';
+        }
         sb.style.cursor = 'not-allowed';
         sb.style.pointerEvents = 'none';
       }
@@ -4746,12 +4887,16 @@ try {
       const isMech = userRole === 'MECHANIC';
       const currentStatus = sS ? sS.value : '';
       const isCompleted = (currentStatus === 'COMPLETED');
+      const isInProgress = (currentStatus === 'IN_PROGRESS');
+
+      const disableDropdowns = !editing || isCompleted || isInProgress || isMech;
+
       if (mS) {
-        mS.disabled = !editing || isCompleted || isMech;
+        mS.disabled = disableDropdowns;
         mS.addEventListener('change', window.validateCommitButton);
       }
       if (bS) {
-        bS.disabled = !editing || isCompleted || isMech;
+        bS.disabled = disableDropdowns;
         bS.addEventListener('change', window.validateCommitButton);
       }
       if (eb) eb.style.display = editing ? 'none' : 'flex';
@@ -4765,6 +4910,14 @@ try {
           if (pendingOpt && (val === 'IN_PROGRESS' || val === 'COMPLETED')) {
             pendingOpt.style.display = 'none';
           }
+
+          const isComp = (val === 'COMPLETED');
+          const isInProg = (val === 'IN_PROGRESS');
+          const disable = !editing || isComp || isInProg || isMech;
+
+          if (mS) mS.disabled = disable;
+          if (bS) bS.disabled = disable;
+
           window.validateCommitButton();
         });
       }
@@ -5589,7 +5742,7 @@ try {
               if (isPending) {
                 actionHtml = `
               <div style="display:flex; gap:8px;">
-                <button class="btn-action" style="flex:1; padding:8px; font-size:0.75rem; background:#10b981; color:white; border:none; border-radius:10px;" onclick="window.processAppointment('${a.appointment_id}', 'CONFIRMED', '${(a.requested_mechanic_name || '').replace(/'/g, "\\'")}')">
+                <button class="btn-action" style="flex:1; padding:8px; font-size:0.75rem; background:#10b981; color:white; border:none; border-radius:10px;" onclick="window.processAppointment('${a.appointment_id}', 'CONFIRMED', '${(a.requested_mechanic_name || '').replace(/'/g, "\\'")}', '${a.appointment_date}', '${a.appointment_time}')">
                   <i class="fas fa-check"></i> Approve
                 </button>
                 <button class="btn-action" style="flex:1; padding:8px; font-size:0.75rem; background:#ef4444; color:white; border:none; border-radius:10px;" onclick="window.processAppointment('${a.appointment_id}', 'CANCELLED')">
@@ -5878,7 +6031,7 @@ try {
       --card-bg: rgba(255, 255, 255, 0.03);
       --input-bg: rgba(255, 255, 255, 0.05);
     }
-    
+
     [data-theme="light"] {
       --bg-deep: #f1f5f9;
       --text-main: #0f172a;
@@ -5890,7 +6043,7 @@ try {
       --input-bg: #ffffff;
       --accent-glow: rgba(var(--accent-rgb), 0.15);
     }
-    
+
     [data-theme="light"] body {
       background-color: var(--bg-deep) !important;
       background-image: none !important;
@@ -5932,7 +6085,7 @@ try {
       background: var(--card-bg) !important;
       color: var(--text-main) !important;
     }
-    
+
     [data-theme="light"] input[style*="background:rgba(0,0,0,0."],
     [data-theme="light"] input[style*="background: rgba(0,0,0,0."] {
       background: var(--input-bg) !important;
@@ -7646,7 +7799,7 @@ try {
             const isAvail = (b.status === 'AVAILABLE' || !b.active_job_id);
             const displayStatus = isAvail ? 'AVAILABLE' : b.status.toUpperCase();
 
-            const action = isAvail ? `openBayProfile(${b.bay_id})` : `window.handleJobClick(${b.active_job_id}, '${b.job_status}', ${b.active_mechanic_id}, ${b.bay_id}, true, false)`;
+            const action = isAvail ? `if(typeof openBayProfile==='function')openBayProfile(${b.bay_id});else showToast('System is initializing, please wait...')` : `window.handleJobClick(${b.active_job_id}, '${b.job_status}', ${b.active_mechanic_id}, ${b.bay_id}, true, false)`;
 
             // NEW: Dynamic Info for Occupied Bays
             const occupiedInfo = !isAvail ? `
@@ -8866,7 +9019,7 @@ try {
             // Safety: If status is OCCUPIED but no active job exists, treat as AVAILABLE
             $is_avail = ($bay['status'] === 'AVAILABLE' || empty($bay['active_job_id']));
             $display_status = $is_avail ? 'AVAILABLE' : strtoupper($bay['status']);
-            $action = $is_avail ? "openBayProfile(" . (int) $bay['bay_id'] . ")" : "window.handleJobClick(" . ($bay['active_job_id'] ?? 0) . ", '" . ($bay['job_status'] ?? 'PENDING') . "', " . ($bay['active_mechanic_id'] ?? 'null') . ", " . (int) $bay['bay_id'] . ", true, false)";
+            $action = $is_avail ? "if(typeof openBayProfile==='function')openBayProfile(" . (int) $bay['bay_id'] . ");else showToast('System is initializing, please wait...')" : "window.handleJobClick(" . ($bay['active_job_id'] ?? 0) . ", '" . ($bay['job_status'] ?? 'PENDING') . "', " . ($bay['active_mechanic_id'] ?? 'null') . ", " . (int) $bay['bay_id'] . ", true, false)";
             ?>
           <div class="bay-card <?php echo !$is_avail ? 'clickable' : ''; ?>"
             onclick="<?php echo !$is_avail ? $action : ''; ?>"
@@ -9070,6 +9223,7 @@ try {
             <tr>
               <th>Item Code</th>
               <th>Name & Brand</th>
+              <th>Price</th>
               <th>Qty on Hand</th>
               <th>Status</th>
               <th>Actions</th>
@@ -9078,7 +9232,7 @@ try {
           <tbody id="inventoryBody">
             <?php if (empty($inventory_list)): ?>
             <tr>
-              <td colspan="5" style="text-align:center; color:var(--text-dim); padding: 2rem;">No
+              <td colspan="6" style="text-align:center; color:var(--text-dim); padding: 2rem;">No
                 inventory records found.</td>
             </tr>
             <?php else: ?>
@@ -9090,6 +9244,9 @@ try {
                 </strong><br><small style="color:var(--text-dim)">
                   <?php echo htmlspecialchars($inv['brand']); ?>
                 </small>
+              </td>
+              <td>
+                <strong>₱<?php echo number_format($inv['price'], 2); ?></strong>
               </td>
               <td>
                 <?php echo $inv['quantity']; ?> pcs
@@ -9761,57 +9918,57 @@ try {
             window.showPayMongoSimulation = function (amount, method, planName, onComplete) {
               const modalId = 'paymongo_' + Date.now();
               const modalHTML = `
-                                                                                                          <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:#f4f7f9; z-index:2147483649; display:flex; flex-direction:column; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
-                                                                                                            <!-- Header -->
-                                                                                                            <div style="background:white; padding:1.5rem 2rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #e2e8f0;">
-                                                                                                              <div style="display:flex; align-items:center; gap:10px;">
-                                                                                                                <div style="background:#6366f1; width:32px; height:32px; border-radius:8px; display:flex; align-items:center; justify-content:center; color:white; font-weight:bold;">P</div>
-                                                                                                                <span style="font-weight:800; font-size:1.2rem; color:#1e293b; letter-spacing:-0.5px;">paymongo</span>
-                                                                                                              </div>
-                                                                                                              <div style="color:#64748b; font-size:0.9rem;">Test Mode</div>
-                                                                                                            </div>
-
-                                                                                                            <div style="flex:1; display:flex; align-items:center; justify-content:center; padding:2rem;">
-                                                                                                              <div style="background:white; width:100%; max-width:400px; border-radius:20px; box-shadow:0 20px 25px -5px rgba(0,0,0,0.1); overflow:hidden; border:1px solid #e2e8f0;">
-                                                                                                                <div style="padding:2rem; text-align:center; border-bottom:1px solid #f1f5f9; background:#f8fafc;">
-                                                                                                                  <div style="color:#64748b; font-size:0.85rem; text-transform:uppercase; font-weight:700; letter-spacing:1px; margin-bottom:0.5rem;">Amount to Pay</div>
-                                                                                                                  <div style="font-size:2.5rem; font-weight:900; color:#1e293b;">₱${parseFloat(amount).toLocaleString()}</div>
-                                                                                                                  <div style="font-size:0.9rem; color:#64748b; margin-top:0.5rem;">${planName}</div>
+                                                                                                              <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:#f4f7f9; z-index:2147483649; display:flex; flex-direction:column; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+                                                                                                                <!-- Header -->
+                                                                                                                <div style="background:white; padding:1.5rem 2rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #e2e8f0;">
+                                                                                                                  <div style="display:flex; align-items:center; gap:10px;">
+                                                                                                                    <div style="background:#6366f1; width:32px; height:32px; border-radius:8px; display:flex; align-items:center; justify-content:center; color:white; font-weight:bold;">P</div>
+                                                                                                                    <span style="font-weight:800; font-size:1.2rem; color:#1e293b; letter-spacing:-0.5px;">paymongo</span>
+                                                                                                                  </div>
+                                                                                                                  <div style="color:#64748b; font-size:0.9rem;">Test Mode</div>
                                                                                                                 </div>
 
-                                                                                                                <div style="padding:2rem;">
-                                                                                                                  <div style="margin-bottom:2rem;">
-                                                                                                                    <div style="display:flex; justify-content:space-between; margin-bottom:0.8rem; font-size:0.9rem;">
-                                                                                                                      <span style="color:#64748b;">Payment Method</span>
-                                                                                                                      <span style="font-weight:700; color:#1e293b;">${method}</span>
+                                                                                                                <div style="flex:1; display:flex; align-items:center; justify-content:center; padding:2rem;">
+                                                                                                                  <div style="background:white; width:100%; max-width:400px; border-radius:20px; box-shadow:0 20px 25px -5px rgba(0,0,0,0.1); overflow:hidden; border:1px solid #e2e8f0;">
+                                                                                                                    <div style="padding:2rem; text-align:center; border-bottom:1px solid #f1f5f9; background:#f8fafc;">
+                                                                                                                      <div style="color:#64748b; font-size:0.85rem; text-transform:uppercase; font-weight:700; letter-spacing:1px; margin-bottom:0.5rem;">Amount to Pay</div>
+                                                                                                                      <div style="font-size:2.5rem; font-weight:900; color:#1e293b;">₱${parseFloat(amount).toLocaleString()}</div>
+                                                                                                                      <div style="font-size:0.9rem; color:#64748b; margin-top:0.5rem;">${planName}</div>
                                                                                                                     </div>
-                                                                                                                    <div style="display:flex; justify-content:space-between; font-size:0.9rem;">
-                                                                                                                      <span style="color:#64748b;">Reference</span>
-                                                                                                                      <span style="font-weight:700; color:#1e293b;">PM-${Math.random().toString(36).substr(2, 9).toUpperCase()}</span>
+
+                                                                                                                    <div style="padding:2rem;">
+                                                                                                                      <div style="margin-bottom:2rem;">
+                                                                                                                        <div style="display:flex; justify-content:space-between; margin-bottom:0.8rem; font-size:0.9rem;">
+                                                                                                                          <span style="color:#64748b;">Payment Method</span>
+                                                                                                                          <span style="font-weight:700; color:#1e293b;">${method}</span>
+                                                                                                                        </div>
+                                                                                                                        <div style="display:flex; justify-content:space-between; font-size:0.9rem;">
+                                                                                                                          <span style="color:#64748b;">Reference</span>
+                                                                                                                          <span style="font-weight:700; color:#1e293b;">PM-${Math.random().toString(36).substr(2, 9).toUpperCase()}</span>
+                                                                                                                        </div>
+                                                                                                                      </div>
+
+                                                                                                                      <button id="payNow_${modalId}" style="width:100%; padding:1rem; background:#6366f1; color:white; border:none; border-radius:12px; font-weight:700; font-size:1.1rem; cursor:pointer; transition:0.3s; margin-bottom:1rem;">
+                                                                                                                        Pay Now with ${method}
+                                                                                                                      </button>
+                      
+                                                                                                                      <button id="cancelPay_${modalId}" style="width:100%; background:none; border:none; color:#94a3b8; font-size:0.9rem; cursor:pointer;">
+                                                                                                                        Cancel Transaction
+                                                                                                                      </button>
                                                                                                                     </div>
                                                                                                                   </div>
-
-                                                                                                                  <button id="payNow_${modalId}" style="width:100%; padding:1rem; background:#6366f1; color:white; border:none; border-radius:12px; font-weight:700; font-size:1.1rem; cursor:pointer; transition:0.3s; margin-bottom:1rem;">
-                                                                                                                    Pay Now with ${method}
-                                                                                                                  </button>
-                      
-                                                                                                                  <button id="cancelPay_${modalId}" style="width:100%; background:none; border:none; color:#94a3b8; font-size:0.9rem; cursor:pointer;">
-                                                                                                                    Cancel Transaction
-                                                                                                                  </button>
                                                                                                                 </div>
-                                                                                                              </div>
-                                                                                                            </div>
 
-                                                                                                            <div id="loading_${modalId}" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(255,255,255,0.95); z-index:10; flex-direction:column; align-items:center; justify-content:center;">
-                                                                                                              <div style="width:50px; height:50px; border:4px solid #f3f3f3; border-top:4px solid #6366f1; border-radius:50%; animation: spin 1s linear infinite; margin-bottom:1.5rem;"></div>
-                                                                                                              <div style="font-weight:700; color:#1e293b; font-size:1.2rem;">Authorizing Payment...</div>
-                                                                                                              <div style="color:#64748b; margin-top:0.5rem;">Please do not close this window</div>
-                                                                                                            </div>
+                                                                                                                <div id="loading_${modalId}" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(255,255,255,0.95); z-index:10; flex-direction:column; align-items:center; justify-content:center;">
+                                                                                                                  <div style="width:50px; height:50px; border:4px solid #f3f3f3; border-top:4px solid #6366f1; border-radius:50%; animation: spin 1s linear infinite; margin-bottom:1.5rem;"></div>
+                                                                                                                  <div style="font-weight:700; color:#1e293b; font-size:1.2rem;">Authorizing Payment...</div>
+                                                                                                                  <div style="color:#64748b; margin-top:0.5rem;">Please do not close this window</div>
+                                                                                                                </div>
 
-                                                                                                            <style>
-                                                                                                              @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-                                                                                                            </style>
-                                                                                                          </div>`;
+                                                                                                                <style>
+                                                                                                                  @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+                                                                                                                </style>
+                                                                                                              </div>`;
                   document.body.insertAdjacentHTML('beforeend', modalHTML);
 
                   document.getElementById('payNow_' + modalId).onclick = function () {
@@ -9836,11 +9993,11 @@ try {
                   const originalHtml = btn ? btn.innerHTML : '<i class="fas fa-bolt"></i> Renew Subscription';
 
                   const proceedWithRenewal = (method) => {
-                                                                                                            <?php
-                                                                                                            $r_cycle = strtolower($active_subscription['billing_cycle'] ?? 'monthly');
-                                                                                                            $r_amount = ($r_cycle === 'yearly') ? ($active_subscription['price_yearly'] > 0 ? $active_subscription['price_yearly'] : ($active_subscription['price'] * 12 * 0.8)) : $active_subscription['price'];
-                                                                                                            ?>
-                                                                                                            const amount = "<?php echo $r_amount; ?>";
+                                                                                                                <?php
+                                                                                                                $r_cycle = strtolower($active_subscription['billing_cycle'] ?? 'monthly');
+                                                                                                                $r_amount = ($r_cycle === 'yearly') ? ($active_subscription['price_yearly'] > 0 ? $active_subscription['price_yearly'] : ($active_subscription['price'] * 12 * 0.8)) : $active_subscription['price'];
+                                                                                                                ?>
+                                                                                                                const amount = "<?php echo $r_amount; ?>";
 
                     showPayMongoSimulation(amount, method, "Subscription Renewal", () => {
                       if (btn) {
@@ -9872,30 +10029,30 @@ try {
                   // DYNAMIC MODAL (With Payment Selection)
                   const modalId = 'dynamicRenewModal_' + Date.now();
                   const modalHTML = `
-                                                                                                          <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); backdrop-filter:blur(15px); z-index:9999999; display:flex; align-items:center; justify-content:center; padding:20px;">
-                                                                                                            <div style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:32px; padding:3rem; width:100%; max-width:480px; text-align:center; box-shadow:0 30px 60px rgba(0,0,0,0.5);">
-                                                                                                              <div style="width:80px; height:80px; background:linear-gradient(135deg, #6366f1 0%, #a855f7 100%); border-radius:50%; display:flex; align-items:center; justify-content:center; margin:0 auto 2rem; color:white; font-size:2.5rem; box-shadow:0 10px 25px rgba(99, 102, 241, 0.4);">
-                                                                                                                <i class="fas fa-credit-card"></i>
-                                                                                                              </div>
-                                                                                                              <h2 style="color:var(--text-main); margin-bottom:0.8rem; font-size:1.8rem; font-weight:800;">Renew Subscription</h2>
-                                                                                                              <p style="color:var(--text-dim); margin-bottom:2rem; line-height:1.6;">${confirmMsg}</p>
+                                                                                                              <div id="${modalId}" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); backdrop-filter:blur(15px); z-index:9999999; display:flex; align-items:center; justify-content:center; padding:20px;">
+                                                                                                                <div style="background:var(--bg-deep); border:1px solid var(--glass-border); border-radius:32px; padding:3rem; width:100%; max-width:480px; text-align:center; box-shadow:0 30px 60px rgba(0,0,0,0.5);">
+                                                                                                                  <div style="width:80px; height:80px; background:linear-gradient(135deg, #6366f1 0%, #a855f7 100%); border-radius:50%; display:flex; align-items:center; justify-content:center; margin:0 auto 2rem; color:white; font-size:2.5rem; box-shadow:0 10px 25px rgba(99, 102, 241, 0.4);">
+                                                                                                                    <i class="fas fa-credit-card"></i>
+                                                                                                                  </div>
+                                                                                                                  <h2 style="color:var(--text-main); margin-bottom:0.8rem; font-size:1.8rem; font-weight:800;">Renew Subscription</h2>
+                                                                                                                  <p style="color:var(--text-dim); margin-bottom:2rem; line-height:1.6;">${confirmMsg}</p>
                   
-                                                                                                              <div style="text-align:left; margin-bottom:2.5rem;">
-                                                                                                                <label style="color:var(--text-main); font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; display:block; opacity:0.7;">Payment Method</label>
-                                                                                                                <select id="payMethod_${modalId}" class="modern-input">
-                                                                                                                  <option value="GCASH">GCash</option>
-                                                                                                                  <option value="MAYA">Maya</option>
-                                                                                                                  <option value="BANK_TRANSFER">Bank Transfer (BDO/BPI)</option>
-                                                                                                                  <option value="CARD">Credit/Debit Card</option>
-                                                                                                                </select>
-                                                                                                              </div>
+                                                                                                                  <div style="text-align:left; margin-bottom:2.5rem;">
+                                                                                                                    <label style="color:var(--text-main); font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; display:block; opacity:0.7;">Payment Method</label>
+                                                                                                                    <select id="payMethod_${modalId}" class="modern-input">
+                                                                                                                      <option value="GCASH">GCash</option>
+                                                                                                                      <option value="MAYA">Maya</option>
+                                                                                                                      <option value="BANK_TRANSFER">Bank Transfer (BDO/BPI)</option>
+                                                                                                                      <option value="CARD">Credit/Debit Card</option>
+                                                                                                                    </select>
+                                                                                                                  </div>
 
-                                                                                                              <div style="display:flex; gap:15px; justify-content:center;">
-                                                                                                                <button id="btnConfirm_${modalId}" style="flex:2; padding:16px; background:#6366f1; color:white; border:none; border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem; transition:0.3s; box-shadow:0 10px 20px rgba(99, 102, 241, 0.3);">Go to Payment</button>
-                                                                                                                <button id="btnCancel_${modalId}" style="flex:1; padding:16px; background:var(--input-bg); color:var(--text-main); border:1px solid var(--glass-border); border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem;">Cancel</button>
-                                                                                                              </div>
-                                                                                                            </div>
-                                                                                                          </div>`;
+                                                                                                                  <div style="display:flex; gap:15px; justify-content:center;">
+                                                                                                                    <button id="btnConfirm_${modalId}" style="flex:2; padding:16px; background:#6366f1; color:white; border:none; border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem; transition:0.3s; box-shadow:0 10px 20px rgba(99, 102, 241, 0.3);">Go to Payment</button>
+                                                                                                                    <button id="btnCancel_${modalId}" style="flex:1; padding:16px; background:var(--input-bg); color:var(--text-main); border:1px solid var(--glass-border); border-radius:16px; font-weight:800; cursor:pointer; font-size:1rem;">Cancel</button>
+                                                                                                                  </div>
+                                                                                                                </div>
+                                                                                                              </div>`;
                   document.body.insertAdjacentHTML('beforeend', modalHTML);
 
                   document.getElementById('btnConfirm_' + modalId).onclick = function () {
@@ -10672,18 +10829,20 @@ try {
         .then(res => res.json()).then(data => {
           const body = document.getElementById('inventoryBody');
           if (data.length === 0) {
-            body.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-dim); padding: 2rem;">No inventory records found.</td></tr>';
+            body.innerHTML = '<tr><td colspan="6" style="text-align:center; color:var(--text-dim); padding: 2rem;">No inventory records found.</td></tr>';
             return;
           }
           body.innerHTML = data.map(i => {
             const isLow = parseInt(i.quantity) < 5;
             const statusClass = isLow ? 'badge-danger' : 'badge-active';
             const statusText = isLow ? 'LOW STOCK' : 'IN STOCK';
+            const price = parseFloat(i.price || 0).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
             return `
               <tr>
                 <td><strong>${i.item_code}</strong></td>
                 <td>${i.item_name} ${i.brand ? '(' + i.brand + ')' : ''}</td>
-                <td>${i.quantity}</td>
+                <td><strong>₱${price}</strong></td>
+                <td>${i.quantity} pcs</td>
                 <td><span class="badge ${statusClass}">${statusText}</span></td>
                 <td><button class="btn-outline" onclick="window.openStockAdjustmentModal(${i.item_id})">Manage</button></td>
               </tr>`;
@@ -11815,6 +11974,18 @@ try {
               style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
         </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px;">
+          <div>
+            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Min Price (₱)</label>
+            <input type="number" step="0.01" name="min_price" placeholder="0.00" required
+              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+          </div>
+          <div>
+            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Max Price (₱)</label>
+            <input type="number" step="0.01" name="max_price" placeholder="0.00" required
+              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+          </div>
+        </div>
         <div
           style="font-size:0.75rem; color:var(--text-dim); display:flex; align-items:center; gap:6px; margin:0.5rem 0 1rem 0;">
           <i class="fas fa-info-circle" style="color:var(--accent);"></i>
@@ -11849,6 +12020,19 @@ try {
             shelf is different.</p>
         </div>
 
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+          <div>
+            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Min Price (₱)</label>
+            <input type="number" step="0.01" name="min_price" id="adj_min_price" required
+              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem; border-radius:12px; font-size:1rem; outline:none; box-sizing:border-box;">
+          </div>
+          <div>
+            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Max Price (₱)</label>
+            <input type="number" step="0.01" name="max_price" id="adj_max_price" required
+              style="width:100%; background:var(--input-bg); border:1px solid var(--glass-border); color:var(--text-main); padding:0.9rem; border-radius:12px; font-size:1rem; outline:none; box-sizing:border-box;">
+          </div>
+        </div>
+
         <div>
           <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Selling Price (₱)</label>
           <input type="number" step="0.01" name="price" id="adj_price" required
@@ -11876,12 +12060,20 @@ try {
             const idEl = document.getElementById('adj_item_id');
             const qtyEl = document.getElementById('adj_quantity');
             const prEl = document.getElementById('adj_price');
+            const minPrEl = document.getElementById('adj_min_price');
+            const maxPrEl = document.getElementById('adj_max_price');
             const nameEl = document.getElementById('adjItemName');
 
             if (nameEl) nameEl.innerText = `Adjust: ${item.item_name}`;
             if (idEl) idEl.value = item.item_id;
             if (qtyEl) qtyEl.value = item.quantity;
-            if (prEl) prEl.value = item.price;
+            if (prEl) {
+              prEl.value = item.price;
+              // Trigger validation
+              prEl.dispatchEvent(new Event('input'));
+            }
+            if (minPrEl) minPrEl.value = item.min_price || 0;
+            if (maxPrEl) maxPrEl.value = item.max_price || 0;
             openModal('stockAdjustmentModal');
           }
         });
@@ -11915,6 +12107,47 @@ try {
             });
         });
       }
+
+      function attachPriceValidation(formId) {
+        const form = document.getElementById(formId);
+        if (!form) return;
+        const minInput = form.querySelector('[name="min_price"]');
+        const maxInput = form.querySelector('[name="max_price"]');
+        const priceInput = form.querySelector('[name="price"]');
+        const submitBtn = form.querySelector('button[type="submit"]');
+
+        if (!minInput || !maxInput || !priceInput || !submitBtn) return;
+
+        const validate = () => {
+          const min = parseFloat(minInput.value);
+          const max = parseFloat(maxInput.value);
+          const price = parseFloat(priceInput.value);
+
+          if (isNaN(min) || isNaN(max) || isNaN(price)) {
+            submitBtn.disabled = true;
+            submitBtn.style.opacity = '0.5';
+            return;
+          }
+
+          if (max > 0 && (price < min || price > max)) {
+            submitBtn.disabled = true;
+            submitBtn.style.opacity = '0.5';
+          } else {
+            submitBtn.disabled = false;
+            submitBtn.style.opacity = '1';
+          }
+        };
+
+        minInput.addEventListener('input', validate);
+        maxInput.addEventListener('input', validate);
+        priceInput.addEventListener('input', validate);
+        
+        // Wait briefly if modal just opened to validate initial values
+        setTimeout(validate, 100);
+      }
+
+      attachPriceValidation('addInventoryForm');
+      attachPriceValidation('stockAdjustmentForm');
     });
   </script>
 
@@ -12126,6 +12359,26 @@ try {
     </div>
   </div>
 
+
+  <!-- Authorization Proof Viewer Modal -->
+  <div id="proofViewerModal"
+    style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(12px); z-index:10000; align-items:center; justify-content:center;">
+    <div
+      style="background:#111827; border:1px solid rgba(255,255,255,0.1); border-radius:28px; padding:2.5rem; width:100%; max-width:700px; max-height:90vh; overflow-y:auto; position:relative; text-align:center; box-shadow:0 40px 100px rgba(0,0,0,0.7);">
+      <button onclick="closeModal('proofViewerModal')"
+        style="position:absolute; top:20px; right:20px; background:rgba(255,255,255,0.05); border:none; color:white; width:40px; height:40px; border-radius:50%; cursor:pointer; transition:0.3s;"
+        onmouseover="this.style.background='rgba(255,255,255,0.1)'"
+        onmouseout="this.style.background='rgba(255,255,255,0.05)'">
+        <i class="fas fa-times"></i>
+      </button>
+      <h3 style="margin:0 0 1.5rem; font-size:1.5rem; letter-spacing:-0.5px;">Authorization Proof</h3>
+      <div id="proofViewerContent"
+        style="width:100%; display:flex; justify-content:center; align-items:center; background:rgba(0,0,0,0.2); border-radius:16px; min-height:200px; padding:1rem;">
+        <img id="proofViewerImage" src=""
+          style="background:white; max-width:100%; max-height:60vh; border-radius:8px; object-fit:contain; box-shadow:0 10px 30px rgba(0,0,0,0.3); padding:1rem;">
+      </div>
+    </div>
+  </div>
 
   <!-- Job Status Modal (Renamed to Avoid Conflicts) -->
   <div id="repairJobStatusModal_Final"
@@ -12346,8 +12599,9 @@ try {
                     <input type="file" name="agreement_proof" id="agreement_proof_input" accept="image/*"
                       style="width:100%; font-size:0.8rem; color:white; background:rgba(0,0,0,0.2); padding:0.5rem; border-radius:8px; border:1px solid rgba(255,255,255,0.1);">
                   </div>
-                  
-                  <button type="button" onclick="window.confirmLocalAuthorization()" style="width:100%; margin-top:10px; padding:12px; border-radius:10px; border:none; background:linear-gradient(135deg, var(--accent), #059669); color:white; font-weight:800; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px;">
+
+                  <button type="button" onclick="window.confirmLocalAuthorization()"
+                    style="width:100%; margin-top:10px; padding:12px; border-radius:10px; border:none; background:linear-gradient(135deg, var(--accent), #059669); color:white; font-weight:800; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px;">
                     <i class="fas fa-check-double"></i> Confirm Authorization
                   </button>
                 </div>
@@ -12564,6 +12818,7 @@ try {
                   <div style="font-size:0.75rem; color:var(--text-dim);">${(job.make || '') + ' ' + (job.model || '---')}</div>
                 </td>
                 <td><span style="font-size:0.85rem; font-weight:700;">${job.service_name || 'General Repair'}</span></td>
+                <td><small style="color:var(--text-dim);"><i class="far fa-clock"></i> ${new Date(job.completed_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</small></td>
                 <td style="font-weight:800; color:var(--accent);">₱${parseFloat(job.total_amount || 0).toLocaleString()}</td>
                 <td><span class="badge ${statusClass}">${status}</span></td>
                 <td>
@@ -13512,7 +13767,7 @@ try {
                 <td style="padding: 1.2rem 1rem;"><span style="background:var(--glass); padding:6px 12px; border-radius:8px; border:1px solid var(--glass-border); font-family:monospace; color:var(--accent); font-weight:800; font-size:0.85rem; letter-spacing:1px;">${j.plate_no}</span></td>
                 <td style="padding: 1.2rem 1rem;"><div style="font-weight:700; font-size:0.95rem; margin-bottom:4px; color:var(--text-main);">${displayModel}</div><div style="opacity:0.6; font-size:0.75rem; display:flex; align-items:center; gap:5px;"><i class="fas fa-user-circle"></i> ${j.customer_name}</div></td>
                 <td style="padding: 1.2rem 1rem;"><span style="color:var(--text-dim); font-size:0.85rem; background:var(--glass); padding:4px 8px; border-radius:6px;">${j.service_name}</span></td>
-                <td style="padding: 1.2rem 1rem;"><small style="color:var(--text-dim);"><i class="far fa-clock"></i> ${new Date(j.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</small></td>
+                <td style="padding: 1.2rem 1rem;"><small style="color:var(--text-dim);"><i class="far fa-clock"></i> ${new Date(j.completed_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</small></td>
                 <td style="padding: 1.2rem 1rem; font-weight:800; color:var(--text-main); font-size:1.1rem;">₱${parseFloat(j.total_amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
                 <td style="padding: 1.2rem 1rem;"><span class="badge ${statusClass}" style="padding: 6px 12px; font-size: 0.7rem; font-weight: 800;">${j.status}</span></td>
                 <td style="padding: 1.2rem 1rem;">
@@ -13897,7 +14152,6 @@ try {
   <div id="supportChatWidget"
     style="position:fixed; top:50%; left:50%; width:90%; max-width:650px; height:80vh; max-height:680px; z-index:9999; background:rgba(18,18,24,0.92); backdrop-filter:blur(25px); -webkit-backdrop-filter:blur(25px); border:1px solid var(--glass-border); border-radius:24px; box-shadow:0 25px 60px rgba(0,0,0,0.65); display:flex; flex-direction:column; transform:translate(-50%, -50%) scale(0.92); opacity:0; pointer-events:none; visibility:hidden; transition:all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);">
     <style>
-
       .chat-header {
         background: var(--accent);
         padding: 1.6rem 2rem;

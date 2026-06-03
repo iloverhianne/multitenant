@@ -39,7 +39,9 @@ class Mailer {
         if ($httpCode == 201 || $httpCode == 200) {
             return true;
         } else {
-            $_SESSION['debug_info'] = "Status: $httpCode | Error: $curlError | Msg: " . $result . " (DEV-FALLBACK CODE: $code)";
+            $debugMsg = "Status: $httpCode | Error: $curlError | Msg: " . $result;
+            $_SESSION['debug_info'] = $debugMsg . " (DEV-FALLBACK CODE: $code)";
+            file_put_contents(__DIR__ . '/mail_error.log', date('Y-m-d H:i:s') . " - " . $debugMsg . PHP_EOL, FILE_APPEND);
             return false;
         }
     }
