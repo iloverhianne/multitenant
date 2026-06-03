@@ -1254,13 +1254,21 @@ try {
         .form-group input:focus,
         .form-group select:focus {
             border-color: var(--accent);
-            background-color: white;
+            background-color: rgba(255, 255, 255, 0.08);
+            color: var(--text-main);
             box-shadow: 0 0 0 4px var(--accent-glow);
+        }
+
+        [data-theme="light"] .form-group input:focus,
+        [data-theme="light"] .form-group select:focus {
+            background-color: white;
+            color: #0f172a;
         }
 
         [data-theme="dark"] .form-group input:focus,
         [data-theme="dark"] .form-group select:focus {
             background-color: rgba(255, 255, 255, 0.08);
+            color: var(--text-main);
         }
 
         /* Password Wrapper for Toggle */
@@ -1826,7 +1834,7 @@ try {
                     </div>
                 </div>
 
-                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                <div style="display: grid; grid-template-columns: 1fr; gap: 12px;">
                     <div class="form-group">
                         <label>Subscription Plan</label>
                         <select name="plan" id="planSelect" required>
@@ -1848,27 +1856,13 @@ try {
                             </optgroup>
                         </select>
                     </div>
-                    <div class="form-group">
-                        <label>Identification Type</label>
-                        <select name="id_type" required>
-                            <option value="">-- Choose ID Type --</option>
-                            <option value="SSS">SSS ID</option>
-                            <option value="UMID">UMID (Multi-Purpose ID)</option>
-                            <option value="Driver's License">Driver's License</option>
-                            <option value="Philippine Passport">Philippine Passport</option>
-                            <option value="PhilHealth">PhilHealth ID</option>
-                            <option value="Voter's ID">Voter's ID</option>
-                            <option value="PRC ID">PRC License</option>
-                            <option value="National ID">National ID (PhilSys)</option>
-                        </select>
-                    </div>
                 </div>
 
-                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 15px; align-items: flex-end;">
                     <div class="form-group">
-                        <label>Business Proof (BIR/Permit)</label>
+                        <label>Business Proof (BIR/Permit) <span style="font-size: 0.8em; color: var(--text-dim);">(Optional)</span></label>
                         <div class="file-upload-wrapper">
-                            <input type="file" name="business_proof" accept="image/*,.pdf" onchange="handleDocumentUpload(this, 'permitExpiryDate', 'business permit')" required>
+                            <input type="file" name="business_proof" accept="image/*,.pdf" onchange="handleDocumentUpload(this, 'permitExpiryDate', 'business permit')">
                             <div class="file-upload-btn">
                                 <i class="fas fa-file-invoice"></i>
                                 <span>Upload Permit...</span>
@@ -1887,21 +1881,9 @@ try {
                     </div>
                 </div>
 
-                <div class="form-group" style="margin-bottom: 15px;">
-                    <label>Owner's ID Photo</label>
-                    <div class="file-upload-wrapper">
-                        <input type="file" name="id_photo" accept="image/*" onchange="handleDocumentUpload(this, 'idExpiryDate', 'valid ID')" required>
-                        <div class="file-upload-btn">
-                            <i class="fas fa-id-card"></i>
-                            <span>Upload ID...</span>
-                        </div>
-                    </div>
-                </div>
-
                 <!-- Hidden fields for OCR extracted dates -->
                 <input type="hidden" name="permit_expiry_date" id="permitExpiryDate">
                 <input type="hidden" name="dti_expiry_date" id="dtiExpiryDate">
-                <input type="hidden" name="id_expiry_date" id="idExpiryDate">
 
                 <input type="hidden" name="plan_id" id="hiddenPlanId">
                 <input type="hidden" name="billing_cycle" id="hiddenBillingCycle">
@@ -1989,8 +1971,8 @@ try {
                 const result = await Tesseract.recognize(file, 'eng');
                 const text = result.data.text;
                 
-                // Regex to find dates in various formats
-                const dateRegex = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{4}\b|\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b/gi;
+                // Regex to find dates in various formats including DD Month YYYY and YYYY-MM-DD
+                const dateRegex = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{4}\b|\b\d{1,2}[\s\-]+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[\s\-]+\d{4}\b|\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b|\b\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2}\b/gi;
                 const matches = text.match(dateRegex);
                 
                 let isValid = false;
@@ -2013,7 +1995,6 @@ try {
                 }
 
                 if (isValid && detectedDate) {
-                    alert(`Valid ${documentName} you may now proceed`);
                     const dateInput = document.getElementById(dateInputId);
                     if(dateInput) {
                         const yyyy = detectedDate.getFullYear();
@@ -2021,6 +2002,7 @@ try {
                         const dd = String(detectedDate.getDate()).padStart(2, '0');
                         dateInput.value = `${yyyy}-${mm}-${dd}`;
                     }
+                    alert(`Valid ${documentName} you may now proceed`);
                 } else {
                     alert(`Invalid ${documentName}, try again with valid ${documentName} date`);
                     input.value = ""; // Clear invalid file
@@ -2157,18 +2139,22 @@ try {
         }
 
         function validateRegistrationForm() {
-            const permitDateInput = document.getElementById('permitExpiryDate');
-            if (permitDateInput && permitDateInput.value) {
-                const permitDate = new Date(permitDateInput.value);
-                const today = new Date();
-                today.setHours(0, 0, 0, 0); // Reset time to midnight for accurate date comparison
-                
-                if (permitDate < today) {
-                    alert("Invalid business permit, try again with valid business permit date");
-                    return false;
-                } else {
-                    alert("Valid business permit you may now proceed");
-                    return true;
+            const today = new Date();
+            today.setHours(0, 0, 0, 0); // Reset time to midnight for accurate date comparison
+            
+            const checks = [
+                { id: 'permitExpiryDate', name: 'business permit' },
+                { id: 'dtiExpiryDate', name: 'DTI permit' }
+            ];
+
+            for (let check of checks) {
+                const dateInput = document.getElementById(check.id);
+                if (dateInput && dateInput.value) {
+                    const expiryDate = new Date(dateInput.value);
+                    if (expiryDate < today) {
+                        alert(`Invalid ${check.name}, try again with valid ${check.name} date`);
+                        return false;
+                    }
                 }
             }
             return true;
