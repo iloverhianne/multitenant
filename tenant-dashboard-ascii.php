@@ -609,18 +609,12 @@ try {
           service_name VARCHAR(100) NOT NULL,
           description TEXT NULL,
           price DECIMAL(10,2) NOT NULL,
-          min_price DECIMAL(10,2) NULL,
-          max_price DECIMAL(10,2) NULL,
           category VARCHAR(50) NULL,
           estimated_time VARCHAR(50) NULL,
           status ENUM('ACTIVE', 'INACTIVE') DEFAULT 'ACTIVE',
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           INDEX (tenant_id)
         ) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;");
-        try {
-          $db->exec("ALTER TABLE services ADD COLUMN min_price DECIMAL(10,2) NULL, ADD COLUMN max_price DECIMAL(10,2) NULL");
-        } catch (Exception $e) {
-        }
         try {
           $db->exec("ALTER TABLE services ADD COLUMN master_id INT DEFAULT NULL AFTER tenant_id");
         } catch (Exception $e) {
@@ -882,13 +876,9 @@ try {
 
       // Payments Table Healer/Creation
       try {
-        $db->exec("CREATE TABLE IF NOT EXISTS services (service_id INT AUTO_INCREMENT PRIMARY KEY, tenant_id INT, master_id INT DEFAULT NULL, service_name VARCHAR(100), description TEXT, price DECIMAL(10,2), min_price DECIMAL(10,2) NULL, max_price DECIMAL(10,2) NULL, category VARCHAR(50), estimated_time VARCHAR(50), status ENUM('ACTIVE', 'INACTIVE'), created_at DATETIME)");
+        $db->exec("CREATE TABLE IF NOT EXISTS services (service_id INT AUTO_INCREMENT PRIMARY KEY, tenant_id INT, master_id INT DEFAULT NULL, service_name VARCHAR(100), description TEXT, price DECIMAL(10,2), category VARCHAR(50), estimated_time VARCHAR(50), status ENUM('ACTIVE', 'INACTIVE'), created_at DATETIME)");
         try {
           $db->exec("ALTER TABLE services ADD COLUMN master_id INT DEFAULT NULL AFTER tenant_id");
-        } catch (Exception $e) {
-        }
-        try {
-          $db->exec("ALTER TABLE services ADD COLUMN min_price DECIMAL(10,2) NULL, ADD COLUMN max_price DECIMAL(10,2) NULL");
         } catch (Exception $e) {
         }
         $db->exec("CREATE TABLE IF NOT EXISTS payments (payment_id INT AUTO_INCREMENT PRIMARY KEY, tenant_id INT, amount DECIMAL(10,2), status VARCHAR(20))");
@@ -1100,6 +1090,8 @@ try {
           quantity INT DEFAULT 0,
           unit VARCHAR(20) DEFAULT 'pcs',
           price DECIMAL(10,2) DEFAULT 0,
+          min_price DECIMAL(10,2) DEFAULT 0,
+          max_price DECIMAL(10,2) DEFAULT 0,
           stock_threshold INT DEFAULT 5,
           status VARCHAR(20) DEFAULT 'IN_STOCK',
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1108,6 +1100,14 @@ try {
         // Ensure columns exist if table was created previously with older schema
         try {
           $db->exec("ALTER TABLE inventory ADD COLUMN price DECIMAL(10,2) DEFAULT 0");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE inventory ADD COLUMN min_price DECIMAL(10,2) DEFAULT 0");
+        } catch (Exception $e) {
+        }
+        try {
+          $db->exec("ALTER TABLE inventory ADD COLUMN max_price DECIMAL(10,2) DEFAULT 0");
         } catch (Exception $e) {
         }
         try {
@@ -1286,12 +1286,26 @@ try {
                       COALESCE(v.plate_no, j.walkin_plate, 'N/A') AS plate_no,
                       COALESCE(v.make, '') AS make,
                       COALESCE(v.model, j.walkin_model, '---') AS model,
-                      COALESCE(s.service_name, 'General Repair') AS service_name,
-                      COALESCE(m.full_name, u.name, 'Unassigned') AS mechanic_name,
+                      COALESCE(
+                        NULLIF(
+                          CONCAT_WS('<br>', 
+                            s.service_name,
+                            (SELECT GROUP_CONCAT(DISTINCT s2.service_name SEPARATOR '<br>') FROM repair_parts rp JOIN services s2 ON rp.service_id = s2.service_id WHERE rp.job_id = j.job_id AND rp.service_id IS NOT NULL)
+                          ), 
+                          ''
+                        ),
+                        'General Repair'
+                      ) AS service_name,
+                      CASE 
+                        WHEN j.status = 'PENDING' AND m.status = 'UNAVAILABLE' THEN 'Unassigned'
+                        ELSE COALESCE(m.full_name, u.name, 'Unassigned') 
+                      END AS mechanic_name,
                       j.created_at,
                       j.total_amount,
                       j.customer_id,
-                      COALESCE(c.full_name, j.walkin_name, 'Walk-in') AS customer_name
+                      COALESCE(c.full_name, j.walkin_name, 'Walk-in') AS customer_name,
+                      (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE ((j.appointment_id > 0 AND appointment_id = j.appointment_id) OR (j.job_id > 0 AND job_id = j.job_id)) AND status IN ('SUCCESS', 'COMPLETED')) AS paid_amount,
+                      (j.total_amount - (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE ((j.appointment_id > 0 AND appointment_id = j.appointment_id) OR (j.job_id > 0 AND job_id = j.job_id)) AND status IN ('SUCCESS', 'COMPLETED'))) AS balance_amount
                     FROM repair_jobs j
                     LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id
                     LEFT JOIN services s ON j.service_id = s.service_id
@@ -1346,7 +1360,16 @@ try {
                       COALESCE(v.plate_no, j.walkin_plate, 'N/A') AS plate_no,
                       COALESCE(v.make, '') AS make,
                       COALESCE(v.model, j.walkin_model, '---') AS model,
-                      COALESCE(s.service_name, 'General Repair') AS service_name,
+                      COALESCE(
+                        NULLIF(
+                          CONCAT_WS('<br>', 
+                            s.service_name,
+                            (SELECT GROUP_CONCAT(DISTINCT s2.service_name SEPARATOR '<br>') FROM repair_parts rp JOIN services s2 ON rp.service_id = s2.service_id WHERE rp.job_id = j.job_id AND rp.service_id IS NOT NULL)
+                          ), 
+                          ''
+                        ),
+                        'General Repair'
+                      ) AS service_name,
                       j.created_at,
                       j.total_amount,
                       j.customer_id,
@@ -1373,31 +1396,32 @@ try {
           $name = trim($_POST['service_name'] ?? '');
           $desc = trim($_POST['description'] ?? '');
           $price = floatval($_POST['price'] ?? 0);
-          $min_price = (isset($_POST['min_price']) && $_POST['min_price'] !== '') ? floatval($_POST['min_price']) : null;
-          $max_price = (isset($_POST['max_price']) && $_POST['max_price'] !== '') ? floatval($_POST['max_price']) : null;
 
           if (empty($name)) {
             echo json_encode(['status' => 'error', 'message' => 'Service name is required.']);
             exit;
           }
 
-          $checkTenant = $db->prepare("SELECT enable_price_limits FROM tenants WHERE tenant_id = ?");
-          $checkTenant->execute([$tenant_id]);
-          $enablePriceLimits = intval($checkTenant->fetchColumn() ?? 1);
-
           $masterId = !empty($_POST['master_id']) ? intval($_POST['master_id']) : null;
 
-          if ($enablePriceLimits && $min_price !== null && $max_price !== null) {
-              if ($price < $min_price || $price > $max_price) {
-                throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($min_price) . " and ₱" . number_format($max_price));
+          if ($masterId) {
+            $ms = $db->prepare("SELECT * FROM master_services WHERE master_id = ?");
+            $ms->execute([$masterId]);
+            $standard = $ms->fetch();
+            if ($standard) {
+              if ($price < $standard['min_price'] || $price > $standard['max_price']) {
+                throw new Exception("Price Out of Bounds! This service must be between ???" . number_format($standard['min_price']) . " and ???" . number_format($standard['max_price']));
               }
+              // Force standard name and category if linked
+              $name = $standard['service_name'];
+            }
           }
 
-          $stmt = $db->prepare("INSERT INTO services (tenant_id, master_id, service_name, description, price, min_price, max_price, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')");
-          if ($stmt->execute([$tenant_id, $masterId, $name, $desc, $price, $min_price, $max_price])) {
+          $stmt = $db->prepare("INSERT INTO services (tenant_id, master_id, service_name, description, price, status) VALUES (?, ?, ?, ?, ?, 'ACTIVE')");
+          if ($stmt->execute([$tenant_id, $masterId, $name, $desc, $price])) {
             try {
               $log = $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'CRUD', ?)");
-              $log->execute([$tenant_id, $_SESSION['user_id'] ?? 0, "Staff " . ($_SESSION['name'] ?? 'Unknown') . " added new service: $name (₱$price)"]);
+              $log->execute([$tenant_id, $_SESSION['user_id'] ?? 0, "Staff " . ($_SESSION['name'] ?? 'Unknown') . " added new service: $name (???$price)"]);
             } catch (Exception $logErr) {
             }
 
@@ -1417,8 +1441,6 @@ try {
           $name = trim($_POST['service_name'] ?? '');
           $desc = trim($_POST['description'] ?? '');
           $price = floatval($_POST['price'] ?? 0);
-          $min_price = (isset($_POST['min_price']) && $_POST['min_price'] !== '') ? floatval($_POST['min_price']) : null;
-          $max_price = (isset($_POST['max_price']) && $_POST['max_price'] !== '') ? floatval($_POST['max_price']) : null;
           $masterId = !empty($_POST['master_id']) ? intval($_POST['master_id']) : null;
 
           if (empty($name) || empty($id)) {
@@ -1426,14 +1448,16 @@ try {
             exit;
           }
 
-          $checkTenant = $db->prepare("SELECT enable_price_limits FROM tenants WHERE tenant_id = ?");
-          $checkTenant->execute([$tenant_id]);
-          $enablePriceLimits = intval($checkTenant->fetchColumn() ?? 1);
-
-          if ($enablePriceLimits && $min_price !== null && $max_price !== null) {
-              if ($price < $min_price || $price > $max_price) {
-                throw new Exception("Price Out of Bounds! This service must be between ₱" . number_format($min_price) . " and ₱" . number_format($max_price));
+          if ($masterId) {
+            $ms = $db->prepare("SELECT * FROM master_services WHERE master_id = ?");
+            $ms->execute([$masterId]);
+            $standard = $ms->fetch();
+            if ($standard) {
+              if ($price < $standard['min_price'] || $price > $standard['max_price']) {
+                throw new Exception("Price Out of Bounds! This service must be between ???" . number_format($standard['min_price']) . " and ???" . number_format($standard['max_price']));
               }
+              $name = $standard['service_name'];
+            }
           }
 
           // AUTO-HEAL: Ensure description column exists
@@ -1442,8 +1466,8 @@ try {
           } catch (Exception $e) {
           }
 
-          $stmt = $db->prepare("UPDATE services SET master_id=?, service_name=?, description=?, price=?, min_price=?, max_price=? WHERE service_id=? AND tenant_id=?");
-          if ($stmt->execute([$masterId, $name, $desc, $price, $min_price, $max_price, $id, $tenant_id])) {
+          $stmt = $db->prepare("UPDATE services SET master_id=?, service_name=?, description=?, price=? WHERE service_id=? AND tenant_id=?");
+          if ($stmt->execute([$masterId, $name, $desc, $price, $id, $tenant_id])) {
             try {
               $log = $db->prepare("INSERT INTO audit_logs (tenant_id, user_id, activity_type, description) VALUES (?, ?, 'CRUD', ?)");
               $log->execute([$tenant_id, $_SESSION['user_id'] ?? 0, "Staff " . ($_SESSION['name'] ?? 'Unknown') . " updated service: $name (ID: $id)"]);
@@ -1504,7 +1528,7 @@ try {
                                COALESCE(v.plate_no, j.walkin_plate) as plate_no, 
                                COALESCE(v.make, '') as make, 
                                COALESCE(v.model, j.walkin_model) as model, 
-                               s.service_name 
+                               s.service_name, s.price as service_price
                                FROM repair_jobs j 
                                LEFT JOIN customers c ON j.customer_id = c.customer_id 
                                LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id 
@@ -1515,10 +1539,42 @@ try {
           if (!$j)
             exit("Receipt not found.");
 
+          $partsStmt = $db->prepare("SELECT rp.*, i.item_name, s.service_name as extra_service_name 
+                                     FROM repair_parts rp 
+                                     LEFT JOIN inventory i ON rp.item_id = i.item_id 
+                                     LEFT JOIN services s ON rp.service_id = s.service_id 
+                                     WHERE rp.job_id = ?");
+          $partsStmt->execute([$id]);
+          $parts = $partsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+          $breakdownHtml = "";
+          if (!empty($j['service_name'])) {
+              $price = floatval($j['service_price'] ?? 0);
+              $breakdownHtml .= "
+                  <div style='display:flex; justify-content:space-between; margin-bottom:5px;'>
+                      <span>{$j['service_name']}</span>
+                      <span>???" . number_format($price, 2) . "</span>
+                  </div>";
+          }
+          foreach ($parts as $p) {
+              $name = !empty($p['item_name']) ? $p['item_name'] : (!empty($p['extra_service_name']) ? $p['extra_service_name'] : 'Unknown Item');
+              $qty = intval($p['quantity']);
+              $total = floatval($p['total_price']);
+              $breakdownHtml .= "
+                  <div style='display:flex; justify-content:space-between; margin-bottom:5px; font-size:0.85rem; color:#444;'>
+                      <span>{$qty}x {$name}</span>
+                      <span>???" . number_format($total, 2) . "</span>
+                  </div>";
+          }
+
           $shop = $db->prepare("SELECT shop_name, address, phone FROM tenants WHERE tenant_id = ?");
           $shop->execute([$tenant_id]);
           $s = $shop->fetch(PDO::FETCH_ASSOC);
           $sn = $s['shop_name'] ?? 'Auto Shop';
+
+          $dateStarted = !empty($j['started_at']) ? date('M d, Y h:i A', strtotime($j['started_at'])) : 'N/A';
+          $endTs = !empty($j['completed_at']) ? strtotime($j['completed_at']) : (in_array($j['status'], ['COMPLETED', 'SETTLED']) && !empty($j['updated_at']) ? strtotime($j['updated_at']) : 0);
+          $dateFinished = $endTs > 0 ? date('M d, Y h:i A', $endTs) : 'N/A';
 
           ob_clean();
           echo "<div style='text-align:center; margin-bottom:1.5rem; border-bottom:1px dashed #ccc; padding-bottom:1rem;'>
@@ -1528,14 +1584,14 @@ try {
                 </div>
                 <div style='font-size:0.9rem; line-height:1.6;'>
                   <p><strong>Job ID:</strong> #{$j['job_id']}</p>
-                  <p><strong>Date:</strong> " . date('M d, Y h:i A', strtotime($j['created_at'])) . "</p>
+                  <p><strong>Date Created:</strong> " . date('M d, Y h:i A', strtotime($j['created_at'])) . "</p>
+                  <p><strong>Date Started:</strong> {$dateStarted}</p>
+                  <p><strong>Date Finished:</strong> {$dateFinished}</p>
                   <p><strong>Customer:</strong> " . ($j['customer'] ?: $j['walkin_name']) . "</p>
                   <p><strong>Plate:</strong> " . ($j['plate_no'] ?: $j['walkin_plate']) . "</p>
+                  <p><strong>Vehicle:</strong> " . trim(($j['make'] ?? '') . ' ' . ($j['model'] ?? '')) . "</p>
                   <div style='margin:1rem 0; border-top:1px solid #eee; border-bottom:1px solid #eee; padding:10px 0;'>
-                    <div style='display:flex; justify-content:space-between;'>
-                      <span>{$j['service_name']}</span>
-                      <strong>???" . number_format($j['total_amount'], 2) . "</strong>
-                    </div>
+                    $breakdownHtml
                   </div>
                   <div style='display:flex; justify-content:space-between; font-size:1.1rem; font-weight:bold;'>
                     <span>TOTAL:</span>
@@ -2020,13 +2076,19 @@ try {
           $brand = trim($_POST['brand'] ?? '');
           $qty = intval($_POST['quantity'] ?? 0);
           $price = floatval($_POST['price'] ?? 0);
+          $min_price = floatval($_POST['min_price'] ?? 0);
+          $max_price = floatval($_POST['max_price'] ?? 0);
           $threshold = intval($_POST['stock_threshold'] ?? 5);
 
           if (empty($item_name))
             throw new Exception("Item name is required.");
+            
+          if ($max_price > 0 && ($price < $min_price || $price > $max_price)) {
+            throw new Exception("Price must be between ₱" . number_format($min_price, 2) . " and ₱" . number_format($max_price, 2));
+          }
 
-          $stmt = $db->prepare("INSERT INTO inventory (tenant_id, item_code, item_name, brand, quantity, price, stock_threshold, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'IN_STOCK')");
-          $stmt->execute([$tenant_id, $item_code, $item_name, $brand, $qty, $price, $threshold]);
+          $stmt = $db->prepare("INSERT INTO inventory (tenant_id, item_code, item_name, brand, quantity, price, min_price, max_price, stock_threshold, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'IN_STOCK')");
+          $stmt->execute([$tenant_id, $item_code, $item_name, $brand, $qty, $price, $min_price, $max_price, $threshold]);
 
           echo json_encode(['status' => 'success', 'message' => 'Item added to inventory.']);
         } catch (Exception $e) {
@@ -2205,10 +2267,16 @@ try {
           $itemId = intval($_POST['item_id'] ?? 0);
           $newQty = intval($_POST['quantity'] ?? 0);
           $newPrice = floatval($_POST['price'] ?? 0);
+          $minPrice = floatval($_POST['min_price'] ?? 0);
+          $maxPrice = floatval($_POST['max_price'] ?? 0);
           $newThreshold = intval($_POST['stock_threshold'] ?? 5);
 
-          $stmt = $db->prepare("UPDATE inventory SET quantity = ?, price = ?, stock_threshold = ? WHERE item_id = ? AND tenant_id = ?");
-          $stmt->execute([$newQty, $newPrice, $newThreshold, $itemId, $tenant_id]);
+          if ($maxPrice > 0 && ($newPrice < $minPrice || $newPrice > $maxPrice)) {
+            throw new Exception("Price must be between ₱" . number_format($minPrice, 2) . " and ₱" . number_format($maxPrice, 2));
+          }
+
+          $stmt = $db->prepare("UPDATE inventory SET quantity = ?, price = ?, min_price = ?, max_price = ?, stock_threshold = ? WHERE item_id = ? AND tenant_id = ?");
+          $stmt->execute([$newQty, $newPrice, $minPrice, $maxPrice, $newThreshold, $itemId, $tenant_id]);
 
           echo json_encode(['status' => 'success', 'message' => 'Stock adjusted successfully.']);
         } catch (Exception $e) {
@@ -2847,9 +2915,14 @@ try {
                       COALESCE(v.make, v2.make) as make,
                       COALESCE(v.model, v2.model, j.walkin_model) as model,
                       s.service_name, 
-                      COALESCE(m.full_name, 'No Mechanic') as mechanic_name,
+                      CASE 
+                        WHEN j.status = 'PENDING' AND m.status = 'UNAVAILABLE' THEN 'No Mechanic'
+                        ELSE COALESCE(m.full_name, 'No Mechanic') 
+                      END as mechanic_name,
                       b.bay_name,
-                      (SELECT remarks FROM repair_timeline WHERE job_id = j.job_id AND remarks != '' ORDER BY created_at DESC LIMIT 1) as latest_remarks
+                      (SELECT remarks FROM repair_timeline WHERE job_id = j.job_id AND remarks != '' ORDER BY created_at DESC LIMIT 1) as latest_remarks,
+                      (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE ((j.appointment_id > 0 AND appointment_id = j.appointment_id) OR (j.job_id > 0 AND job_id = j.job_id)) AND status IN ('SUCCESS', 'COMPLETED')) AS paid_amount,
+                      (j.total_amount - (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE ((j.appointment_id > 0 AND appointment_id = j.appointment_id) OR (j.job_id > 0 AND job_id = j.job_id)) AND status IN ('SUCCESS', 'COMPLETED'))) AS balance_amount
                       FROM repair_jobs j
                       LEFT JOIN customers c ON j.customer_id = c.customer_id
                       LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id
@@ -2899,14 +2972,6 @@ try {
 
           if (!$jobId || empty($newStatus)) {
             throw new Exception("Invalid job data.");
-          }
-
-          if ($newStatus === 'COMPLETED') {
-              $pendingCheck = $db->prepare("SELECT COUNT(*) FROM repair_parts WHERE job_id = ? AND tenant_id = ? AND approval_status = 'PENDING_APPROVAL'");
-              $pendingCheck->execute([$jobId, $tenant_id]);
-              if ($pendingCheck->fetchColumn() > 0) {
-                  throw new Exception("Operation Denied: Cannot complete job while there are items pending customer approval.");
-              }
           }
 
           // Get old state to handle status transfers and missing fields
@@ -3592,63 +3657,11 @@ try {
         });
     };
 
-    window.editService = function (id, name, desc, price, masterId = null, minPrice = null, maxPrice = null) {
+    window.editService = function (id, name, desc, price, masterId = null) {
       if (document.getElementById('edit_service_id')) document.getElementById('edit_service_id').value = id;
       if (document.getElementById('edit_service_name')) document.getElementById('edit_service_name').value = name;
       if (document.getElementById('edit_service_desc')) document.getElementById('edit_service_desc').value = (desc === 'null' || !desc) ? '' : desc;
       if (document.getElementById('edit_service_price')) document.getElementById('edit_service_price').value = price;
-      if (document.getElementById('edit_service_min_price')) document.getElementById('edit_service_min_price').value = (minPrice === null || minPrice === 'null') ? '' : minPrice;
-      if (document.getElementById('edit_service_max_price')) document.getElementById('edit_service_max_price').value = (maxPrice === null || maxPrice === 'null') ? '' : maxPrice;
-
-      const priceInput = document.getElementById('edit_service_price');
-      const form = document.getElementById('editServiceForm');
-      const submitBtn = form ? form.querySelector('button[onclick*="saveEditService"]') : null;
-      let hint = form ? form.querySelector('.price-hint') : null;
-
-      if (!hint && form && priceInput) {
-        hint = document.createElement('div');
-        hint.className = 'price-hint';
-        hint.style.fontSize = '0.75rem';
-        hint.style.marginTop = '5px';
-        priceInput.parentNode.appendChild(hint);
-      }
-
-      if (priceInput) {
-        priceInput.value = price;
-        if (minPrice !== null && maxPrice !== null && parseFloat(minPrice) > 0) {
-          priceInput.min = minPrice;
-          priceInput.max = maxPrice;
-          priceInput.placeholder = `Range: ₱${parseFloat(minPrice).toLocaleString()} - ₱${parseFloat(maxPrice).toLocaleString()}`;
-
-          const validate = () => {
-            const val = parseFloat(priceInput.value || 0);
-            const isInvalid = (val < parseFloat(minPrice) || val > parseFloat(maxPrice));
-            if (hint) {
-              hint.style.color = isInvalid ? '#ef4444' : 'var(--accent)';
-              hint.innerHTML = `<i class="fas fa-${isInvalid ? 'exclamation-triangle' : 'info-circle'}"></i> Recommended Price: ₱${parseFloat(minPrice).toLocaleString()} - ₱${parseFloat(maxPrice).toLocaleString()}`;
-            }
-            if (submitBtn) {
-              submitBtn.disabled = isInvalid;
-              submitBtn.style.opacity = isInvalid ? '0.5' : '1';
-              submitBtn.style.cursor = isInvalid ? 'not-allowed' : 'pointer';
-            }
-          };
-          priceInput.oninput = validate;
-          validate();
-        } else {
-          priceInput.removeAttribute('min');
-          priceInput.removeAttribute('max');
-          priceInput.placeholder = "";
-          priceInput.oninput = null;
-          if (hint) hint.innerHTML = '';
-          if (submitBtn) {
-            submitBtn.disabled = false;
-            submitBtn.style.opacity = '1';
-            submitBtn.style.cursor = 'pointer';
-          }
-        }
-      }
-
       const masterSelect = document.querySelector('#editServiceForm select[name="master_id"]');
       if (masterSelect) masterSelect.value = masterId || "";
       openModal('editServiceModal');
@@ -3661,17 +3674,13 @@ try {
       const priceEl = document.getElementById('edit_service_price');
       if (!idEl || !nameEl || !priceEl) return;
       const fd = new FormData();
-      fd.append('service_id', idEl.value);
+      fd.append('id', idEl.value);
       fd.append('service_name', nameEl.value);
       fd.append('description', descEl ? descEl.value : '');
       fd.append('price', priceEl.value);
-      const minPriceEl = document.getElementById('edit_service_min_price');
-      const maxPriceEl = document.getElementById('edit_service_max_price');
-      if (minPriceEl && minPriceEl.value !== '') fd.append('min_price', minPriceEl.value);
-      if (maxPriceEl && maxPriceEl.value !== '') fd.append('max_price', maxPriceEl.value);
       const mS = document.querySelector('#editServiceForm select[name="master_id"]');
       if (mS) fd.append('master_id', mS.value);
-      fetch('tenant-dashboard.php?action=edit_service', { method: 'POST', body: fd })
+      fetch('tenant-dashboard.php?action=update_service', { method: 'POST', body: fd })
         .then(r => r.json()).then(data => {
           if (data.status === 'success') {
             showToast("Service updated!");
@@ -3682,8 +3691,7 @@ try {
     };
 
     window.processAppointment = function (id, status, reqMechName = null) {
-      const statusStr = (typeof status === 'string') ? status : String(status || '');
-      if (statusStr === 'CONFIRMED') {
+      if (status === 'CONFIRMED') {
         const idF = document.getElementById('confirm_appt_id');
         if (idF) idF.value = id;
         const display = document.getElementById('requested_mechanic_display');
@@ -3709,8 +3717,8 @@ try {
         }
         window.openModal('confirmApptModal');
       } else {
-        if (!confirm('Are you sure you want to ' + statusStr.toLowerCase() + ' this appointment?')) return;
-        fetch('tenant-dashboard.php?action=update_appointment_status&id=' + id + '&status=' + statusStr)
+        if (!confirm('Are you sure you want to ' + status.toLowerCase() + ' this appointment?')) return;
+        fetch('tenant-dashboard.php?action=update_appointment_status&id=' + id + '&status=' + status)
           .then(r => r.json()).then(data => { if (data.status === 'success') location.reload(); else alert(data.message); });
       }
     };
@@ -3800,12 +3808,13 @@ try {
         const bS = document.getElementById('status_bay_id');
         if (mS) mS.innerHTML = '<option>Loading...</option>';
         if (bS) bS.innerHTML = '<option>Loading...</option>';
-        fetch(`tenant-dashboard.php?action=fetch_available_resources&preferred_id=${currentBayId || 0}&current_mechanic_id=${currentMechId || 0}`)
+        fetch(`tenant-dashboard.php?action=fetch_available_resources&preferred_id=${currentBayId || 0}&current_mechanic_id=${currentMechId || 0}&job_status=${currentStatus}`)
           .then(r => r.json()).then(data => {
             if (mS) {
               let mHtml = '<option value="">-- Select Mechanic --</option>';
               mHtml += (data.mechanics || []).map(m => `<option value="${m.mechanic_id}" ${m.mechanic_id == currentMechId ? 'selected' : ''}>${m.full_name}</option>`).join('');
-              if (!mS.value && currentMechId && currentMechId != 0) mHtml += `<option value="${currentMechId}" selected>Current Mechanic</option>`;
+              const hasMech = (data.mechanics || []).some(m => m.mechanic_id == currentMechId);
+              if (!hasMech && currentMechId && currentMechId != 0 && currentStatus !== 'PENDING') mHtml += `<option value="${currentMechId}" selected>Current Mechanic</option>`;
               mS.innerHTML = mHtml;
             }
             if (bS) {
@@ -3830,8 +3839,13 @@ try {
       const isMech = userRole === 'MECHANIC';
       const currentStatus = sS ? sS.value : '';
       const isCompleted = (currentStatus === 'COMPLETED');
-      if (mS) mS.disabled = !editing || isCompleted || isMech;
-      if (bS) bS.disabled = !editing || isCompleted || isMech;
+      const isInProgress = (currentStatus === 'IN_PROGRESS');
+      
+      const disableDropdowns = !editing || isCompleted || isInProgress || isMech;
+
+      if (mS) mS.disabled = disableDropdowns;
+      if (bS) bS.disabled = disableDropdowns;
+      
       if (eb) eb.style.display = editing ? 'none' : 'flex';
       if (sb) sb.style.display = editing ? 'flex' : 'none';
 
@@ -3843,6 +3857,13 @@ try {
           if (pendingOpt && (val === 'IN_PROGRESS' || val === 'COMPLETED')) {
             pendingOpt.style.display = 'none';
           }
+          
+          const isComp = (val === 'COMPLETED');
+          const isInProg = (val === 'IN_PROGRESS');
+          const disable = !editing || isComp || isInProg || isMech;
+          
+          if (mS) mS.disabled = disable;
+          if (bS) bS.disabled = disable;
         };
       }
     };
@@ -3860,86 +3881,6 @@ try {
         list.style.display = 'block';
       }
     };
-
-
-    // --- SERVICES & LABOR INTEGRATION ---
-    window.filterServiceCombobox = function (q) {
-      const query = (q || "").toLowerCase().trim();
-      const list = document.getElementById('serviceResultsList');
-      if (!list || !window.allServicesCache) return;
-
-      const filtered = window.allServicesCache.filter(s => {
-        const matches = (s.service_name || "").toLowerCase().includes(query);
-        return matches;
-      });
-
-      list.innerHTML = filtered.map(s => {
-        const price = parseFloat(s.price || 0);
-        return `<div onclick="window.selectServiceForJob(${s.service_id}, '${(s.service_name || "").replace(/'/g, "\\'")}', ${price})" 
-                     style="padding:12px 15px; cursor:pointer; border-bottom:1px solid rgba(255,255,255,0.05); transition:0.2s;"
-                     onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-              <div>
-                <div style="font-weight:700; font-size:0.85rem; color:white;">${s.service_name}</div>
-                <div style="font-size:0.7rem; color:var(--text-dim);">${s.category || 'Service'}</div>
-              </div>
-              <div style="font-weight:800; color:var(--accent); font-size:0.9rem;">₱${price.toLocaleString()}</div>
-            </div>
-          </div>`;
-      }).join('') || '<div style="padding:20px; text-align:center; color:var(--text-dim); font-size:0.85rem;">No services found.</div>';
-    };
-
-    window.selectServiceForJob = function (id, name, price) {
-      document.getElementById('selectedServiceId').value = id;
-      document.getElementById('serviceComboboxInput').value = name;
-      document.getElementById('serviceResultsList').style.display = 'none';
-    };
-
-    window.addServiceToJob = function () {
-      const jidEl = document.getElementById('status_job_id');
-      const sidEl = document.getElementById('selectedServiceId');
-      if (!jidEl || !sidEl) return;
-      
-      const jid = jidEl.value;
-      const sid = sidEl.value;
-      if (!jid || !sid) return alert("Please select a service first.");
-      const fd = new FormData();
-      fd.append('job_id', jid);
-      fd.append('service_id', sid);
-      fetch('tenant-dashboard.php?action=add_service_to_job', { method: 'POST', body: fd })
-        .then(r => r.json()).then(data => {
-          if (data.status === 'success') {
-            showToast(data.message);
-            window.refreshJobPartsList(jid);
-            document.getElementById('selectedServiceId').value = '';
-            document.getElementById('serviceComboboxInput').value = '';
-          } else alert(data.message);
-        });
-    };
-
-    window.loadServiceSelector = function () {
-      fetch('tenant-dashboard.php?action=fetch_services')
-        .then(r => r.json()).then(data => {
-          window.allServicesCache = data;
-          window.filterServiceCombobox("");
-        });
-    };
-
-    // Close floating lists when clicking outside
-    window.addEventListener('click', function (e) {
-      const partList = document.getElementById('partResultsList');
-      const partInput = document.getElementById('partComboboxInput');
-      const partArrow = document.getElementById('comboboxArrow');
-      const serviceList = document.getElementById('serviceResultsList');
-      const serviceInput = document.getElementById('serviceComboboxInput');
-
-      if (partList && !partList.contains(e.target) && e.target !== partInput && e.target !== partArrow) {
-        partList.style.display = 'none';
-      }
-      if (serviceList && !serviceList.contains(e.target) && e.target !== serviceInput) {
-        serviceList.style.display = 'none';
-      }
-    });
 
 
     window.selectPartForJob = function (id, name, price, stock) {
@@ -3960,17 +3901,13 @@ try {
       if (!list) return;
       fetch(`tenant-dashboard.php?action=fetch_job_parts&job_id=${jid}`)
         .then(r => r.json()).then(data => {
-          const approvalContainer = document.getElementById('customerApprovalLinkContainer');
-          let hasPending = false;
-          
           if (!data.length) {
             list.innerHTML = '<div style="text-align:center; color:var(--text-dim); font-size:0.8rem; padding:20px;">No parts recorded.</div>';
-            if (bill) bill.innerText = '₱0.00';
-            if (approvalContainer) approvalContainer.style.display = 'none';
+            if (bill) bill.innerText = '???0.00';
             const overall = document.getElementById('totalOverallBill');
             if (overall) {
               const sP = window.currentJobServicePrice || 0;
-              overall.innerText = '₱' + sP.toLocaleString(undefined, { minimumFractionDigits: 2 });
+              overall.innerText = '???' + sP.toLocaleString(undefined, { minimumFractionDigits: 2 });
             }
             return;
           }
@@ -3978,49 +3915,24 @@ try {
           list.innerHTML = data.map(p => {
             const itemTotal = parseFloat(p.total_price) || 0;
             const itemUnit = parseFloat(p.unit_price) || 0;
-            
-            let statusBadge = '';
-            if (p.approval_status === 'PENDING_APPROVAL') {
-                statusBadge = '<span style="font-size:0.6rem; background:var(--warning); color:#000; padding:2px 5px; border-radius:4px; margin-left:5px; font-weight:700;">PENDING</span>';
-                hasPending = true;
-            } else if (p.approval_status === 'REJECTED') {
-                statusBadge = '<span style="font-size:0.6rem; background:var(--danger); color:#fff; padding:2px 5px; border-radius:4px; margin-left:5px; font-weight:700;">REJECTED</span>';
-            }
-            
-            if (p.approval_status === 'APPROVED') {
-                total += itemTotal;
-            }
-            
-            const rowOpacity = (p.approval_status === 'REJECTED') ? 'opacity: 0.5;' : '';
-            const totalDecor = (p.approval_status === 'REJECTED' || p.approval_status === 'PENDING_APPROVAL') ? 'text-decoration: line-through;' : '';
-
-            return `<div style="display:flex; justify-content:space-between; align-items:center; background:rgba(255,255,255,0.03); padding:10px 15px; border-radius:12px; border:1px solid rgba(255,255,255,0.05); margin-bottom:8px; ${rowOpacity}">
+            total += itemTotal;
+            return `<div style="display:flex; justify-content:space-between; align-items:center; background:rgba(255,255,255,0.03); padding:10px 15px; border-radius:12px; border:1px solid rgba(255,255,255,0.05); margin-bottom:8px;">
                       <div style="flex:1;">
-                        <div style="font-weight:700; font-size:0.85rem; color:white;">${p.item_name} ${statusBadge}</div>
-                        <div style="font-size:0.7rem; color:var(--text-dim);">${p.service_id ? 'Labor / Service' : `${p.quantity} units @ ₱${itemUnit.toLocaleString()}`}</div>
+                        <div style="font-weight:700; font-size:0.85rem; color:white;">${p.item_name}</div>
+                        <div style="font-size:0.7rem; color:var(--text-dim);">${p.quantity} units @ ???${itemUnit.toLocaleString()}</div>
                       </div>
                       <div style="display:flex; align-items:center; gap:12px;">
-                        <div style="font-weight:800; color:var(--accent); font-size:0.9rem; ${totalDecor}">₱${itemTotal.toLocaleString()}</div>
+                        <div style="font-weight:800; color:var(--accent); font-size:0.9rem;">???${itemTotal.toLocaleString()}</div>
                         <i class="fas fa-times-circle" onclick="window.removePartFromJob(${p.rp_id}, ${jid})" style="color:var(--danger); cursor:pointer;"></i>
                       </div>
                     </div>`;
           }).join('');
-          
-          if (approvalContainer) {
-              if (hasPending) {
-                  approvalContainer.style.display = 'block';
-                  window.currentApprovalLink = window.location.origin + window.location.pathname.replace('tenant-dashboard-ascii.php', '') + 'customer-agreement.php?job_id=' + jid + '&token=' + (data[0] ? data[0].token : '');
-              } else {
-                  approvalContainer.style.display = 'none';
-              }
-          }
-
-          if (bill) bill.innerText = '₱' + total.toLocaleString(undefined, { minimumFractionDigits: 2 });
+          if (bill) bill.innerText = '???' + total.toLocaleString(undefined, { minimumFractionDigits: 2 });
           const overall = document.getElementById('totalOverallBill');
           if (overall) {
             const sP = window.currentJobServicePrice || 0;
             const combined = total + sP;
-            overall.innerText = '₱' + combined.toLocaleString(undefined, { minimumFractionDigits: 2 });
+            overall.innerText = '???' + combined.toLocaleString(undefined, { minimumFractionDigits: 2 });
           }
         });
     };
@@ -4519,7 +4431,7 @@ try {
               <tr>
                 <td>#${p.payment_id}</td>
                 <td><strong>${p.customer_name}</strong></td>
-                <td><small>${p.reference_no || '---'}</small> (${p.payment_method})</td>
+                <td><small>${p.reference_no || p.ref_id || '---'}</small> (${p.payment_method || p.payment_type || 'N/A'})</td>
                 <td>???${parseFloat(p.amount || 0).toLocaleString()}</td>
                 <td>${new Date(p.payment_date).toLocaleDateString()}</td>
                 <td><span class="badge badge-active">${p.status}</span></td>
@@ -4751,11 +4663,10 @@ try {
         });
     };
     window.processShiftRequest = function (requestId, status) {
-      const statusStr = (typeof status === 'string') ? status : String(status || '');
-      if (!confirm(`Are you sure you want to ${statusStr.toLowerCase()} this request?`)) return;
+      if (!confirm(`Are you sure you want to ${status.toLowerCase()} this request?`)) return;
       const fd = new FormData();
       fd.append('request_id', requestId);
-      fd.append('status', statusStr);
+      fd.append('status', status);
       fetch('tenant-dashboard.php?action=process_shift_request', { method: 'POST', body: fd })
         .then(r => r.json())
         .then(data => {
@@ -6173,7 +6084,7 @@ try {
         const min = parseFloat(priceInput.min);
         const max = parseFloat(priceInput.max);
         if (val < min || val > max) {
-          showToast(`Price must be between ₱${min.toLocaleString()} and ₱${max.toLocaleString()}`, 'error');
+          showToast(`Price must be between ???${min.toLocaleString()} and ???${max.toLocaleString()}`, 'error');
           return;
         }
       }
@@ -6184,10 +6095,6 @@ try {
       fd.append('description', desc);
       fd.append('price', price);
       fd.append('master_id', document.querySelector('#editServiceForm select[name="master_id"]').value);
-      const minPriceEl = document.getElementById('edit_service_min_price');
-      const maxPriceEl = document.getElementById('edit_service_max_price');
-      if (minPriceEl && minPriceEl.value !== '') fd.append('min_price', minPriceEl.value);
-      if (maxPriceEl && maxPriceEl.value !== '') fd.append('max_price', maxPriceEl.value);
 
       const btn = document.querySelector('#editServiceForm button[onclick*="saveEditService"]');
       const originalText = btn ? btn.innerText : 'Update Service';
@@ -7676,7 +7583,7 @@ try {
                 </span></td>
               <td>
                 <button class="btn-outline"
-                  onclick="editService(<?php echo $s['service_id']; ?>, '<?php echo addslashes($s['service_name']); ?>', '<?php echo addslashes($s['description']); ?>', <?php echo $s['price']; ?>, <?php echo $s['master_id'] ?? 'null'; ?>, <?php echo $s['min_price'] ?? 'null'; ?>, <?php echo $s['max_price'] ?? 'null'; ?>)">Edit</button>
+                  onclick="editService(<?php echo $s['service_id']; ?>, '<?php echo addslashes($s['service_name']); ?>', '<?php echo addslashes($s['description']); ?>', <?php echo $s['price']; ?>, <?php echo $s['master_id'] ?? 'null'; ?>)">Edit</button>
                 <button class="btn-outline"
                   style="color:var(--danger); border-color:rgba(239,68,68,0.3); margin-left: 5px;"
                   onclick="deleteService(<?php echo $s['service_id']; ?>)">Delete</button>
@@ -7710,6 +7617,7 @@ try {
             <tr>
               <th>Item Code</th>
               <th>Name & Brand</th>
+              <th>Price</th>
               <th>Qty on Hand</th>
               <th>Status</th>
               <th>Actions</th>
@@ -7718,7 +7626,7 @@ try {
           <tbody id="inventoryBody">
             <?php if (empty($inventory_list)): ?>
             <tr>
-              <td colspan="5" style="text-align:center; color:var(--text-dim); padding: 2rem;">No
+              <td colspan="6" style="text-align:center; color:var(--text-dim); padding: 2rem;">No
                 inventory records found.</td>
             </tr>
             <?php else: ?>
@@ -7730,6 +7638,9 @@ try {
                 </strong><br><small style="color:var(--text-dim)">
                   <?php echo htmlspecialchars($inv['brand']); ?>
                 </small>
+              </td>
+              <td>
+                <strong>???<?php echo number_format($inv['price'], 2); ?></strong>
               </td>
               <td>
                 <?php echo $inv['quantity']; ?> pcs
@@ -9287,18 +9198,20 @@ try {
         .then(res => res.json()).then(data => {
           const body = document.getElementById('inventoryBody');
           if (data.length === 0) {
-            body.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-dim); padding: 2rem;">No inventory records found.</td></tr>';
+            body.innerHTML = '<tr><td colspan="6" style="text-align:center; color:var(--text-dim); padding: 2rem;">No inventory records found.</td></tr>';
             return;
           }
           body.innerHTML = data.map(i => {
             const isLow = parseInt(i.quantity) <= parseInt(i.stock_threshold || 0);
             const statusClass = isLow ? 'badge-danger' : 'badge-active';
             const statusText = isLow ? 'LOW STOCK' : 'IN STOCK';
+            const price = parseFloat(i.price || 0).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
             return `
               <tr>
                 <td><strong>${i.item_code}</strong></td>
                 <td>${i.item_name} ${i.brand ? '(' + i.brand + ')' : ''}</td>
-                <td>${i.quantity}</td>
+                <td><strong>???${price}</strong></td>
+                <td>${i.quantity} pcs</td>
                 <td><span class="badge ${statusClass}">${statusText}</span></td>
                 <td><button class="btn-outline" onclick="window.openStockAdjustmentModal(${i.item_id})">Manage</button></td>
               </tr>`;
@@ -9595,22 +9508,11 @@ try {
           <textarea name="description" placeholder="What's included?"
             style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; min-height:90px; resize:none; box-sizing:border-box;"></textarea>
         </div>
-        <div style="margin-bottom:1.5rem; display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;">
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price (PHP)</label>
-            <input type="number" step="0.01" name="price" required placeholder="0.00"
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Min Price</label>
-            <input type="number" step="0.01" name="min_price" placeholder="Optional"
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Max Price</label>
-            <input type="number" step="0.01" name="max_price" placeholder="Optional"
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
+        <div style="margin-bottom:1.5rem;">
+          <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price
+            (PHP)</label>
+          <input type="number" step="0.01" name="price" required placeholder="0.00"
+            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <button type="button" onclick="submitAddService()"
           style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1rem; border-radius:12px; font-size:1rem; font-weight:700; cursor:pointer;">Save
@@ -9662,22 +9564,11 @@ try {
           <textarea name="description" id="edit_service_desc"
             style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; min-height:90px; resize:none; box-sizing:border-box;"></textarea>
         </div>
-        <div style="margin-bottom:1.5rem; display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;">
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price (PHP)</label>
-            <input type="number" step="0.01" name="price" id="edit_service_price" required
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Min Price</label>
-            <input type="number" step="0.01" name="min_price" id="edit_service_min_price" placeholder="Optional"
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
-          <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Max Price</label>
-            <input type="number" step="0.01" name="max_price" id="edit_service_max_price" placeholder="Optional"
-              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
-          </div>
+        <div style="margin-bottom:1.5rem;">
+          <label style="display:block; margin-bottom:6px; font-size:0.85rem; color:#94a3b8;">Price
+            (PHP)</label>
+          <input type="number" step="0.01" name="price" id="edit_service_price" required
+            style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem 1rem; border-radius:10px; font-size:0.95rem; outline:none; box-sizing:border-box;">
         </div>
         <button type="button" onclick="window.saveEditService()"
           style="width:100%; background:linear-gradient(135deg,#6366f1,#8b5cf6); color:white; border:none; padding:1rem; border-radius:12px; font-size:1rem; font-weight:700; cursor:pointer;">Update
@@ -10374,13 +10265,25 @@ try {
         </div>
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
           <div>
-            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Cost Price (???)</label>
+            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Cost Price (₱)</label>
             <input type="number" step="0.01" name="price" placeholder="0.00" required
               style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
           <div>
             <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Initial Qty</label>
             <input type="number" name="quantity" value="1" required
+              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+          </div>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px;">
+          <div>
+            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Min Price (₱)</label>
+            <input type="number" step="0.01" name="min_price" placeholder="0.00" required
+              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
+          </div>
+          <div>
+            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Max Price (₱)</label>
+            <input type="number" step="0.01" name="max_price" placeholder="0.00" required
               style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem; border-radius:10px; font-size:0.9rem; outline:none; box-sizing:border-box;">
           </div>
         </div>
@@ -10418,8 +10321,21 @@ try {
             shelf is different.</p>
         </div>
 
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+          <div>
+            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Min Price (₱)</label>
+            <input type="number" step="0.01" name="min_price" id="adj_min_price" required
+              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem; border-radius:12px; font-size:1rem; outline:none; box-sizing:border-box;">
+          </div>
+          <div>
+            <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Max Price (₱)</label>
+            <input type="number" step="0.01" name="max_price" id="adj_max_price" required
+              style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem; border-radius:12px; font-size:1rem; outline:none; box-sizing:border-box;">
+          </div>
+        </div>
+
         <div>
-          <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Selling Price (???)</label>
+          <label style="display:block; margin-bottom:6px; font-size:0.8rem; color:#94a3b8;">Selling Price (₱)</label>
           <input type="number" step="0.01" name="price" id="adj_price" required
             style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.9rem; border-radius:12px; font-size:1rem; outline:none; box-sizing:border-box;">
         </div>
@@ -10448,6 +10364,8 @@ try {
           document.getElementById('adj_item_id').value = item.item_id;
           document.getElementById('adj_quantity').value = item.quantity;
           document.getElementById('adj_price').value = item.price;
+          document.getElementById('adj_min_price').value = item.min_price || 0;
+          document.getElementById('adj_max_price').value = item.max_price || 0;
           document.getElementById('adj_threshold').value = item.stock_threshold;
           openModal('stockAdjustmentModal');
         });
@@ -10625,11 +10543,6 @@ try {
           <div id="paymentPartsList"
             style="display:flex; flex-direction:column; gap:6px; max-height:100px; overflow-y:auto;"></div>
           <input type="hidden" name="parts_json" id="pay_parts_json" value="[]">
-        </div>
-
-        <div id="paymentReceiptDetails" style="margin-bottom:0.8rem; background:rgba(0,0,0,0.2); padding:1rem; border-radius:12px; border:1px solid rgba(255,255,255,0.05); display:none;">
-            <div style="font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase; margin-bottom:8px;">Receipt Breakdown</div>
-            <div id="receiptBreakdownContent" style="font-size:0.85rem; color:#fff;"></div>
         </div>
 
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:0.8rem;">
@@ -10825,34 +10738,10 @@ try {
                 </div>
               </div>
 
-              <!-- Services & Labor Integration -->
-              <div style="flex:1; display:flex; flex-direction:column; border-top:1px solid rgba(255,255,255,0.05); padding-top:1.5rem; margin-top:1rem;">
-                <label style="display:block; margin-bottom:12px; font-size:0.8rem; color:var(--accent); font-weight:800; text-transform:uppercase; letter-spacing:1px;">Services & Labor</label>
-                <div style="display:flex; gap:10px;">
-                  <div id="serviceComboboxWrapper" style="position:relative; flex:1;">
-                    <input type="text" id="serviceComboboxInput" placeholder="Add another service..." autocomplete="off"
-                      style="width:100%; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:white; padding:0.8rem 1rem; border-radius:12px; font-size:0.9rem; outline:none;"
-                      onfocus="document.getElementById('serviceResultsList').style.display='block'; window.loadServiceSelector();"
-                      oninput="window.filterServiceCombobox(this.value)">
-                    <input type="hidden" id="selectedServiceId" value="">
-                    <div id="serviceResultsList"
-                      style="display:none; position:absolute; top:110%; left:0; width:100%; background:#1f2937; border:1px solid rgba(255,255,255,0.1); border-radius:12px; max-height:200px; overflow-y:auto; z-index:10001; padding:5px;">
-                    </div>
-                  </div>
-                  <button type="button" onclick="window.addServiceToJob()"
-                    style="background:rgba(255,255,255,0.1); color:white; border:none; border-radius:12px; padding:0 15px; font-weight:700; cursor:pointer;">Add</button>
-                </div>
-              </div>
-
               <div id="jobPartsList"
                 style="flex:1; display:flex; flex-direction:column; gap:8px; min-height:120px; max-height:220px; overflow-y:auto; background:rgba(0,0,0,0.15); border-radius:15px; padding:12px; border:1px solid rgba(255,255,255,0.03);">
                 <div style="text-align:center; color:var(--text-dim); font-size:0.8rem; padding:20px;">No parts
                   recorded.</div>
-              </div>
-
-              <div id="customerApprovalLinkContainer" style="display:none; margin-top:8px; padding:10px; background:rgba(239, 161, 52, 0.1); border:1px solid rgba(239, 161, 52, 0.3); border-radius:12px; text-align:center;">
-                  <div style="font-size:0.75rem; color:var(--warning); font-weight:700; margin-bottom:5px;">Items Pending Customer Approval</div>
-                  <button type="button" onclick="navigator.clipboard.writeText(window.currentApprovalLink); alert('Approval link copied to clipboard! Send this to the customer.');" style="background:var(--warning); color:#000; border:none; border-radius:8px; padding:5px 15px; font-weight:600; font-size:0.8rem; cursor:pointer;"><i class="fas fa-link"></i> Copy Approval Link</button>
               </div>
 
               <div
@@ -11020,11 +10909,11 @@ try {
                   <div style="font-size:0.75rem; color:var(--text-dim);">${(job.make || '') + ' ' + (job.model || '---')}</div>
                 </td>
                 <td><span style="font-size:0.85rem; font-weight:700;">${job.service_name || 'General Repair'}</span></td>
-                <td style="font-weight:800; color:var(--accent);">???${parseFloat(job.total_amount || 0).toLocaleString()}</td>
+                <td style="font-weight:800; color:var(--accent);">???${parseFloat(job.balance_amount ?? job.total_amount ?? 0).toLocaleString()}</td>
                 <td><span class="badge ${statusClass}">${status}</span></td>
                 <td>
                    <button class="btn-action" style="padding:6px 12px; font-size:0.75rem; background:#10b981; border:none;" 
-                           onclick="window.openPaymentForJob('${job.job_id}', '${job.customer_id || ''}', '${job.total_amount || 0}', '${job.customer_name || ''}')">
+                           onclick="window.openPaymentForJob('${job.job_id}', '${job.customer_id || ''}', '${job.balance_amount ?? job.total_amount ?? 0}', '${job.customer_name || ''}')">
                      <i class="fas fa-cash-register"></i> Collect
                    </button>
                 </td>`;
@@ -12498,59 +12387,6 @@ try {
         }
       }
 
-      // RECEIPT BREAKDOWN LOGIC
-      const receiptContainer = document.getElementById('paymentReceiptDetails');
-      const breakdownContent = document.getElementById('receiptBreakdownContent');
-      if (receiptContainer && breakdownContent) {
-          if (jobId) {
-              receiptContainer.style.display = 'block';
-              breakdownContent.innerHTML = '<div style="text-align:center;"><i class="fas fa-spinner fa-spin"></i> Loading Breakdown...</div>';
-              
-              fetch(`tenant-dashboard.php?action=get_job_details&id=${jobId}`)
-                  .then(r => r.json())
-                  .then(job => {
-                      if (!job) throw new Error("Job not found");
-                      
-                      let baseServiceName = job.service_name || 'Service Package';
-                      let baseServicePrice = parseFloat(job.service_price) || 0;
-                      
-                      fetch(`tenant-dashboard.php?action=fetch_job_parts&job_id=${jobId}`)
-                          .then(r => r.json())
-                          .then(parts => {
-                              let html = '<table style="width:100%; border-collapse:collapse; margin-bottom:10px;">';
-                              html += '<tr><th style="text-align:left; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px;">Description</th>';
-                              html += '<th style="text-align:right; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px;">Amount</th></tr>';
-                              
-                              // Base Service
-                              html += `<tr><td style="padding:5px 0;">${baseServiceName}</td>`;
-                              html += `<td style="text-align:right; padding:5px 0;">₱${baseServicePrice.toLocaleString(undefined, {minimumFractionDigits: 2})}</td></tr>`;
-                              
-                              let subtotal = baseServicePrice;
-                              
-                              // Additional Parts
-                              parts.forEach(p => {
-                                  if(p.approval_status === 'APPROVED') {
-                                      let itemTotal = parseFloat(p.total_price) || 0;
-                                      subtotal += itemTotal;
-                                      html += `<tr><td style="padding:5px 0; color:#94a3b8; font-size:0.8rem;">+ ${p.item_name} (x${p.quantity})</td>`;
-                                      html += `<td style="text-align:right; padding:5px 0; color:#94a3b8; font-size:0.8rem;">₱${itemTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</td></tr>`;
-                                  }
-                              });
-                              
-                              html += `<tr><th style="text-align:left; border-top:1px dashed rgba(255,255,255,0.2); padding-top:5px; margin-top:5px;">Job Subtotal</th>`;
-                              html += `<th style="text-align:right; border-top:1px dashed rgba(255,255,255,0.2); padding-top:5px; margin-top:5px;">₱${subtotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</th></tr>`;
-                              
-                              html += '</table>';
-                              breakdownContent.innerHTML = html;
-                          });
-                  }).catch(err => {
-                      breakdownContent.innerHTML = '<div style="color:var(--danger); text-align:center;">Failed to load breakdown.</div>';
-                  });
-          } else {
-              receiptContainer.style.display = 'none';
-          }
-      }
-
       if (typeof window.openModal === 'function') window.openModal('paymentModal');
       else {
         const modal = document.getElementById('paymentModal');
@@ -12850,6 +12686,10 @@ try {
             const ctx = document.getElementById('revenueChart').getContext('2d');
 
             if (typeof Chart !== 'undefined') {
+              const computedStyle = getComputedStyle(document.documentElement);
+              const accentColor = computedStyle.getPropertyValue('--accent').trim() || '#6366f1';
+              const accentRgb = computedStyle.getPropertyValue('--accent-rgb').trim() || '99, 102, 241';
+
               window.revenueChartInstance = new Chart(ctx, {
                 type: 'line',
                 data: {
@@ -12857,12 +12697,12 @@ try {
                   datasets: [{
                     label: 'Daily Revenue (???)',
                     data: data.map(row => row.total),
-                    borderColor: '#6366f1',
-                    backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                    borderColor: accentColor,
+                    backgroundColor: `rgba(${accentRgb}, 0.2)`,
                     borderWidth: 3,
                     fill: true,
                     tension: 0.4,
-                    pointBackgroundColor: '#6366f1',
+                    pointBackgroundColor: accentColor,
                     pointRadius: 5
                   }]
                 },

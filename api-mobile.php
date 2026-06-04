@@ -383,9 +383,22 @@ try {
             $appTime = date("H:i:s", strtotime($parts[0]));
         }
 
+        $serviceIds = explode(',', $_POST['service_id']);
+        $firstId = null;
+
         $stmt = $db->prepare("INSERT INTO appointments (tenant_id, customer_id, vehicle_id, service_id, mechanic_id, appointment_date, appointment_time, estimated_amount, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', NOW())");
-        $stmt->execute([$tid, $cid, $_POST['vehicle_id'], $_POST['service_id'], $_POST['mechanic_id'], $_POST['date'], $appTime, $_POST['estimate']]);
-        echo json_encode(['status' => 'success', 'appointment_id' => $db->lastInsertId()]);
+        
+        foreach ($serviceIds as $sid) {
+            $sid = trim($sid);
+            if (empty($sid)) continue;
+            
+            $stmt->execute([$tid, $cid, $_POST['vehicle_id'], $sid, $_POST['mechanic_id'], $_POST['date'], $appTime, $_POST['estimate']]);
+            if ($firstId === null) {
+                $firstId = $db->lastInsertId();
+            }
+        }
+        
+        echo json_encode(['status' => 'success', 'appointment_id' => $firstId]);
         exit;
     }
 

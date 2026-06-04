@@ -2696,7 +2696,7 @@ try {
                                 COALESCE(v.model, v2.model, j.walkin_model, 'Walk-in') as vehicle_model, 
                                 s.service_name,
                                 s.price as service_price,
-                                (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE ((j.appointment_id > 0 AND appointment_id = j.appointment_id) OR (j.job_id > 0 AND job_id = j.job_id)) AND status IN ('SUCCESS', 'COMPLETED', 'PENDING')) as downpayment
+                                (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE ( (j.job_id > 0 AND job_id = j.job_id) OR (j.appointment_id > 0 AND appointment_id = j.appointment_id AND (job_id IS NULL OR job_id = 0 OR job_id = j.job_id)) ) AND status IN ('SUCCESS', 'COMPLETED', 'PENDING')) as downpayment
                                 FROM repair_jobs j 
                                 LEFT JOIN vehicles v ON j.vehicle_id = v.vehicle_id 
                                 LEFT JOIN vehicles v2 ON j.customer_id = v2.customer_id AND v.plate_no IS NULL
@@ -5455,8 +5455,8 @@ try {
               const sP = window.currentJobServicePrice || 0;
               const dp = window.currentJobDownpayment || 0;
               const overallTotal = sP;
-              const combined = Math.max(0, overallTotal - dp);
-              if (dpRow) { dpRow.style.display = 'flex'; }
+              const combined = overallTotal - dp;
+              if (dpRow && dp > 0) { dpRow.style.display = 'flex'; }
               if (dpAmt) { dpAmt.textContent = `- ₱${dp.toLocaleString(undefined, { minimumFractionDigits: 2 })}`; }
               overall.textContent = `₱${combined.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
             }
@@ -5529,8 +5529,8 @@ try {
             const sP = window.currentJobServicePrice || 0;
             const dp = window.currentJobDownpayment || 0;
             const overallTotal = total + sP;
-            const combined = Math.max(0, overallTotal - dp);
-            if (dpRow) { dpRow.style.display = 'flex'; }
+            const combined = overallTotal - dp;
+            if (dpRow && dp > 0) { dpRow.style.display = 'flex'; }
             if (dpAmt) { dpAmt.textContent = `- ₱${dp.toLocaleString(undefined, { minimumFractionDigits: 2 })}`; }
             overall.textContent = `₱${combined.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
           }

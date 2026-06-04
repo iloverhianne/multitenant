@@ -11,7 +11,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['email'])) {
     }
 
     $business_proof_path = '';
-    $dti_proof_path = '';
     $id_photo_path = '';
     $uploadDir = __DIR__ . '/uploads/tenants/';
     if (!is_dir($uploadDir))
@@ -22,14 +21,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['email'])) {
         $filename = 'proof_' . time() . '_' . rand(1000, 9999) . '.' . $ext;
         if (move_uploaded_file($_FILES['business_proof']['tmp_name'], $uploadDir . $filename)) {
             $business_proof_path = 'uploads/tenants/' . $filename;
-        }
-    }
-
-    if (!empty($_FILES['dti_proof']['name'])) {
-        $ext = pathinfo($_FILES['dti_proof']['name'], PATHINFO_EXTENSION);
-        $filename = 'dti_' . time() . '_' . rand(1000, 9999) . '.' . $ext;
-        if (move_uploaded_file($_FILES['dti_proof']['tmp_name'], $uploadDir . $filename)) {
-            $dti_proof_path = 'uploads/tenants/' . $filename;
         }
     }
 
@@ -54,11 +45,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['email'])) {
         'billing_cycle' => $_POST['billing_cycle'] ?? 'monthly',
         'password' => $_POST['password'] ?? '',
         'id_type' => $_POST['id_type'] ?? '',
-        'permit_expiry_date' => $_POST['permit_expiry_date'] ?? '',
-        'dti_expiry_date' => $_POST['dti_expiry_date'] ?? '',
-        'id_expiry_date' => $_POST['id_expiry_date'] ?? '',
         'business_proof_url' => $business_proof_path,
-        'dti_proof_url' => $dti_proof_path,
         'id_photo_url' => $id_photo_path
     ];
 }
@@ -74,11 +61,7 @@ $plan_id = $reg_data['plan_id'] ?? '';
 $billing_cycle = $reg_data['billing_cycle'] ?? 'monthly';
 $password = $reg_data['password'] ?? '';
 $id_type = $reg_data['id_type'] ?? '';
-$permit_expiry_date = $reg_data['permit_expiry_date'] ?? '';
-$dti_expiry_date = $reg_data['dti_expiry_date'] ?? '';
-$id_expiry_date = $reg_data['id_expiry_date'] ?? '';
 $business_proof_url = $reg_data['business_proof_url'] ?? '';
-$dti_proof_url = $reg_data['dti_proof_url'] ?? '';
 $id_photo_url = $reg_data['id_photo_url'] ?? '';
 
 // Generate a REAL 6-digit random code if not exist or failed before
@@ -299,11 +282,7 @@ if ($shouldSend) {
             <input type="hidden" name="billing_cycle" value="<?php echo htmlspecialchars($billing_cycle); ?>">
             <input type="hidden" name="password" value="<?php echo htmlspecialchars($password); ?>">
             <input type="hidden" name="id_type" value="<?php echo htmlspecialchars($id_type); ?>">
-            <input type="hidden" name="permit_expiry_date" value="<?php echo htmlspecialchars($permit_expiry_date); ?>">
-            <input type="hidden" name="dti_expiry_date" value="<?php echo htmlspecialchars($dti_expiry_date); ?>">
-            <input type="hidden" name="id_expiry_date" value="<?php echo htmlspecialchars($id_expiry_date); ?>">
             <input type="hidden" name="business_proof_url" value="<?php echo htmlspecialchars($business_proof_url); ?>">
-            <input type="hidden" name="dti_proof_url" value="<?php echo htmlspecialchars($dti_proof_url); ?>">
             <input type="hidden" name="id_photo_url" value="<?php echo htmlspecialchars($id_photo_url); ?>">
 
             <div class="otp-container">
