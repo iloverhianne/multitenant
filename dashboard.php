@@ -117,14 +117,15 @@ if (isset($_SESSION['pending_auto_backup']) && $_SESSION['pending_auto_backup'] 
 
 
 
-// Auto-migrate: Add 'slug' and 'business_proof_url' columns to tenants table if they don't exist
+// Auto-migrate: Add 'slug', 'business_proof_url', and 'permit_expiry_date' columns to tenants table if they don't exist
 try {
     $db->exec("ALTER TABLE tenants ADD COLUMN slug VARCHAR(100) DEFAULT NULL AFTER status");
-} catch (PDOException $e) {
-}
-
-try {
     $db->exec("ALTER TABLE tenants ADD COLUMN business_proof_url VARCHAR(255) DEFAULT NULL AFTER slug");
+    $db->exec("ALTER TABLE tenants ADD COLUMN permit_expiry_date DATE DEFAULT NULL AFTER business_proof_url");
+    $db->exec("ALTER TABLE tenants ADD COLUMN dti_proof_url VARCHAR(255) DEFAULT NULL AFTER permit_expiry_date");
+    $db->exec("ALTER TABLE tenants ADD COLUMN dti_expiry_date DATE DEFAULT NULL AFTER dti_proof_url");
+    $db->exec("ALTER TABLE tenants ADD COLUMN id_photo_url VARCHAR(255) DEFAULT NULL AFTER dti_expiry_date");
+    $db->exec("ALTER TABLE tenants ADD COLUMN id_expiry_date DATE DEFAULT NULL AFTER id_photo_url");
 } catch (PDOException $e) {
 }
 
